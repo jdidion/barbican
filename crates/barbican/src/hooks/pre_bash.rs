@@ -13,9 +13,13 @@
 //!   (`base64 -d`, `xxd -r`, `openssl enc -d`, `uudecode`) writing to
 //!   a path that looks like an executable (script extension, no
 //!   extension, or a known shell rc file).
+//! - **M1** — re-entry wrappers: unwrap the inner command string of
+//!   `bash -c` / `sh -c` / `eval` / `sudo` / `find -exec` / `xargs` /
+//!   `timeout` / `nohup` / `env` / `nice` / `watch` / `su -c` / etc.
+//!   and re-classify through the whole stack.
 //!
-//! Remaining audit findings (M1, M2) land on their own feature
-//! branches and plug into the same `Decision` switchboard.
+//! Remaining audit findings (M2) land on their own feature branch
+//! and plug into the same `Decision` switchboard.
 
 use std::io::{Read, Write};
 
@@ -24,6 +28,11 @@ use serde::Deserialize;
 
 use crate::parser::{self, ParseError, Pipeline, RedirectKind, Script};
 use crate::tables::SHELL_INTERPRETERS;
+
+/// Maximum depth of M1 wrapper-unwrap recursion. Beyond this, a
+/// pathological nesting like `bash -c "bash -c 'bash -c ...'"`
+/// collapses to a deny (same posture as the parser's MAX_DEPTH).
+const M1_MAX_DEPTH: usize = 16;
 
 /// Exit code Claude Code reads as "allow the tool call."
 const EXIT_ALLOW: i32 = 0;
@@ -119,30 +128,320 @@ fn classify_command(command: &str) -> Decision {
     }
 }
 
-/// Apply every shipped policy to a parsed `Script`. Each H-level has
-/// a stand-alone `h*_*` function; this function dispatches to all of
-/// them, recurses into substitutions, and returns the first deny.
+/// Apply every shipped policy to a parsed `Script`.
 fn classify_script(script: &Script) -> Decision {
+    classify_script_with_depth(script, 0)
+}
+
+fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
+    if depth > M1_MAX_DEPTH {
+        return Decision::Deny {
+            reason: "command re-entry nesting exceeded safe depth (deny by default)".to_string(),
+        };
+    }
     for pipeline in &script.pipelines {
+        // M1 marker — the inner string of a wrapper failed to parse.
+        // Deny before the per-policy checks since none of them will
+        // fire on the synthetic stage.
+        if pipeline
+            .stages
+            .iter()
+            .any(|s| s.basename == MALFORMED_REENTRY_MARKER)
+        {
+            return Decision::Deny {
+                reason: "wrapped command could not be parsed safely \
+                         (deny by default)"
+                    .to_string(),
+            };
+        }
         if let Some(reason) = h1_pipeline_curl_to_shell(pipeline) {
             return Decision::Deny { reason };
         }
         if let Some(reason) = h2_staged_decode_to_exec(pipeline) {
             return Decision::Deny { reason };
         }
+        // M1: if any stage is a re-entry wrapper, unwrap it into a
+        // flattened pipeline whose stages are the wrapper's inner
+        // command, then re-classify. This makes H1/H2 (and future
+        // M2) see through `sudo`, `timeout`, `bash -c`, `find -exec`,
+        // `xargs bash -c`, etc.
+        if let Some(unwrapped) = unwrap_wrappers_in_pipeline(pipeline) {
+            if let Decision::Deny { reason } = classify_script_with_depth(&unwrapped, depth + 1) {
+                return Decision::Deny { reason };
+            }
+        }
     }
-    // Substitutions are classified the same way, so `$(curl ... | bash)`
-    // and `X=$(base64 -d > /tmp/a.sh)` both deny.
     for pipeline in &script.pipelines {
         for stage in &pipeline.stages {
             for sub in &stage.substitutions {
-                if let Decision::Deny { reason } = classify_script(sub) {
+                if let Decision::Deny { reason } = classify_script_with_depth(sub, depth + 1) {
                     return Decision::Deny { reason };
                 }
             }
         }
     }
     Decision::Allow
+}
+
+/// If any stage in `pipeline` is a wrapper (`sudo`, `bash -c`, `eval`,
+/// `find -exec`, `xargs`, etc.), return a NEW script whose pipelines
+/// replace the wrapper stage with the wrapper's unwrapped inner
+/// command. Returns `None` if no stage is a wrapper — caller can skip
+/// the extra classification pass.
+///
+/// The unwrap preserves the outer pipeline's `|` connections. For a
+/// wrapper stage whose inner is a single pipeline (the common case),
+/// the inner's stages replace the wrapper stage in line:
+/// `[sudo curl, bash]` with wrapper=sudo → `[curl, bash]`. That keeps
+/// H1's within-pipeline check working.
+///
+/// If the inner expands to multiple pipelines (e.g. `bash -c 'a; b'`),
+/// all-but-the-last emit as separate top-level pipelines, and the
+/// last splices into the current chain. This is a best-effort
+/// flattening — `bash -c 'a; b' | c` isn't perfectly expressible as
+/// shell but the classifiers get to see every inner command, which
+/// is the safety goal.
+fn unwrap_wrappers_in_pipeline(pipeline: &Pipeline) -> Option<Script> {
+    let mut any_wrapper = false;
+    let mut new_pipelines: Vec<Pipeline> = Vec::new();
+    let mut current_stages: Vec<crate::parser::Command> = Vec::new();
+    for stage in &pipeline.stages {
+        if let Some(inner) = unwrap_wrapper_command(stage) {
+            any_wrapper = true;
+            let mut inner_pipelines = inner.pipelines;
+            if inner_pipelines.is_empty() {
+                continue;
+            }
+            // If the wrapper stage itself has redirects (e.g. `find -exec
+            // base64 -d blob \; > /tmp/a.sh`), those redirects apply to
+            // the stdout of the inner command's last stage. Graft them
+            // on so H2's last-stage-writes-to-exec check sees them.
+            if !stage.redirects.is_empty() {
+                if let Some(tail) = inner_pipelines.last_mut() {
+                    if let Some(last_stage) = tail.stages.last_mut() {
+                        last_stage.redirects.extend(stage.redirects.clone());
+                    }
+                }
+            }
+            // Last inner pipeline splices in-line so pipe connections
+            // survive. Earlier inner pipelines emit as separate
+            // top-level pipelines.
+            let tail = inner_pipelines.pop().expect("non-empty checked above");
+            for p in inner_pipelines {
+                new_pipelines.push(p);
+            }
+            current_stages.extend(tail.stages);
+        } else {
+            current_stages.push(stage.clone());
+        }
+    }
+    if !current_stages.is_empty() {
+        new_pipelines.push(Pipeline {
+            stages: current_stages,
+        });
+    }
+    if !any_wrapper {
+        return None;
+    }
+    Some(Script {
+        pipelines: new_pipelines,
+    })
+}
+
+/// Extract and parse the inner command of a wrapper command.
+///
+/// Returns `Some(Script)` if `stage` is a known wrapper and we
+/// successfully parsed its inner; `None` if it isn't a wrapper.
+/// Parse-failure on the inner returns a synthetic malformed Script so
+/// the caller denies.
+fn unwrap_wrapper_command(stage: &crate::parser::Command) -> Option<Script> {
+    let inner_source = extract_wrapper_inner(stage)?;
+    if let Ok(script) = parser::parse(&inner_source) {
+        return Some(script);
+    }
+    // Inner is malformed (unterminated quote inside -c, etc.). Per
+    // CLAUDE.md rule #1, surface as a deny-worthy placeholder. The
+    // classifier stack has no policy that matches this synthetic
+    // basename today, so we need a tiny policy hook too: if any
+    // pipeline contains this marker, classify_script returns Deny.
+    let marker = crate::parser::Command {
+        basename: MALFORMED_REENTRY_MARKER.to_string(),
+        argv0_raw: String::new(),
+        args: Vec::new(),
+        redirects: Vec::new(),
+        substitutions: Vec::new(),
+    };
+    Some(Script {
+        pipelines: vec![Pipeline {
+            stages: vec![marker],
+        }],
+    })
+}
+
+/// Basename Barbican stuffs into a synthetic Command when the inner
+/// string of a re-entry wrapper fails to parse. The classifier
+/// dispatcher matches it and surfaces a deny.
+const MALFORMED_REENTRY_MARKER: &str = "__barbican_malformed_reentry__";
+
+/// Return the text of a wrapper command's inner bash source, or `None`
+/// if `stage` is not a recognized wrapper.
+fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
+    let basename = stage.basename.as_str();
+    // --- Shell -c wrappers: basename is a shell, args contain "-c STR"
+    if matches!(basename, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
+        return extract_dash_c_arg(&stage.args);
+    }
+    // --- eval: concatenate all args with spaces, parse that.
+    if basename == "eval" {
+        if stage.args.is_empty() {
+            return None;
+        }
+        return Some(stage.args.join(" "));
+    }
+    // --- -c wrappers that aren't shells directly: su / runuser
+    if matches!(basename, "su" | "runuser") {
+        return extract_dash_c_arg(&stage.args);
+    }
+    // --- watch 'cmd' — first positional (non-flag) arg is a bash string.
+    if basename == "watch" {
+        return stage.args.iter().find(|a| !a.starts_with('-')).cloned();
+    }
+    // --- find ... -exec <cmd> [args] \; or +
+    if basename == "find" {
+        return extract_find_exec_command(&stage.args);
+    }
+    // --- Prefix runners: first non-flag, non-assignment arg is the
+    // inner command name; remaining args are its argv.
+    if matches!(
+        basename,
+        "sudo"
+            | "doas"
+            | "timeout"
+            | "nohup"
+            | "env"
+            | "nice"
+            | "ionice"
+            | "setsid"
+            | "stdbuf"
+            | "unbuffer"
+            | "xargs"
+    ) {
+        return extract_prefix_runner_command(basename, &stage.args);
+    }
+    None
+}
+
+/// Scan `args` for the first `-c` flag (or `-c=STR`) and return the
+/// string after it. Handles `-c STR`, `--command STR`, `-c=STR`,
+/// `--command=STR`. Returns `None` if there's no `-c` or no value.
+fn extract_dash_c_arg(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-c" || arg == "--command" {
+            return iter.next().cloned();
+        }
+        if let Some(rest) = arg.strip_prefix("-c=") {
+            return Some(rest.to_string());
+        }
+        if let Some(rest) = arg.strip_prefix("--command=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// `find <paths> <predicates> -exec <cmd> <args...> \;` — extract
+/// the command + args between `-exec` and `;`/`+` into a single
+/// shell-parseable string.
+fn extract_find_exec_command(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-exec" || args[i] == "-execdir" || args[i] == "-ok" || args[i] == "-okdir" {
+            let mut parts: Vec<String> = Vec::new();
+            for arg in &args[i + 1..] {
+                if arg == ";" || arg == "\\;" || arg == "+" {
+                    break;
+                }
+                parts.push(arg.clone());
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            return Some(parts.join(" "));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Prefix runner — skip leading flags / VAR=x style env assignments;
+/// the first remaining arg is the inner command name, the rest is its
+/// argv. Reconstruct a bash-parseable string.
+///
+/// `xargs` is included here because `xargs cmd args...` has the same
+/// shape as `sudo cmd args...` for our purposes (the inner cmd is a
+/// real command we should classify).
+fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<String> {
+    // Number of leading positional args that belong to the wrapper
+    // itself, not the inner command. Most wrappers consume 0; timeout
+    // consumes 1 (the duration).
+    let positional_skip: usize = match wrapper {
+        "timeout" => 1,
+        _ => 0,
+    };
+    let mut wrapper_positionals_seen: usize = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        // Env-style `VAR=value` assignment (recognized by `env`; harmless
+        // to other wrappers — they won't parse it as their own flag).
+        if arg.contains('=') && !arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // Wrapper's own flags:
+        if arg.starts_with('-') {
+            let takes_value = matches!(
+                (wrapper, arg.as_str()),
+                ("sudo", "-u" | "-g" | "-p" | "-C" | "-T")
+                    | ("doas", "-u" | "-C")
+                    | ("timeout", "-s" | "--signal" | "-k" | "--kill-after")
+                    | ("nice", "-n")
+                    | ("ionice", "-c" | "-n" | "-t")
+                    | (
+                        "env",
+                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+                    )
+                    | ("xargs", "-I" | "-L" | "-n" | "-P" | "-d" | "-E" | "-s")
+                    | ("stdbuf", "-i" | "-o" | "-e")
+            );
+            if takes_value {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Positional argument. Wrapper-owned positionals (like
+        // timeout's duration) still count toward the skip budget
+        // before we reach the inner command.
+        if wrapper_positionals_seen < positional_skip {
+            wrapper_positionals_seen += 1;
+            i += 1;
+            continue;
+        }
+        // First positional that belongs to the inner command: rest of
+        // argv is the inner's args.
+        let cmd_name = &args[i];
+        let rest = &args[i + 1..];
+        let mut out = cmd_name.clone();
+        for r in rest {
+            out.push(' ');
+            out.push_str(r);
+        }
+        return Some(out);
+    }
+    None
 }
 
 /// H1 audit finding: a pipeline with `curl` or `wget` as any stage and
