@@ -179,69 +179,176 @@ fn is_curl_or_wget(basename: &str) -> bool {
     matches!(basename, "curl" | "wget")
 }
 
-/// H2 audit finding: a pipeline whose final stage is a decode operation
-/// (`base64 -d`, `xxd -r`, `openssl enc -d`, `uudecode`) writing to a
-/// path whose shape implies execution. Also: any single command with
-/// the same decode + redirect shape.
+/// H2 audit finding: a pipeline that decodes content and writes the
+/// decoded bytes to a path whose shape implies execution.
 ///
-/// This is the "download and run later" evasion of H1 — the exec
-/// happens on a second Bash call so H1's same-pipeline check doesn't
-/// fire.
+/// Deny rules:
+/// 1. **Pipeline**: any stage is a decoder AND the pipeline's effective
+///    output redirect (see [`effective_out_file_target`]) is an exec
+///    target.
+/// 2. **tee/uudecode side-channel**: any stage writes to a file via its
+///    own argv (not a shell `>` redirect) and the target is an exec
+///    target, where the pipeline contains at least one decoder. This
+///    catches `base64 -d | tee /tmp/a.sh > /dev/null` and
+///    `cat b.uue | uudecode -o /tmp/a.sh`.
 ///
 /// Returns `Some(reason)` if the pipeline matches.
 fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<String> {
-    let tail = pipeline.stages.last()?;
-    let out_file = tail_out_file_target(tail)?;
-    if !is_exec_target(&out_file) {
+    let has_decoder = pipeline.stages.iter().any(is_decode_stage);
+    if !has_decoder {
         return None;
     }
-    // The tail stage must actually be a decode operation for H2. A
-    // plain `echo hi > /tmp/x.sh` is legit (users write scripts), and
-    // any *content*-scanning check on the payload is Phase 7 (post-
-    // edit/post-mcp scanner).
-    if !is_decode_stage(tail) {
-        return None;
+    // Rule 1: effective `>` / `>>` target on the pipeline's tail stage.
+    if let Some(tail) = pipeline.stages.last() {
+        if let Some(target) = effective_out_file_target(tail) {
+            if is_exec_target(&target) {
+                return Some(format_h2_reason(&decoder_name(pipeline), &target));
+            }
+        }
     }
-    Some(format!(
-        "blocked: decode operation `{decoder}` writes to execution-shaped \
-         target `{target}` (H2 — staged payload, evades curl|bash check)",
-        decoder = tail.basename,
-        target = out_file,
-    ))
+    // Rule 2: any stage writes via its own `-o`/`tee` argv.
+    for stage in &pipeline.stages {
+        if let Some(target) = argv_output_target(stage) {
+            if is_exec_target(&target) {
+                return Some(format_h2_reason(&decoder_name(pipeline), &target));
+            }
+        }
+    }
+    None
 }
 
-/// Return the target of this command's first `OutFile` redirect, or
-/// `None` if it has no file-output redirect.
-fn tail_out_file_target(stage: &crate::parser::Command) -> Option<String> {
+fn format_h2_reason(decoder: &str, target: &str) -> String {
+    format!(
+        "blocked: decode pipeline (decoder `{decoder}`) writes to \
+         execution-shaped target `{t}` (H2 — staged payload, evades \
+         curl|bash check)",
+        t = sanitize_reason_text(target),
+    )
+}
+
+/// First decoder basename in the pipeline (for a reason-string hint).
+/// Always safe to call because callers have already checked
+/// `pipeline.stages.iter().any(is_decode_stage)`.
+fn decoder_name(pipeline: &Pipeline) -> String {
+    pipeline
+        .stages
+        .iter()
+        .find(|s| is_decode_stage(s))
+        .map(|s| s.basename.clone())
+        .unwrap_or_default()
+}
+
+/// Return the EFFECTIVE `>` / `>>` target of a command's redirects,
+/// matching shell "last wins" semantics.
+///
+/// Bash's `cmd > a > b` opens both files but writes only to `b`. A
+/// "first wins" scan allowed attackers to hide the real target behind
+/// a benign-looking first redirect.
+fn effective_out_file_target(stage: &crate::parser::Command) -> Option<String> {
     stage
         .redirects
         .iter()
+        .rev()
         .find_map(|r| matches!(r.kind, RedirectKind::OutFile { .. }).then(|| r.target.clone()))
+}
+
+/// For stages that carry their own write-to-file flag (instead of a
+/// shell redirect), extract the target. Today we special-case:
+/// - `tee <file> …` / `tee -a <file>` — first non-flag arg is a file.
+/// - `uudecode -o <file>` — explicit output target.
+///
+/// Returns `None` for any other command; that's fine, Rule 1 already
+/// handles `>` / `>>` redirects.
+fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
+    match stage.basename.as_str() {
+        "tee" => {
+            // Skip flags; take the first positional arg.
+            stage.args.iter().find(|a| !a.starts_with('-')).cloned()
+        }
+        "uudecode" => {
+            // Take the value following `-o`. Accept both `-o PATH` and
+            // `-o=PATH` forms.
+            let mut args = stage.args.iter();
+            while let Some(arg) = args.next() {
+                if arg == "-o" || arg == "--output-file" {
+                    if let Some(path) = args.next() {
+                        return Some(path.clone());
+                    }
+                }
+                if let Some(rest) = arg.strip_prefix("-o=") {
+                    return Some(rest.to_string());
+                }
+                if let Some(rest) = arg.strip_prefix("--output-file=") {
+                    return Some(rest.to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Is this command a decode operation that turns bytes into code?
 ///
-/// Matches:
-/// - `base64 -d` / `base64 --decode` / `base64 -D`
-/// - `xxd -r` (any form, `-r` must be present)
-/// - `openssl enc -d` / `openssl enc -D`
-/// - `uudecode` (always a decoder; no flag needed)
+/// Match rules per tool:
+/// - `base64`: any single-dash flag (`-X`) containing `d` or `D`.
+///   Catches `-d`, `-D`, `-di`, `-id`, `-Di`, `-iD`, `-dD`. Also the
+///   long forms `--decode` / `--Decode`.
+/// - `xxd`: any single-dash flag containing `r`. Catches `-r`, `-rp`,
+///   `-r -p` (same either way because args are separate tokens).
+/// - `openssl`: any arg is `-d` or `-D`. Drops the `enc` requirement;
+///   modern openssl accepts `openssl base64 -d` without `enc`.
+/// - `uudecode`: always a decoder (no encode mode exists).
 ///
-/// `base64` / `xxd` / `openssl` without the decode flag are encoders or
-/// dumpers and are not attack shapes — they don't turn data into code.
+/// Encoders, dumpers, and help flags don't match.
 fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
     match cmd.basename.as_str() {
-        "base64" => cmd
-            .args
-            .iter()
-            .any(|a| a == "-d" || a == "--decode" || a == "-D"),
-        "xxd" => cmd.args.iter().any(|a| a == "-r" || a.starts_with("-r")),
-        "openssl" => {
-            cmd.args.iter().any(|a| a == "enc") && cmd.args.iter().any(|a| a == "-d" || a == "-D")
-        }
+        "base64" => cmd.args.iter().any(|a| is_base64_decode_flag(a)),
+        "xxd" => cmd.args.iter().any(|a| is_xxd_reverse_flag(a)),
+        "openssl" => cmd.args.iter().any(|a| a == "-d" || a == "-D"),
         "uudecode" => true,
         _ => false,
     }
+}
+
+fn is_base64_decode_flag(arg: &str) -> bool {
+    if arg == "--decode" || arg == "--Decode" {
+        return true;
+    }
+    // Single-dash form: `-` followed by chars; at least one char is 'd'/'D'.
+    if let Some(rest) = arg.strip_prefix('-') {
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.chars().any(|c| c == 'd' || c == 'D');
+        }
+    }
+    false
+}
+
+fn is_xxd_reverse_flag(arg: &str) -> bool {
+    if let Some(rest) = arg.strip_prefix('-') {
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.chars().any(|c| c == 'r');
+        }
+    }
+    false
+}
+
+/// Replace every ASCII control char (except `\n` and `\t`) in `s` with
+/// a space, so attacker-controlled path components can't rewrite the
+/// terminal when `Claude Code` surfaces the deny reason on stderr.
+///
+/// Rust's `&str` guarantees well-formed UTF-8 at the buffer level; we
+/// only need to neutralize control codepoints, not raw byte smuggling.
+fn sanitize_reason_text(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Does `path` look like a file whose contents will execute later?
@@ -256,6 +363,14 @@ fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
 fn is_exec_target(path: &str) -> bool {
     let trimmed = path.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+    // `/dev/*` paths are never execution-shaped. `/dev/null`,
+    // `/dev/stderr`, `/dev/fd/2`, `/dev/tty`, etc. can't execute; nor
+    // can `/dev/tcp/host/port` (that's an egress channel, but a
+    // different policy's concern). Short-circuit before the
+    // no-extension heuristic which would otherwise flag them.
+    if trimmed.starts_with("/dev/") || trimmed == "/dev" {
         return false;
     }
     // Strip any trailing slash (unlikely on a redirect target but defensive).

