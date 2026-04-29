@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# macOS
+.DS_Store
+
+# Editor scratch
+*.swp
+.idea/
+.vscode/
+
+# OMC state (ephemeral)
+.omc/
+.claude/
