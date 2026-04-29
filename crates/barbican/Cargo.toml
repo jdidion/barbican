@@ -1,0 +1,24 @@
+[package]
+name = "barbican"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+phf = { version = "0.11", features = ["macros"] }
+regex = "1.11"
+rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "transport-io"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "io-std", "io-util", "time", "sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+unicode-normalization = "0.1"

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/barbican"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/jdidion/barbican"
+description = "Rust port of Narthex: a safety layer for Claude Code hooks and MCP tools."
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Deliberate opt-outs: these pedantic lints collide with a safety tool's
+# deliberately-verbose style (explicit matches, explicit types in public APIs).
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# We prose-reference CamelCase Claude Code concepts (PreToolUse, PostToolUse,
+# MultiEdit, Bash, Edit, Write) frequently in module docs. The lint wants
+# backticks around every one; not worth the review noise for a pedantic
+# formatting rule.
+doc_markdown = "allow"
+
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
