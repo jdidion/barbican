@@ -1,8 +1,10 @@
 //! Bash parser + IR used by every composition classifier.
 //!
 //! Wrapper around `tree-sitter-bash`. A single parser choice, with
-//! `tree.root_node().has_error()` as the hard-deny signal per
-//! CLAUDE.md rule #1 (deny by default). There is no regex fallback.
+//! `tree.root_node().has_error()` as one hard-deny signal and
+//! [`ParseError::Malformed`] from the walker as the other, both
+//! honoring CLAUDE.md rule #1 (deny by default). There is no regex
+//! fallback.
 //!
 //! # IR surface
 //!
@@ -12,6 +14,33 @@
 //! name (H1 foundation), its remaining argv as raw text, any redirects
 //! attached to it, and any `$(...)` / `<(...)` / `>(...)` substitutions
 //! as fully-parsed sub-scripts so classifiers can recurse.
+//!
+//! # Deny policy for non-representable shapes
+//!
+//! The walker refuses (returns [`ParseError::Malformed`]) on:
+//!
+//! - Any pipeline stage that is not a simple command or
+//!   `redirected_statement{command}`. In particular
+//!   `curl ... | (bash)` (subshell), `curl ... | { bash; }`
+//!   (compound_statement), and `curl ... | if true; then bash; fi`
+//!   (control-flow) are denied — they are the H1 bypass surface.
+//! - Any `redirected_statement` whose body is a compound_statement or
+//!   subshell, e.g. `{ cat /etc/shadow; } > /tmp/x.sh`. We cannot
+//!   safely attribute the redirect to any single inner command, and
+//!   the shape is an H2 write-to-exec-target bypass.
+//! - Any `redirected_statement` whose body is a control-flow statement
+//!   (`if/while/for/case/until`). Legitimate usage is rare; the shape
+//!   is preferred by staged attacks.
+//! - Invalid UTF-8 byte boundaries inside a tree-sitter node range
+//!   (defensive; `&str` input guarantees bytes are UTF-8 but a
+//!   grammar bug could still produce a mid-char range).
+//! - Recursion deeper than [`MAX_DEPTH`] substitutions / nested walks.
+//!
+//! Benign top-level uses of these constructs (`{ echo hi; }`,
+//! `( echo hi )`, `if true; then echo hi; fi`) parse cleanly — we
+//! recurse into their bodies and surface the inner commands as
+//! top-level pipelines. The deny only fires when they appear in
+//! pipeline stages or as redirect targets.
 //!
 //! # Deliberate Phase-1 scope
 //!
@@ -23,22 +52,16 @@
 //! Out of scope until later phases:
 //! - Variable expansion (`$FOO`, `${FOO}`) — raw text only.
 //! - Arithmetic `$(( ... ))`.
-//! - `case` / `if` / `while` / `for` bodies — they parse but don't
-//!   surface as first-class IR yet. Classifiers that care must walk
-//!   the raw tree-sitter tree until a later phase.
-//!
-//! Parser edge cases that we deliberately hard-deny (documented in
-//! SECURITY.md §Known parser limits):
-//! - Any input that `tree-sitter-bash` reports with `has_error()`,
-//!   including unterminated quotes, unmatched parens, truncated heredocs.
-//! - Any input that parses cleanly but contains node kinds we don't yet
-//!   traverse is reported through the tree but may result in missing
-//!   substitution/redirect entries; classifiers treat "missing"
-//!   conservatively and the integration test suite catches regressions.
 
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::cmd::cmd_basename;
+
+/// Maximum nesting depth for recursive walks. A bash script with this
+/// many nested substitutions / blocks is almost certainly adversarial;
+/// we cap it to defend against stack overflow DoS regardless of what
+/// `tree-sitter-bash`'s internal recursion limit is.
+const MAX_DEPTH: usize = 100;
 
 /// A parsed bash script, ready for classifier consumption.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -56,8 +79,9 @@ pub struct Pipeline {
 /// One simple command in the IR.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Command {
-    /// `argv[0]` after [`cmd_basename`] + surrounding-quote strip.
-    /// This is the string classifiers match against [`crate::tables`] sets.
+    /// `argv[0]` after [`cmd_basename`] + surrounding-quote /
+    /// `$'...'` / `$"..."` strip. This is the string classifiers match
+    /// against [`crate::tables`] sets.
     pub basename: String,
     /// `argv[0]` as written, preserved for audit-log readability.
     pub argv0_raw: String,
@@ -77,25 +101,26 @@ pub struct Command {
 pub struct Redirect {
     pub kind: RedirectKind,
     /// Raw text of the redirect target: a filename for file redirects,
-    /// the here-string body for `<<<`, the delimiter for a heredoc,
-    /// the wrapped command for a process substitution.
+    /// the here-string body for `<<<`, the delimiter (with any surrounding
+    /// quoting) for a heredoc.
     pub target: String,
 }
 
 /// Classification of a redirect operator.
+///
+/// Note: `<(...)` / `>(...)` process substitutions are NOT surfaced as
+/// redirects — they always appear as entries in [`Command::substitutions`]
+/// because the grammar treats them as argv words, not redirect targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectKind {
-    /// `> file`, `2> file`, `&> file`, `>> file`.
+    /// `> file`, `2> file`, `&> file`, `>> file`, `2>> file`, `&>> file`.
     OutFile { append: bool },
-    /// `< file`.
+    /// `< file`, `2< file`.
     InFile,
     /// `<<< string`.
     HereString,
     /// `<< EOF ... EOF`.
     Heredoc,
-    /// `<(...)` or `>(...)` — the inner command also appears in the
-    /// parent command's `substitutions` list.
-    ProcessSubstitution,
 }
 
 /// Parser failure mode. Every variant is a hard deny.
@@ -104,9 +129,12 @@ pub enum ParseError {
     /// Could not load the bash grammar. Treat as system error, but
     /// still deny — we cannot classify anything.
     ParserInit,
-    /// The parser emitted at least one `ERROR` or `MISSING` node.
-    /// Could be attacker-crafted unterminated quoting, or could be
-    /// benign exotic syntax. Barbican denies either way.
+    /// The parser emitted at least one `ERROR` or `MISSING` node,
+    /// the walker encountered an unrepresentable shape (subshell /
+    /// compound pipeline stage, redirect on compound body, control
+    /// flow behind a redirect), recursion exceeded [`MAX_DEPTH`], or
+    /// a node spanned invalid UTF-8. All collapse to "denied by
+    /// default."
     Malformed,
 }
 
@@ -116,8 +144,9 @@ impl std::fmt::Display for ParseError {
             Self::ParserInit => write!(f, "bash parser failed to initialize"),
             Self::Malformed => write!(
                 f,
-                "bash input could not be parsed cleanly (ERROR or MISSING node) \
-                 — denied by default"
+                "bash input could not be parsed cleanly \
+                 (error node, unrepresentable shape, depth exceeded, \
+                 or invalid UTF-8) — denied by default"
             ),
         }
     }
@@ -126,13 +155,6 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parse `input` as a bash script.
-///
-/// Errors:
-/// - [`ParseError::ParserInit`] if the tree-sitter-bash language fails
-///   to load (shouldn't happen in practice; the grammar is statically
-///   linked).
-/// - [`ParseError::Malformed`] if the parser produced an error tree
-///   — hard-deny per CLAUDE.md rule #1.
 pub fn parse(input: &str) -> Result<Script, ParseError> {
     let mut parser = Parser::new();
     parser
@@ -145,295 +167,452 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
     }
 
     let src = input.as_bytes();
-    Ok(walk_program(&tree, src))
+    walk_program(&tree, src)
 }
 
 /// Walk the `program` root and collect every pipeline.
-fn walk_program(tree: &Tree, src: &[u8]) -> Script {
+fn walk_program(tree: &Tree, src: &[u8]) -> Result<Script, ParseError> {
     let mut script = Script::default();
     let root = tree.root_node();
-    for child in named_children(root) {
-        walk_statement(child, src, &mut script.pipelines);
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        walk_statement(child, src, &mut script.pipelines, 0)?;
     }
-    script
+    Ok(script)
 }
 
-/// Recurse into a single top-level statement, appending any pipelines
-/// it contains to `out`.
+/// Recurse into a single statement, appending any pipelines it
+/// contains to `out`.
 ///
-/// tree-sitter-bash's node kinds we care about:
-/// - `pipeline`: `a | b | c`
-/// - `command`: a bare simple command
-/// - `redirected_statement`: wraps a command or pipeline with trailing
-///   redirects, e.g. `echo hi > file`
-/// - `list`: `a ; b`, `a && b`, `a || b`
-/// - `compound_statement`, `subshell`, `if_statement`, `while_statement`,
-///   `for_statement`, `function_definition`, `case_statement`: recurse
-///   into their bodies so we pick up nested commands. Not first-class
-///   IR in Phase 1; they flatten into the surrounding pipeline list.
-fn walk_statement(node: Node<'_>, src: &[u8], out: &mut Vec<Pipeline>) {
+/// See the module doc for the deny policy.
+fn walk_statement(
+    node: Node<'_>,
+    src: &[u8],
+    out: &mut Vec<Pipeline>,
+    depth: usize,
+) -> Result<(), ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError::Malformed);
+    }
     match node.kind() {
-        "pipeline" => out.push(walk_pipeline(node, src)),
+        "pipeline" => out.push(walk_pipeline(node, src, depth + 1)?),
         "command" => out.push(Pipeline {
-            stages: vec![walk_command(node, src)],
+            stages: vec![walk_command(node, src, depth + 1)?],
         }),
-        "redirected_statement" => {
-            let body = node
-                .child_by_field_name("body")
-                .unwrap_or_else(|| named_children(node).next().unwrap_or(node));
-            let redirects = collect_redirects(node, src);
-
-            match body.kind() {
-                "pipeline" => {
-                    let mut p = walk_pipeline(body, src);
-                    if let Some(last) = p.stages.last_mut() {
-                        last.redirects.extend(redirects);
-                    }
-                    out.push(p);
-                }
-                "command" => {
-                    let mut c = walk_command(body, src);
-                    c.redirects.extend(redirects);
-                    out.push(Pipeline { stages: vec![c] });
-                }
-                _ => {
-                    // Unrecognized body — recurse; attached redirects
-                    // are lost in this phase. Documented limit.
-                    walk_statement(body, src, out);
+        "redirected_statement" => walk_redirected_statement(node, src, out, depth + 1)?,
+        // Data / leaf kinds appearing inside control-flow statements
+        // (`for x in a b c` puts each word here). Not attack-interesting
+        // and don't need to recurse — but don't deny either, since
+        // denying breaks legitimate `for`/`case` loops.
+        "variable_assignment"
+        | "declaration_command"
+        | "unset_command"
+        | "comment"
+        | "word"
+        | "string"
+        | "raw_string"
+        | "ansi_c_string"
+        | "variable_name"
+        | "simple_expansion"
+        | "expansion"
+        | "concatenation"
+        | "number"
+        | "regex"
+        | "test_command"
+        | "case_item"
+        | "string_content" => {
+            // Later phases may track variables / expansions.
+        }
+        // Benign top-level grouping + control flow: recurse into bodies
+        // so inner commands surface as top-level pipelines. The deny
+        // for these constructs only fires inside `walk_pipeline` or
+        // `walk_redirected_statement`, where they become a bypass
+        // surface.
+        "list"
+        | "compound_statement"
+        | "subshell"
+        | "function_definition"
+        | "if_statement"
+        | "elif_clause"
+        | "else_clause"
+        | "while_statement"
+        | "until_statement"
+        | "for_statement"
+        | "c_style_for_statement"
+        | "case_statement"
+        | "negated_command"
+        | "do_group"
+        | "named_expansion" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    walk_statement(child, src, out, depth + 1)?;
                 }
             }
         }
-        "variable_assignment" | "declaration_command" | "unset_command" | "comment" => {
-            // Not attack-interesting. Classifier may re-walk the tree
-            // in later phases if variable tracking is needed.
-        }
-        // `list`, compound/subshell/function/if/while/until/for/case:
-        // recurse into named children so nested commands surface as
-        // top-level pipelines. Also the catch-all for grammar node
-        // kinds we haven't enumerated — defensive recursion beats
-        // silent drop.
         _ => {
-            for child in named_children(node) {
-                walk_statement(child, src, out);
-            }
+            // Unknown node kind. Per CLAUDE.md rule #1, deny by default.
+            // If a legitimate grammar node kind surfaces that we haven't
+            // enumerated, add it above with a deliberate decision.
+            return Err(ParseError::Malformed);
         }
     }
+    Ok(())
 }
 
-fn walk_pipeline(node: Node<'_>, src: &[u8]) -> Pipeline {
+/// Walk a `pipeline` node.
+///
+/// Denies when any stage is not a simple command (bare or behind a
+/// file redirect). Subshells, compound statements, and control flow
+/// are the H1 bypass surface this guards.
+fn walk_pipeline(node: Node<'_>, src: &[u8], depth: usize) -> Result<Pipeline, ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError::Malformed);
+    }
     let mut stages = Vec::with_capacity(2);
-    for child in named_children(node) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "command" => stages.push(walk_command(child, src)),
+            "command" => stages.push(walk_command(child, src, depth + 1)?),
             "redirected_statement" => {
-                let body = child
-                    .child_by_field_name("body")
-                    .unwrap_or_else(|| named_children(child).next().unwrap_or(child));
-                let redirects = collect_redirects(child, src);
-                if body.kind() == "command" {
-                    let mut c = walk_command(body, src);
-                    c.redirects.extend(redirects);
-                    stages.push(c);
+                let body = redirected_statement_body(child)?;
+                if body.kind() != "command" {
+                    // `redirected_statement` with a non-command body
+                    // appearing as a pipeline stage is the same bypass
+                    // surface as a bare subshell stage.
+                    return Err(ParseError::Malformed);
                 }
+                let mut c = walk_command(body, src, depth + 1)?;
+                c.redirects.extend(collect_redirects(child, src)?);
+                stages.push(c);
             }
-            _ => {}
+            _ => return Err(ParseError::Malformed),
         }
     }
-    Pipeline { stages }
+    Ok(Pipeline { stages })
 }
 
-fn walk_command(node: Node<'_>, src: &[u8]) -> Command {
+/// Walk a `redirected_statement`, attaching its trailing redirects to
+/// the correct inner stage.
+///
+/// - body = `pipeline`: attach to the last stage (the H2 attack shape).
+/// - body = `command`: attach to the single stage.
+/// - body is a compound / subshell / control-flow / other: deny.
+fn walk_redirected_statement(
+    node: Node<'_>,
+    src: &[u8],
+    out: &mut Vec<Pipeline>,
+    depth: usize,
+) -> Result<(), ParseError> {
+    let body = redirected_statement_body(node)?;
+    let redirects = collect_redirects(node, src)?;
+    match body.kind() {
+        "pipeline" => {
+            let mut p = walk_pipeline(body, src, depth + 1)?;
+            let last = p.stages.last_mut().ok_or(ParseError::Malformed)?;
+            last.redirects.extend(redirects);
+            out.push(p);
+        }
+        "command" => {
+            let mut c = walk_command(body, src, depth + 1)?;
+            c.redirects.extend(redirects);
+            out.push(Pipeline { stages: vec![c] });
+        }
+        _ => {
+            // compound_statement / subshell / if_statement / while_statement
+            // / for_statement / until_statement / case_statement — any of
+            // these carrying trailing redirects is an H2 write-to-exec-
+            // target bypass surface. Deny.
+            return Err(ParseError::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// The body of a `redirected_statement` is the first named child that
+/// isn't a redirect. The grammar doesn't provide a `body` field, so
+/// find it by filtering.
+fn redirected_statement_body(node: Node<'_>) -> Result<Node<'_>, ParseError> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !is_redirect_kind(child.kind()) {
+            return Ok(child);
+        }
+    }
+    Err(ParseError::Malformed)
+}
+
+fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError::Malformed);
+    }
     let mut cmd = Command::default();
 
-    // argv[0] comes from the `command_name` field.
-    if let Some(name_node) = node.child_by_field_name("name") {
-        let raw = extract_word_text(name_node, src);
-        cmd.basename = cmd_basename(strip_surrounding_quotes(&raw)).to_string();
+    let name_node = node.child_by_field_name("name");
+    let name_id = name_node.map(|n| n.id());
+    if let Some(name_node) = name_node {
+        let raw = extract_word_text(name_node, src)?;
+        cmd.basename = cmd_basename(strip_command_name_quoting(&raw)).to_string();
         cmd.argv0_raw = raw;
-        // Substitutions nested inside the command name itself.
-        collect_substitutions(name_node, src, &mut cmd.substitutions);
+        collect_substitutions(name_node, src, &mut cmd.substitutions, depth + 1)?;
     }
 
-    // Remaining argv: every `argument`-field child, plus inline
-    // redirects collected into the redirects vec.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        // `child_by_field_name` only yields one; iterate all children
-        // so repeated fields like `argument` all show up.
         if !child.is_named() {
             continue;
         }
         if is_redirect_kind(child.kind()) {
-            if let Some(r) = redirect_from_node(child, src) {
-                cmd.redirects.push(r);
-            }
-            // A process substitution also contributes a sub-script.
-            collect_substitutions(child, src, &mut cmd.substitutions);
+            cmd.redirects
+                .push(redirect_from_node(child, src, depth + 1)?);
+            collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
             continue;
         }
-        if node
-            .child_by_field_name("name")
-            .is_some_and(|n| n.id() == child.id())
-        {
+        if name_id == Some(child.id()) {
             // Already consumed as argv[0].
             continue;
         }
-        // Treat every remaining non-redirect named child as an argument.
-        cmd.args.push(extract_word_text(child, src));
-        collect_substitutions(child, src, &mut cmd.substitutions);
+        cmd.args.push(extract_word_text(child, src)?);
+        collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
     }
 
-    cmd
+    Ok(cmd)
 }
 
 /// Return `true` if the node kind is any of tree-sitter-bash's redirect
 /// nodes.
-const fn is_redirect_kind(kind: &str) -> bool {
+fn is_redirect_kind(kind: &str) -> bool {
     matches!(
-        kind.as_bytes(),
-        b"file_redirect" | b"herestring_redirect" | b"heredoc_redirect",
+        kind,
+        "file_redirect" | "herestring_redirect" | "heredoc_redirect"
     )
 }
 
-/// Build a [`Redirect`] from a tree-sitter redirect node, or `None` if
-/// the node is something we don't yet model.
-fn redirect_from_node(node: Node<'_>, src: &[u8]) -> Option<Redirect> {
+/// Build a [`Redirect`] from a tree-sitter redirect node.
+///
+/// Deny on any redirect shape we don't know — being lenient here
+/// re-creates the bypass class the review flagged.
+fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redirect, ParseError> {
     match node.kind() {
         "file_redirect" => {
-            let op_text = redirect_operator_text(node, src);
-            let append = op_text.starts_with(">>") || op_text == "&>>";
+            let op_text = redirect_operator_text(node, src)?;
+            // `>>`, `2>>`, `&>>` all contain the literal `>>`. Previous
+            // code used `starts_with(">>")` which misfired on `2>>`
+            // because the file_descriptor prefix is part of the node
+            // span.
+            let append = op_text.contains(">>");
             let is_out = op_text.contains('>');
             let kind = if is_out {
                 RedirectKind::OutFile { append }
             } else {
                 RedirectKind::InFile
             };
-            let target = node
+            let dest = node
                 .child_by_field_name("destination")
-                .map(|n| extract_word_text(n, src))
-                .unwrap_or_default();
-            Some(Redirect { kind, target })
+                .ok_or(ParseError::Malformed)?;
+            let target = extract_word_text(dest, src)?;
+            let mut redirect = Redirect { kind, target };
+            // `destination` can contain a process substitution — preserve
+            // it via the caller (see walk_command, which collects subs on
+            // the redirect node itself).
+            let _ = depth; // reserved for future recursion through target
+                           // Reconstruct nothing else; substitutions are captured at
+                           // the walk_command layer.
+            redirect.target.shrink_to_fit();
+            Ok(redirect)
         }
         "herestring_redirect" => {
-            let target = node
+            // The value is typically the sole named child (the string
+            // literal). Accept `value` field if present, otherwise
+            // take the last named child as a fallback.
+            let target_node = node
                 .child_by_field_name("value")
-                .or_else(|| named_children(node).last())
-                .map(|n| extract_word_text(n, src))
-                .unwrap_or_default();
-            Some(Redirect {
+                .or_else(|| last_named_child(node))
+                .ok_or(ParseError::Malformed)?;
+            let target = extract_word_text(target_node, src)?;
+            Ok(Redirect {
                 kind: RedirectKind::HereString,
                 target,
             })
         }
-        "heredoc_redirect" => Some(Redirect {
-            kind: RedirectKind::Heredoc,
-            target: node
-                .child_by_field_name("delimiter")
-                .map(|n| extract_word_text(n, src))
-                .unwrap_or_default(),
-        }),
-        _ => None,
+        "heredoc_redirect" => {
+            // Grammar shape: `heredoc_redirect` has children
+            // `heredoc_start` (delimiter, with any surrounding quoting)
+            // and `heredoc_body` / `heredoc_end`. There is NO `delimiter`
+            // field; the prior code looked one up and always got None.
+            let start =
+                find_named_child_by_kind(node, "heredoc_start").ok_or(ParseError::Malformed)?;
+            let target = extract_word_text(start, src)?;
+            Ok(Redirect {
+                kind: RedirectKind::Heredoc,
+                target,
+            })
+        }
+        _ => Err(ParseError::Malformed),
     }
 }
 
-/// Collect every trailing redirect on a `redirected_statement`.
-fn collect_redirects(node: Node<'_>, src: &[u8]) -> Vec<Redirect> {
+/// Collect every redirect that is a direct named child of `node`.
+///
+/// For `cat <<EOF > /tmp/a.sh`, the grammar nests the `file_redirect`
+/// inside the `heredoc_redirect`. Flatten by descending once into any
+/// heredoc child and picking up its inner file redirects too.
+fn collect_redirects(node: Node<'_>, src: &[u8]) -> Result<Vec<Redirect>, ParseError> {
     let mut out = Vec::new();
-    for child in named_children(node) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
         if is_redirect_kind(child.kind()) {
-            if let Some(r) = redirect_from_node(child, src) {
-                out.push(r);
+            out.push(redirect_from_node(child, src, 1)?);
+            if child.kind() == "heredoc_redirect" {
+                let mut inner = child.walk();
+                for inner_child in child.named_children(&mut inner) {
+                    if inner_child.kind() == "file_redirect" {
+                        out.push(redirect_from_node(inner_child, src, 1)?);
+                    }
+                }
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// Extract the unquoted, unexpanded text that best represents this
-/// word's shell-level value. For Phase 1 this is best-effort:
-/// - `word` → raw bytes.
-/// - `string` / `raw_string` → stripped of surrounding quotes.
-/// - `concatenation` → each child recursively and concatenated.
-/// - everything else → raw bytes.
-fn extract_word_text(node: Node<'_>, src: &[u8]) -> String {
+/// Extract the effective shell-level text of a word-shaped node.
+///
+/// Surface-level: strips one layer of surrounding quotes from plain
+/// `string` / `raw_string` / `ansi_c_string` nodes so classifiers
+/// compare against the literal value. For deeper constructs like
+/// `concatenation`, descend and concatenate children.
+///
+/// Errors on invalid UTF-8 — `&str` input guarantees byte validity,
+/// so a failure here is either a tree-sitter bug placing a range on
+/// a non-boundary, or a grammar emitting an impossible span; either
+/// way we deny per CLAUDE.md rule #1.
+fn extract_word_text(node: Node<'_>, src: &[u8]) -> Result<String, ParseError> {
     match node.kind() {
         "string" | "raw_string" | "ansi_c_string" => {
-            let raw = raw_text(node, src);
-            strip_surrounding_quotes(raw).to_string()
+            let raw = raw_text(node, src)?;
+            Ok(strip_surrounding_quotes(raw).to_string())
         }
         "concatenation" => {
             let mut s = String::new();
-            for child in named_children(node) {
-                s.push_str(&extract_word_text(child, src));
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                s.push_str(&extract_word_text(child, src)?);
             }
-            s
+            Ok(s)
         }
-        // `word`, `simple_expansion`, `expansion`, and every other node
-        // kind we don't specialize: use the raw byte slice from source.
-        _ => raw_text(node, src).to_string(),
+        // `word`, `simple_expansion`, `expansion`, `command_name` (when
+        // the command_name wraps another word-like child), and every
+        // other kind: use the raw byte slice.
+        _ => Ok(raw_text(node, src)?.to_string()),
     }
 }
 
 /// Find every `$(...)` / `` `...` `` / `<(...)` / `>(...)` inside the
 /// subtree rooted at `node` and append each one, fully parsed, to `out`.
-fn collect_substitutions(node: Node<'_>, src: &[u8], out: &mut Vec<Script>) {
+fn collect_substitutions(
+    node: Node<'_>,
+    src: &[u8],
+    out: &mut Vec<Script>,
+    depth: usize,
+) -> Result<(), ParseError> {
+    if depth > MAX_DEPTH {
+        return Err(ParseError::Malformed);
+    }
     match node.kind() {
         "command_substitution" | "process_substitution" => {
             let mut inner = Script::default();
-            for child in named_children(node) {
-                walk_statement(child, src, &mut inner.pipelines);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_statement(child, src, &mut inner.pipelines, depth + 1)?;
             }
             out.push(inner);
-            // Do not descend further — a nested $(...)  inside $(...)
-            // will be picked up by the outer walk when the classifier
-            // recurses into `inner`.
         }
         _ => {
-            for child in named_children(node) {
-                collect_substitutions(child, src, out);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_substitutions(child, src, out, depth + 1)?;
             }
         }
     }
+    Ok(())
 }
 
-fn raw_text<'a>(node: Node<'_>, src: &'a [u8]) -> &'a str {
+fn raw_text<'a>(node: Node<'_>, src: &'a [u8]) -> Result<&'a str, ParseError> {
     let range = node.byte_range();
-    std::str::from_utf8(&src[range]).unwrap_or("")
+    if range.end > src.len() {
+        return Err(ParseError::Malformed);
+    }
+    std::str::from_utf8(&src[range]).map_err(|_| ParseError::Malformed)
 }
 
-/// Return just the operator text (`>`, `>>`, `2>`, `&>`, `&>>`) of a
-/// `file_redirect` by reading bytes from the node up to the destination
-/// field.
-fn redirect_operator_text<'a>(node: Node<'_>, src: &'a [u8]) -> &'a str {
+/// Return just the operator text (`>`, `>>`, `2>`, `2>>`, `&>`, `&>>`)
+/// of a `file_redirect` by reading bytes from the node up to the
+/// `destination` field. On malformed spans, return an error.
+fn redirect_operator_text<'a>(node: Node<'_>, src: &'a [u8]) -> Result<&'a str, ParseError> {
     let start = node.start_byte();
     let end = node
         .child_by_field_name("destination")
         .map_or_else(|| node.end_byte(), |n| n.start_byte());
-    std::str::from_utf8(&src[start..end])
-        .unwrap_or("")
-        .trim_end()
+    if end > src.len() || start > end {
+        return Err(ParseError::Malformed);
+    }
+    let slice = std::str::from_utf8(&src[start..end]).map_err(|_| ParseError::Malformed)?;
+    Ok(slice.trim_end())
 }
 
 /// If `s` is wrapped in matching `"..."`, `'...'`, or `` `...` ``,
-/// return the inner slice; otherwise return `s`.
+/// return the inner slice. Otherwise return `s`.
+///
+/// Kept narrow on purpose — `strip_command_name_quoting` handles the
+/// richer set (including `$'...'` / `$"..."`) used by `argv[0]`.
 fn strip_surrounding_quotes(s: &str) -> &str {
     let bytes = s.as_bytes();
     if bytes.len() >= 2 {
         let first = bytes[0];
         let last = bytes[bytes.len() - 1];
-        if first == last && (first == b'"' || first == b'\'' || first == b'`') {
+        if first == last && matches!(first, b'"' | b'\'' | b'`') {
             return &s[1..s.len() - 1];
         }
     }
     s
 }
 
-/// Iterator over the named children of `node`, hiding the cursor
-/// boilerplate. Named children skip punctuation / whitespace tokens.
-fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    let mut cursor = node.walk();
-    let ids: Vec<_> = node.named_children(&mut cursor).collect();
-    ids.into_iter()
+/// Strip ANSI-C (`$'...'`), localized (`$"..."`), and plain surrounding
+/// quotes off an `argv[0]` string before basename-normalizing. GPT
+/// finding C#2: without the `$` prefix handling, `$'/bin/bash'` passes
+/// cmd_basename as `bash'`, defeating H1.
+fn strip_command_name_quoting(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    // $'...' or $"..." — strip the 3-byte cap.
+    if bytes.len() >= 3 && bytes[0] == b'$' {
+        let q = bytes[1];
+        if matches!(q, b'\'' | b'"') && bytes[bytes.len() - 1] == q {
+            return &s[2..s.len() - 1];
+        }
+    }
+    strip_surrounding_quotes(s)
+}
+
+/// Linear scan for the last named child of a node, by index.
+fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let count = node.named_child_count();
+    if count == 0 {
+        None
+    } else {
+        node.named_child(count - 1)
+    }
+}
+
+/// Linear scan for the first named child of a given kind, by index.
+fn find_named_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    for i in 0..node.named_child_count() {
+        if let Some(c) = node.named_child(i) {
+            if c.kind() == kind {
+                return Some(c);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -454,6 +633,28 @@ mod tests {
         assert_eq!(strip_surrounding_quotes("\""), "\"");
         assert_eq!(strip_surrounding_quotes(""), "");
         assert_eq!(strip_surrounding_quotes("\"mismatch'"), "\"mismatch'");
+    }
+
+    #[test]
+    fn strip_command_name_quoting_ansi_c() {
+        assert_eq!(strip_command_name_quoting("$'/bin/bash'"), "/bin/bash");
+    }
+
+    #[test]
+    fn strip_command_name_quoting_localized() {
+        assert_eq!(strip_command_name_quoting("$\"/bin/bash\""), "/bin/bash");
+    }
+
+    #[test]
+    fn strip_command_name_quoting_falls_back_to_plain() {
+        assert_eq!(strip_command_name_quoting("\"/bin/bash\""), "/bin/bash");
+        assert_eq!(strip_command_name_quoting("/bin/bash"), "/bin/bash");
+    }
+
+    #[test]
+    fn strip_command_name_quoting_mismatched_dollar_keeps_input() {
+        // $'bash" — unmatched closing quote, stays as written.
+        assert_eq!(strip_command_name_quoting("$'bash\""), "$'bash\"");
     }
 
     #[test]
