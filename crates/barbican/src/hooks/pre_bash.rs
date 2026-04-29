@@ -6,21 +6,23 @@
 //! - `0` to allow the tool call.
 //! - `2` to block it (Claude Code surfaces stderr to the user).
 //!
-//! Phase 2 scope: close audit finding **H1** — `curl`/`wget` piped into
-//! a shell interpreter, basename-normalized so every path variant
-//! (`/bin/bash`, `/opt/homebrew/bin/bash`, `./bash`, `$'/bin/bash'`,
-//! etc.) denies.
+//! Shipped classifiers:
+//! - **H1** — `curl`/`wget` piped into a shell interpreter, basename-
+//!   normalized so every path variant denies.
+//! - **H2** — a pipeline whose tail stage is a decode operation
+//!   (`base64 -d`, `xxd -r`, `openssl enc -d`, `uudecode`) writing to
+//!   a path that looks like an executable (script extension, no
+//!   extension, or a known shell rc file).
 //!
-//! Other audit findings (H2, M1, M2) have their own classifier
-//! branches and land on their own feature branches. Each reuses the
-//! same parser IR + `Decision` type.
+//! Remaining audit findings (M1, M2) land on their own feature
+//! branches and plug into the same `Decision` switchboard.
 
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::parser::{self, ParseError, Pipeline, Script};
+use crate::parser::{self, ParseError, Pipeline, RedirectKind, Script};
 use crate::tables::SHELL_INTERPRETERS;
 
 /// Exit code Claude Code reads as "allow the tool call."
@@ -117,16 +119,20 @@ fn classify_command(command: &str) -> Decision {
     }
 }
 
-/// Apply every Phase-2 policy to a parsed `Script`. Phase 2 only has
-/// H1; later phases add H2, M1, M2 to the same `Decision` switchboard.
+/// Apply every shipped policy to a parsed `Script`. Each H-level has
+/// a stand-alone `h*_*` function; this function dispatches to all of
+/// them, recurses into substitutions, and returns the first deny.
 fn classify_script(script: &Script) -> Decision {
     for pipeline in &script.pipelines {
         if let Some(reason) = h1_pipeline_curl_to_shell(pipeline) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = h2_staged_decode_to_exec(pipeline) {
+            return Decision::Deny { reason };
+        }
     }
     // Substitutions are classified the same way, so `$(curl ... | bash)`
-    // denies too. Each sub-script has its own pipelines; walk them.
+    // and `X=$(base64 -d > /tmp/a.sh)` both deny.
     for pipeline in &script.pipelines {
         for stage in &pipeline.stages {
             for sub in &stage.substitutions {
@@ -172,6 +178,120 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
 fn is_curl_or_wget(basename: &str) -> bool {
     matches!(basename, "curl" | "wget")
 }
+
+/// H2 audit finding: a pipeline whose final stage is a decode operation
+/// (`base64 -d`, `xxd -r`, `openssl enc -d`, `uudecode`) writing to a
+/// path whose shape implies execution. Also: any single command with
+/// the same decode + redirect shape.
+///
+/// This is the "download and run later" evasion of H1 — the exec
+/// happens on a second Bash call so H1's same-pipeline check doesn't
+/// fire.
+///
+/// Returns `Some(reason)` if the pipeline matches.
+fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<String> {
+    let tail = pipeline.stages.last()?;
+    let out_file = tail_out_file_target(tail)?;
+    if !is_exec_target(&out_file) {
+        return None;
+    }
+    // The tail stage must actually be a decode operation for H2. A
+    // plain `echo hi > /tmp/x.sh` is legit (users write scripts), and
+    // any *content*-scanning check on the payload is Phase 7 (post-
+    // edit/post-mcp scanner).
+    if !is_decode_stage(tail) {
+        return None;
+    }
+    Some(format!(
+        "blocked: decode operation `{decoder}` writes to execution-shaped \
+         target `{target}` (H2 — staged payload, evades curl|bash check)",
+        decoder = tail.basename,
+        target = out_file,
+    ))
+}
+
+/// Return the target of this command's first `OutFile` redirect, or
+/// `None` if it has no file-output redirect.
+fn tail_out_file_target(stage: &crate::parser::Command) -> Option<String> {
+    stage
+        .redirects
+        .iter()
+        .find_map(|r| matches!(r.kind, RedirectKind::OutFile { .. }).then(|| r.target.clone()))
+}
+
+/// Is this command a decode operation that turns bytes into code?
+///
+/// Matches:
+/// - `base64 -d` / `base64 --decode` / `base64 -D`
+/// - `xxd -r` (any form, `-r` must be present)
+/// - `openssl enc -d` / `openssl enc -D`
+/// - `uudecode` (always a decoder; no flag needed)
+///
+/// `base64` / `xxd` / `openssl` without the decode flag are encoders or
+/// dumpers and are not attack shapes — they don't turn data into code.
+fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
+    match cmd.basename.as_str() {
+        "base64" => cmd
+            .args
+            .iter()
+            .any(|a| a == "-d" || a == "--decode" || a == "-D"),
+        "xxd" => cmd.args.iter().any(|a| a == "-r" || a.starts_with("-r")),
+        "openssl" => {
+            cmd.args.iter().any(|a| a == "enc") && cmd.args.iter().any(|a| a == "-d" || a == "-D")
+        }
+        "uudecode" => true,
+        _ => false,
+    }
+}
+
+/// Does `path` look like a file whose contents will execute later?
+///
+/// Narthex parity: basename must be a known shell rc file, OR have a
+/// script-extension suffix, OR have no extension at all (classic `/tmp/x`,
+/// `/usr/local/bin/run`, `~/bin/foo`).
+///
+/// Any file with a non-script extension (`.json`, `.txt`, `.csv`, etc.)
+/// is considered a data target and does not trigger H2 — writing data
+/// files is a legitimate workflow.
+fn is_exec_target(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Strip any trailing slash (unlikely on a redirect target but defensive).
+    let trimmed = trimmed.trim_end_matches('/');
+    // Basename: last segment after '/'.
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if base.is_empty() {
+        return false;
+    }
+    if SHELL_RC_FILES.contains(base) {
+        return true;
+    }
+    match base.rsplit_once('.') {
+        // No dot → no extension → bare-name exec target (`/tmp/x`).
+        // A leading dot only (dotfile like `.profile`) is caught by
+        // SHELL_RC_FILES above; `.foo` without a script ext falls here
+        // as "no extension after the lead dot".
+        None => true,
+        Some(("", _)) => false, // dotfile like ".env" — data, not exec
+        Some((_, ext)) => SCRIPT_EXTS.contains(ext.to_ascii_lowercase().as_str()),
+    }
+}
+
+/// Shell rc / profile files. Writing to these is execution-class:
+/// the next interactive shell launch will source them.
+static SHELL_RC_FILES: phf::Set<&'static str> = phf::phf_set! {
+    ".bashrc", ".zshrc", ".profile", ".bash_profile", ".bash_login",
+    ".zshenv", ".zprofile", ".zlogin",
+};
+
+/// Filename extensions associated with executable content (matched
+/// case-insensitively).
+static SCRIPT_EXTS: phf::Set<&'static str> = phf::phf_set! {
+    "sh", "bash", "zsh", "dash", "ksh", "fish",
+    "py", "pl", "rb", "js", "mjs",
+};
 
 #[cfg(test)]
 mod tests {
