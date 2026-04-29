@@ -200,29 +200,31 @@ fn walk_statement(
             stages: vec![walk_command(node, src, depth + 1)?],
         }),
         "redirected_statement" => walk_redirected_statement(node, src, out, depth + 1)?,
-        // Data / leaf kinds appearing inside control-flow statements
-        // (`for x in a b c` puts each word here). Not attack-interesting
-        // and don't need to recurse — but don't deny either, since
-        // denying breaks legitimate `for`/`case` loops.
-        "variable_assignment"
-        | "declaration_command"
-        | "unset_command"
-        | "comment"
+        // True data / leaf kinds. Never contain executable
+        // substitutions — safe to skip without recursing. Don't deny,
+        // because denying breaks legitimate `for x in a b c`, `case`,
+        // and bare assignment-to-literal.
+        "comment"
         | "word"
-        | "string"
-        | "raw_string"
-        | "ansi_c_string"
         | "variable_name"
         | "simple_expansion"
-        | "expansion"
-        | "concatenation"
         | "number"
         | "regex"
-        | "test_command"
         | "case_item"
         | "string_content" => {
             // Later phases may track variables / expansions.
         }
+        // Assignment forms CAN carry command substitutions on the
+        // right-hand side. Bash executes `X=$(curl|bash)` immediately
+        // and the attack bypasses H1 if we don't walk into them.
+        // Fall through to the generic recurse-into-named-children
+        // branch via the `_` arm below.
+        //
+        // `string`, `raw_string`, `ansi_c_string`, `concatenation`,
+        // `expansion` similarly: a `"$(curl|bash)"` literal embeds a
+        // substitution whose contents execute. Recurse.
+        //
+        // `test_command` (`[[ ... ]]`) can contain substitutions too.
         // Benign top-level grouping + control flow: recurse into bodies
         // so inner commands surface as top-level pipelines. The deny
         // for these constructs only fires inside `walk_pipeline` or
@@ -242,7 +244,25 @@ fn walk_statement(
         | "case_statement"
         | "negated_command"
         | "do_group"
-        | "named_expansion" => {
+        | "named_expansion"
+        // Assignment forms — recurse so substitutions on the RHS get
+        // classified (`X=$(curl|bash)` executes immediately in bash).
+        | "variable_assignment"
+        | "declaration_command"
+        | "unset_command"
+        // Quoted forms that can embed substitutions.
+        | "string"
+        | "raw_string"
+        | "ansi_c_string"
+        | "concatenation"
+        | "expansion"
+        | "test_command"
+        // Substitutions encountered as statement children (e.g. RHS of
+        // an assignment). Their inner pipelines flatten into the
+        // top-level `out`, so the classifier sees them the same way
+        // it would see a bare `curl | bash`.
+        | "command_substitution"
+        | "process_substitution" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
                     walk_statement(child, src, out, depth + 1)?;

@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::parser::{self, ParseError, Pipeline, Script};
-use crate::tables::{NETWORK_TOOLS_HARD, SHELL_INTERPRETERS};
+use crate::tables::SHELL_INTERPRETERS;
 
 /// Exit code Claude Code reads as "allow the tool call."
 const EXIT_ALLOW: i32 = 0;
@@ -149,12 +149,10 @@ fn classify_script(script: &Script) -> Decision {
 /// is already `cmd_basename`-normalized (H1's original bypass class).
 fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
     let stages = &pipeline.stages;
-    // Find the earliest curl/wget; then check any stage after it.
-    let net_idx = stages
-        .iter()
-        .position(|s| NETWORK_TOOLS_HARD.contains(s.basename.as_str()))
-        .filter(|_| stages.iter().any(|s| is_curl_or_wget(&s.basename)))?;
-    let net_basename = stages[net_idx].basename.clone();
+    // Narthex-parity: H1 keys specifically on curl/wget, not all of
+    // NETWORK_TOOLS_HARD. See `h1_curl_wget_scope_rationale` in the
+    // module doc + SECURITY.md §Known parser limits for why.
+    let net_idx = stages.iter().position(|s| is_curl_or_wget(&s.basename))?;
     let shell_stage = stages
         .iter()
         .skip(net_idx + 1)
@@ -162,11 +160,15 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
     Some(format!(
         "blocked: `{net}` piped to shell interpreter `{sh}` (H1 — \
          downloaded-content executed as script)",
-        net = net_basename,
+        net = stages[net_idx].basename,
         sh = shell_stage.basename,
     ))
 }
 
+/// H1's narrowed network-tool set. See `h1_pipeline_curl_to_shell` and
+/// `SECURITY.md` §Known parser limits — other egress tools (`nc`,
+/// `socat`, `ssh`, …) live in `NETWORK_TOOLS_HARD` and will be gated
+/// by later-phase classifiers.
 fn is_curl_or_wget(basename: &str) -> bool {
     matches!(basename, "curl" | "wget")
 }
