@@ -21,4 +21,9 @@ serde_json = "1.0"
 tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "io-std", "io-util", "time", "sync"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# Bash parser: exact-pinned — runtime ABI between tree-sitter core and
+# tree-sitter-bash is only tested on matching minor versions. Don't let
+# cargo update drift into 0.27 silently.
+tree-sitter = "=0.25.0"
+tree-sitter-bash = "=0.25.1"
 unicode-normalization = "0.1"
