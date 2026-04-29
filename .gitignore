@@ -13,3 +13,8 @@ Cargo.lock.bak
 # OMC state (ephemeral)
 .omc/
 .claude/
+
+# Cursor-adapt scratch (created by /crew:review when a Cursor reviewer is in
+# the roster; removed on cleanup, but we gitignore so a crash doesn't leak)
+.cursor/
+AGENTS.md
