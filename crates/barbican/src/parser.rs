@@ -104,6 +104,30 @@ pub struct Redirect {
     /// the here-string body for `<<<`, the delimiter (with any surrounding
     /// quoting) for a heredoc.
     pub target: String,
+    /// Which file descriptor the redirect targets. `>` → stdout (1),
+    /// `2>` → stderr (2), `&>` → both (1), `< file` → stdin (0). For
+    /// redirects that don't carry an fd (here-string, heredoc) this is
+    /// the default: 1 for out-facing, 0 for in-facing.
+    ///
+    /// Used so that `base64 -d > /tmp/a.sh 2> /dev/null` doesn't let
+    /// the stderr redirect mask the stdout target during H2
+    /// classification.
+    pub fd: RedirectFd,
+}
+
+/// Which file descriptor a redirect operates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectFd {
+    /// `< file`
+    Stdin,
+    /// `> file`, `>> file`
+    Stdout,
+    /// `2> file`, `2>> file`
+    Stderr,
+    /// `&> file`, `&>> file` — stdout AND stderr merged.
+    StdoutAndStderr,
+    /// Any other explicit fd (`3> file`, `5< file`).
+    Other,
 }
 
 /// Classification of a redirect operator.
@@ -426,11 +450,12 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             } else {
                 RedirectKind::InFile
             };
+            let fd = classify_redirect_fd(op_text, is_out);
             let dest = node
                 .child_by_field_name("destination")
                 .ok_or(ParseError::Malformed)?;
             let target = extract_word_text(dest, src)?;
-            let mut redirect = Redirect { kind, target };
+            let mut redirect = Redirect { kind, target, fd };
             // `destination` can contain a process substitution — preserve
             // it via the caller (see walk_command, which collects subs on
             // the redirect node itself).
@@ -452,6 +477,7 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             Ok(Redirect {
                 kind: RedirectKind::HereString,
                 target,
+                fd: RedirectFd::Stdin,
             })
         }
         "heredoc_redirect" => {
@@ -465,9 +491,40 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             Ok(Redirect {
                 kind: RedirectKind::Heredoc,
                 target,
+                fd: RedirectFd::Stdin,
             })
         }
         _ => Err(ParseError::Malformed),
+    }
+}
+
+/// Classify which fd(s) a `file_redirect` operator text targets.
+///
+/// Examples (`op_text` is the bytes of the operator region, trimmed):
+/// - `>`, `>>`       → `Stdout`
+/// - `1>`, `1>>`     → `Stdout` (fd 1 explicit)
+/// - `2>`, `2>>`     → `Stderr`
+/// - `&>`, `&>>`, `>&` → `StdoutAndStderr`
+/// - `<`, `0<`       → `Stdin`
+/// - anything else (`3>`, `5<`, etc.) → `Other`
+fn classify_redirect_fd(op_text: &str, is_out: bool) -> RedirectFd {
+    let op = op_text.trim();
+    if op.starts_with("&>") || op.contains(">&") || op.starts_with("&>>") {
+        return RedirectFd::StdoutAndStderr;
+    }
+    if op.starts_with("2>") {
+        return RedirectFd::Stderr;
+    }
+    // Leading digit that isn't 1 or 2 → other fd.
+    if let Some(first) = op.chars().next() {
+        if first.is_ascii_digit() && first != '1' && first != '2' && first != '0' {
+            return RedirectFd::Other;
+        }
+    }
+    if is_out {
+        RedirectFd::Stdout
+    } else {
+        RedirectFd::Stdin
     }
 }
 
