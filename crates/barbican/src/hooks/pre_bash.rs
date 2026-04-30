@@ -175,6 +175,12 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = m2_secret_or_base64_to_network(pipeline) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = m2_substitution_exfil(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = m2_staged_payload_to_exec_target(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -901,7 +907,12 @@ fn secret_path_regex() -> &'static regex::Regex {
                 | gh/hosts\.yml\b
                 | ~/\.netrc\b
                 | \.netrc\b
-                | \.env(?:\.[a-zA-Z0-9_-]+)?\b
+                # dotenv filename — `.env`, `prod.env`, `staging.env`,
+                # `<name>.env[.variant]`. The overall alternation is
+                # anchored on the outer start/separator char class, so
+                # we limit the pre-.env prefix here to identifier-ish
+                # chars to avoid matching inside random tokens.
+                | [A-Za-z0-9_.-]*\.env(?:\.[A-Za-z0-9_-]+)?\b
                 | ~/\.docker/config\.json
                 | ~/\.kube/config\b
                 | ~/\.npmrc\b
@@ -921,16 +932,37 @@ fn secret_path_regex() -> &'static regex::Regex {
 
 /// True if the command-raw-text (or the argv0 text) in this pipeline's
 /// joined command looks like it references a credential file.
+///
+/// Skips argv positions that are immediately after a `-m`/`--message`
+/// flag for `git`/`gh`/`glab`/`jj` — commit messages routinely mention
+/// `.env` or `.ssh` as documentation, not as file reads.
 fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
     let re = secret_path_regex();
     for stage in &pipeline.stages {
         if re.is_match(&stage.argv0_raw) {
             return true;
         }
+        let is_msg_wrapper = matches!(stage_bn_lc(stage).as_str(), "git" | "gh" | "glab" | "jj");
+        let mut prev_was_msg_flag = false;
         for a in &stage.args {
+            if is_msg_wrapper && prev_was_msg_flag {
+                // Skip this arg — it's the body of -m / --message.
+                prev_was_msg_flag = false;
+                continue;
+            }
+            if is_msg_wrapper && matches!(a.as_str(), "-m" | "--message" | "-F" | "--file") {
+                prev_was_msg_flag = true;
+                continue;
+            }
+            // Long-form `--message=VALUE` contains both in one token;
+            // skip the whole token for wrapper commands.
+            if is_msg_wrapper && (a.starts_with("--message=") || a.starts_with("-m=")) {
+                continue;
+            }
             if re.is_match(a) {
                 return true;
             }
+            prev_was_msg_flag = false;
         }
         for r in &stage.redirects {
             if re.is_match(&r.target) {
@@ -1036,6 +1068,162 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
          `{net}` (M2 — obfuscated exfil)",
         net = net_stage.basename,
     ))
+}
+
+/// M2 substitution-correlation: a pipeline's command contains a
+/// network tool (e.g. `curl "…$(env|base64)…"`) and one of its
+/// substitutions contains an env-dump, secret read, or base64, OR
+/// vice-versa. This closes the cross-`$(…)` / `<(…)` / `>(…)`
+/// source→sink bypass where the parent pipeline and the sub get
+/// classified separately and neither triggers on its own.
+fn m2_substitution_exfil(pipeline: &Pipeline) -> Option<String> {
+    // Collect the "signals" across the whole composition:
+    //   (has_net_tool, has_secret_ref, has_env_dump, has_base64)
+    // If combinations that indicate exfil appear, deny.
+    let (parent_net, parent_secret, parent_env, parent_b64) = signals_in_pipeline(pipeline);
+    // Walk substitutions recursively.
+    let mut sub_net = false;
+    let mut sub_secret = false;
+    let mut sub_env = false;
+    let mut sub_b64 = false;
+    for stage in &pipeline.stages {
+        for sub_script in &stage.substitutions {
+            for sub_pipe in &sub_script.pipelines {
+                let (n, s, e, b) = signals_in_pipeline(sub_pipe);
+                sub_net |= n;
+                sub_secret |= s;
+                sub_env |= e;
+                sub_b64 |= b;
+            }
+        }
+    }
+    let net = parent_net || sub_net;
+    let secret = parent_secret || sub_secret;
+    let env = parent_env || sub_env;
+    let b64 = parent_b64 || sub_b64;
+
+    // Only fire when the network sink and the secret/env/base64
+    // source live on opposite sides of the substitution boundary
+    // (same-side cases are already caught by the non-sub classifiers).
+    let cross_boundary = (parent_net && (sub_secret || sub_env || sub_b64))
+        || (sub_net && (parent_secret || parent_env || parent_b64));
+    if cross_boundary && net && (secret || env || b64) {
+        let kind = if secret {
+            "secret path"
+        } else if env {
+            "environment dump"
+        } else {
+            "base64-encoded content"
+        };
+        return Some(format!(
+            "blocked: {kind} flows to network tool across a \
+             $(…) / <(…) / >(…) boundary (M2 — sub-exfil)"
+        ));
+    }
+    None
+}
+
+/// Pull (has_net, has_secret, has_env_dump, has_base64) signals from a
+/// single pipeline's stages + redirects. Shared by substitution and
+/// staged-payload classifiers.
+fn signals_in_pipeline(pipeline: &Pipeline) -> (bool, bool, bool, bool) {
+    let mut net = false;
+    let mut secret = pipeline_mentions_secret(pipeline);
+    let mut env = false;
+    let mut b64 = false;
+    for stage in &pipeline.stages {
+        let bn = stage_bn_lc(stage);
+        if EXFIL_NETWORK_TOOLS.contains(bn.as_str()) {
+            net = true;
+        }
+        if ENV_DUMPERS.contains(bn.as_str()) {
+            env = true;
+        }
+        if bn == "base64" {
+            b64 = true;
+        }
+        // Scan argv text as well, so `echo '...env | curl...'` inside
+        // an argv can surface its own signals when the classifier is
+        // invoked on echo/printf staged-payload content.
+        if !secret {
+            secret = stage.args.iter().any(|a| secret_path_regex().is_match(a));
+        }
+    }
+    (net, secret, env, b64)
+}
+
+/// M2 staged-payload: a command writes a string to an exec-shaped
+/// target AND the string contains BOTH a secret-path reference AND a
+/// network-tool token (or a `/dev/tcp` reverse-shell). Narthex parity
+/// with `_scan_payload_for_exfil`.
+///
+/// Matches `echo '<payload>' > /tmp/x.sh`, `printf '<payload>' > ...`,
+/// `cat > /tmp/x.sh << 'EOF' ... EOF`, and tee targets with the same
+/// shape.
+fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        // Find the target of any `>` redirect or tee/uudecode output.
+        let out_target = effective_out_file_target(stage).or_else(|| argv_output_target(stage));
+        let Some(target) = out_target else { continue };
+        if !is_exec_target(&target) {
+            continue;
+        }
+        // Inspect the argv of a payload-generator (echo/printf/cat).
+        let bn = stage_bn_lc(stage);
+        if !matches!(bn.as_str(), "echo" | "printf" | "cat" | "tee") {
+            continue;
+        }
+        let payload_text = stage.args.join(" ");
+        if payload_text.is_empty() {
+            continue;
+        }
+        if scan_payload_for_exfil(&payload_text) {
+            return Some(format!(
+                "blocked: payload written to execution-shaped target \
+                 `{t}` contains a credential path and a network tool \
+                 (M2 — staged exfiltration)",
+                t = sanitize_reason_text(&target),
+            ));
+        }
+    }
+    None
+}
+
+/// Scan a string that's being written to an exec target for exfil
+/// shapes. Returns true when any of:
+/// - credential path AND network tool appear together
+/// - env-dump tool AND network tool appear together
+/// - `/dev/tcp` or `/dev/udp` reverse-shell marker appears
+fn scan_payload_for_exfil(payload: &str) -> bool {
+    let has_secret = secret_path_regex().is_match(payload);
+    let has_net = network_tool_word_regex().is_match(payload);
+    let has_env = env_dumper_word_regex().is_match(payload);
+    if has_net && (has_secret || has_env) {
+        return true;
+    }
+    payload.contains("/dev/tcp/") || payload.contains("/dev/udp/")
+}
+
+/// Whole-word env-dumper regex (lock-step with `ENV_DUMPERS`).
+fn env_dumper_word_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:env|printenv|export|declare|set)\b")
+            .expect("env-dumper regex compiles")
+    })
+}
+
+/// Whole-word network-tool regex, compiled once. Union of
+/// `EXFIL_NETWORK_TOOLS` members with `\b` boundaries.
+fn network_tool_word_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        // Keep this in lock-step with EXFIL_NETWORK_TOOLS.
+        regex::Regex::new(
+            r"(?i)\b(?:curl|wget|nc|ncat|netcat|socat|dig|host|nslookup|drill|resolvectl|scp|rsync|sftp|ftp|tftp|http|https|httpie|xh|mail|sendmail|mutt|ssh)\b",
+        )
+        .expect("network-tool regex compiles")
+    })
 }
 
 /// M2 `BARBICAN_GIT_HARD_DENY=1` promotes bare `git` to an
