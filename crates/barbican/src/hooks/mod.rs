@@ -7,6 +7,7 @@
 //! …) so each audit finding gets its own commit with its own test.
 
 pub mod audit;
+pub mod post_advisory;
 pub mod post_edit;
 pub mod post_mcp;
 pub mod pre_bash;
