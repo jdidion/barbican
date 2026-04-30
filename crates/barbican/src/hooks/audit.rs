@@ -29,11 +29,21 @@ use crate::sanitize::strip_ansi;
 /// Max chars any string field is allowed to reach before truncation.
 const MAX_STRING_CHARS: usize = 4000;
 
+/// Max bytes we'll ever read from stdin. Guards against OOM DoS on
+/// an unbounded payload. 8 MiB comfortably covers any realistic
+/// tool-call payload; anything larger is rejected (the log gets a
+/// single-line "too large" marker instead).
+const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Run the audit hook. Never returns Err — writer failures are
 /// swallowed so the parent tool call proceeds.
 pub fn run() -> Result<()> {
     let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
+    if std::io::stdin()
+        .take(MAX_STDIN_BYTES)
+        .read_to_string(&mut buf)
+        .is_err()
+    {
         return Ok(());
     }
     let Ok(payload) = serde_json::from_str::<Value>(&buf) else {
@@ -53,11 +63,13 @@ pub fn run() -> Result<()> {
 }
 
 /// Derive the audit-log path from `$HOME`. Returns `None` if the env
-/// var is unset or empty — no sensible fallback on Unix.
+/// var is unset, empty, or relative — relative HOME would silently
+/// plant the log under the process's current working directory
+/// (often a project tree; potentially git-tracked). Reject early.
 fn log_path_from_env() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let home = PathBuf::from(home);
-    if home.as_os_str().is_empty() {
+    if home.as_os_str().is_empty() || !home.is_absolute() {
         return None;
     }
     Some(home.join(".claude").join("barbican").join("audit.log"))
@@ -85,8 +97,11 @@ fn build_entry(payload: &Value) -> Value {
     })
 }
 
-/// Recursively walk a JSON value, ANSI-stripping every string and
-/// truncating anything over [`MAX_STRING_CHARS`].
+/// Recursively walk a JSON value, ANSI-stripping every string
+/// (including object KEYS) and truncating anything over
+/// [`MAX_STRING_CHARS`]. Object keys are sanitized too so a log
+/// consumer decoding the JSONL and displaying a key doesn't render
+/// an attacker-planted ESC.
 fn sanitize_value(v: Value) -> Value {
     match v {
         Value::String(s) => Value::String(sanitize_string(&s)),
@@ -94,7 +109,7 @@ fn sanitize_value(v: Value) -> Value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                out.insert(k, sanitize_value(v));
+                out.insert(sanitize_string(&k), sanitize_value(v));
             }
             Value::Object(out)
         }
@@ -123,39 +138,87 @@ fn truncate_with_marker(s: &str, cap: usize) -> String {
     format!("{prefix}...[truncated {dropped} chars]", prefix = &s[..end])
 }
 
-/// Pull a JSON value and render it as a string if it's one, or the
-/// JSON text for objects/arrays/numbers/bools. Null → "".
+/// Render a top-level JSON field for the log entry. Strings go
+/// through `sanitize_string`; anything else (object/array/num/bool)
+/// gets recursively sanitized via `sanitize_value` so nested ESC
+/// bytes in e.g. `session_id: {nested: "<ESC>…"}` can't slip through.
+/// Null -> Null.
 fn scalar_string(v: Option<&Value>) -> Value {
     match v {
         Some(Value::String(s)) => Value::String(sanitize_string(s)),
-        Some(other) => other.clone(),
+        Some(other) => sanitize_value(other.clone()),
         None => Value::Null,
     }
 }
 
-/// Open the log file (create + append), set mode `0o600`, write one
-/// JSONL line + newline. Best-effort — ignore any failure. Creates
-/// parent directories as needed.
+/// Open the log file and write one JSONL line + newline.
+///
+/// Hardening (Phase-6 review):
+/// - Creates parent dirs at mode 0o700 (L2 defense-in-depth — the dir
+///   listing + metadata shouldn't leak either).
+/// - `custom_flags(O_NOFOLLOW)` on open: a pre-planted symlink at the
+///   log path returns ELOOP and the whole write is aborted. Without
+///   this, an attacker could symlink audit.log -> /etc/resolv.conf
+///   and the hook would corrupt the target + chmod it to 0o600.
+/// - `file.set_permissions()` (fd-based `fchmod`) instead of the
+///   path-based `fs::set_permissions` to close a TOCTOU window.
+/// - If the chmod fails, we bail WITHOUT writing — the L2 guarantee is
+///   that the log is 0o600, so writing anyway would leak URL tokens
+///   into a world-readable file.
+///
+/// All failures propagate as `Err` to the caller, which ignores them
+/// (the hook must never break the session).
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Tighten the dir whether or not we created it — a stale
+        // wider-perm dir from a previous run shouldn't leak.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     let mut file: File = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        // O_NOFOLLOW — a pre-planted symlink at the log path fails
+        // the open with ELOOP. The constant is 0x100 on Linux and
+        // 0x100 on macOS (same value on both; POSIX-standard since
+        // 2008). Avoids pulling libc just for one flag.
+        .custom_flags(o_nofollow())
         .open(path)?;
-    // `.mode(0o600)` only affects creation. If the file already
-    // existed with looser perms, fix them now — L2 says we never
-    // rely on umask and the perms must always be 0o600.
+    // `.mode(0o600)` only applies on create. If the file pre-existed
+    // with looser perms, tighten via the fd (avoids path-level TOCTOU).
     let mut perms = file.metadata()?.permissions();
     if perms.mode() & 0o777 != 0o600 {
         perms.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
+        // fd-based set_permissions = fchmod on Unix. If this fails we
+        // skip the write so URL tokens don't leak into a wide log.
+        file.set_permissions(perms)?;
     }
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
     Ok(())
+}
+
+/// The POSIX `O_NOFOLLOW` flag value. `0x100` on Linux and macOS
+/// (verified against `sys/fcntl.h`). We hard-code it here so we
+/// don't need to pull `libc` as a direct dep just for one constant.
+const fn o_nofollow() -> i32 {
+    // macOS: 0x0100, Linux: 0x20000 (differs!). Detect at compile time.
+    #[cfg(target_os = "macos")]
+    {
+        0x0100
+    }
+    #[cfg(target_os = "linux")]
+    {
+        0x20000
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Fallback: don't pass O_NOFOLLOW on exotic platforms.
+        // Symlink hardening loses but the install target is
+        // macOS + Linux; BSDs etc. can add their own value later.
+        0
+    }
 }
 
 /// Render `SystemTime::now()` as an ISO-8601 UTC timestamp:

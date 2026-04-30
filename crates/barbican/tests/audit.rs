@@ -199,6 +199,202 @@ fn audit_log_truncates_very_long_strings() {
 // Log directory auto-creation.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// Phase-6 /crew:review regression tests.
+// ---------------------------------------------------------------------
+
+// ---- CRITICAL C1: symlink-follow on audit.log path ----
+// Claude + GPT + Gemini all flagged.
+
+#[test]
+fn audit_rejects_pre_existing_symlink_at_log_path() {
+    let home = tempdir("symlink_attack");
+    let log_dir = home.join(".claude").join("barbican");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    // Plant a target file that the symlink will point at.
+    let target =
+        std::env::temp_dir().join(format!("barbican-symlink-target-{}", std::process::id()));
+    std::fs::write(&target, b"pre-existing content\n").unwrap();
+    let before = std::fs::read(&target).unwrap();
+    // Symlink audit.log -> target.
+    std::os::unix::fs::symlink(&target, log_dir.join("audit.log")).unwrap();
+
+    // Run the hook.
+    assert_eq!(
+        run_audit(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            &home
+        ),
+        0,
+    );
+
+    // The symlink target must be UNCHANGED — the hook must refuse to
+    // follow symlinks when opening the log file.
+    let after = std::fs::read(&target).unwrap();
+    assert_eq!(
+        after, before,
+        "symlink target was modified; O_NOFOLLOW not enforced"
+    );
+    // Cleanup.
+    let _ = std::fs::remove_file(&target);
+}
+
+// ---- CRITICAL C2: JSON object keys not sanitized ----
+// Defense in depth — the JSON serializer escapes ESC today, but if a
+// consumer decodes the JSONL and displays the key, ESC renders.
+
+#[test]
+fn audit_log_sanitizes_object_keys() {
+    let home = tempdir("keys");
+    let input = "{\"tool_name\":\"Bash\",\"tool_input\":\
+                 {\"\\u001b[31mevilkey\":\"v\",\"command\":\"ls\"}}";
+    assert_eq!(run_audit(input, &home), 0);
+    let contents = std::fs::read_to_string(log_path(&home)).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+    // The original key contained ESC; after sanitization the key must
+    // have no ESC char when the JSON is *decoded*.
+    let input_map = entry["input"].as_object().unwrap();
+    for key in input_map.keys() {
+        assert!(
+            !key.contains('\x1b'),
+            "object key still contains ESC after sanitize: {key:?}"
+        );
+    }
+}
+
+// ---- CRITICAL C3: non-string top-level fields preserved verbatim ----
+
+#[test]
+fn audit_log_sanitizes_nonstring_top_level_fields() {
+    let home = tempdir("topnonstr");
+    // session_id as an object with ESC in a string value.
+    let input = "{\"session_id\":{\"nested\":\"\\u001b[31mboom\"},\
+                 \"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}";
+    assert_eq!(run_audit(input, &home), 0);
+    let contents = std::fs::read_to_string(log_path(&home)).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+    // The decoded session field must not contain ESC anywhere in its
+    // rendered form.
+    let session_text = entry["session"].to_string();
+    assert!(
+        !session_text.contains('\x1b'),
+        "top-level non-string session was not sanitized: {session_text}"
+    );
+}
+
+// ---- WARNING W1: unbounded stdin is a DoS surface ----
+
+#[test]
+fn audit_hook_rejects_huge_stdin_without_oom() {
+    let home = tempdir("bigstdin");
+    // 50 MB should be well above our 8 MB cap. Must return quickly
+    // without allocating the whole stream. The hook will read up to
+    // the cap and close stdin, which can surface as EPIPE on the
+    // writing side — tolerate that; what we care about is exit code.
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = std::process::Command::new(bin)
+        .arg("audit")
+        .env("HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn barbican audit");
+    let huge = "A".repeat(50 * 1024 * 1024);
+    let input = format!("{{\"tool_name\":\"Bash\",\"tool_input\":{{\"command\":\"{huge}\"}}}}");
+    let start = std::time::Instant::now();
+    // Ignore EPIPE — the hook legitimately closes stdin after the cap.
+    let _ = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let code = child.wait().expect("wait").code().unwrap_or(-1);
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "50MB stdin took {elapsed:?} (expected <5s)"
+    );
+}
+
+// ---- WARNING W2: parent dir created with umask, not 0o700 ----
+
+#[test]
+fn audit_log_parent_dir_is_0700() {
+    let home = tempdir("dirperm");
+    assert_eq!(
+        run_audit(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            &home
+        ),
+        0,
+    );
+    let parent = log_path(&home).parent().unwrap().to_path_buf();
+    let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "~/.claude/barbican dir must be 0o700, got {mode:o}"
+    );
+}
+
+// ---- WARNING W3: relative HOME silently writes into cwd ----
+
+#[test]
+fn audit_hook_refuses_relative_home() {
+    // If HOME is "." or a relative path, the hook must skip logging
+    // rather than writing under the current working dir.
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let cwd_before: Vec<_> = std::fs::read_dir(std::env::current_dir().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let mut child = std::process::Command::new(bin)
+        .arg("audit")
+        .env("HOME", "./relative-home-should-be-rejected")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)
+        .unwrap();
+    let code = child.wait().unwrap().code().unwrap_or(-1);
+    assert_eq!(code, 0);
+    // Nothing new in the cwd.
+    let cwd_after: Vec<_> = std::fs::read_dir(std::env::current_dir().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(cwd_before, cwd_after, "relative HOME leaked log into cwd");
+}
+
+// ---- WARNING W5: chmod failure must prevent write ----
+
+#[test]
+fn audit_log_tightens_pre_existing_wide_perms() {
+    let home = tempdir("wideperm");
+    let log = log_path(&home);
+    let parent = log.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&parent).unwrap();
+    // Pre-create log at 0644 so the hook must tighten it.
+    std::fs::write(&log, b"pre-existing\n").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        run_audit(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            &home
+        ),
+        0,
+    );
+    let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "pre-existing wide-perm log must be tightened to 0o600; got {mode:o}"
+    );
+}
+
 #[test]
 fn audit_hook_creates_log_directory_if_missing() {
     let home = tempdir("mkdir");
