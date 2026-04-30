@@ -22,8 +22,15 @@
 //! | 192.168.0.0/16             | RFC1918 private                  |
 //! | 169.254.0.0/16, fe80::/10  | Link-local (incl. IMDS v4)       |
 //! | 100.64.0.0/10              | Carrier-grade NAT (RFC6598)      |
+//! | 192.0.0.0/24               | IETF protocol assignments        |
+//! |                            | (incl. Oracle IMDS 192.0.0.192)  |
 //! | fd00::/8                   | IPv6 unique local                |
 //! | fd00:ec2::/64              | EC2 IMDS v6                      |
+//! | fec0::/10                  | Deprecated IPv6 site-local       |
+//! | 100::/64                   | IPv6 discard-only                |
+//! | 2001::/32                  | Teredo tunneling                 |
+//! | 2002::/16                  | 6to4 tunnel (unwrap embedded v4) |
+//! | 64:ff9b::/96, 64:ff9b:1::/48| NAT64 (unwrap embedded v4)      |
 //! | ff00::/8, 224.0.0.0/4      | Multicast                        |
 //! | 0.0.0.0/8, ::               | Unspecified                      |
 //! | 255.255.255.255            | Broadcast                        |
@@ -161,6 +168,12 @@ fn is_blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
     if octets[0] == 100 && (64..=127).contains(&octets[1]) {
         return Some("carrier-grade NAT (100.64.0.0/10)");
     }
+    // IETF protocol assignments (RFC6890) — includes Oracle OCI IMDS at
+    // 192.0.0.192. Not a private address range, but nothing here should
+    // ever be reachable from a user-controlled URL.
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return Some("IETF protocol assignments (192.0.0.0/24, incl. Oracle IMDS 192.0.0.192)");
+    }
     // Reserved / documentation / benchmark — not exploitable but not
     // useful either. Keep them blocked so a typo in a config doesn't
     // trigger an unexpected probe.
@@ -191,6 +204,11 @@ fn is_blocked_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if (seg[0] & 0xffc0) == 0xfe80 {
         return Some("link-local (fe80::/10)");
     }
+    // Deprecated site-local fec0::/10 (RFC3879). Still treated as
+    // internal by routers that kept legacy configs.
+    if (seg[0] & 0xffc0) == 0xfec0 {
+        return Some("deprecated site-local (fec0::/10)");
+    }
     // Unique local fc00::/7 (includes fd00::/8 used by AWS IMDS v6).
     if (seg[0] & 0xfe00) == 0xfc00 {
         // Specifically flag the EC2 IMDS v6 address for the audit log.
@@ -198,6 +216,38 @@ fn is_blocked_v6(v6: Ipv6Addr) -> Option<&'static str> {
             return Some("IMDS v6 (fd00:ec2::/64)");
         }
         return Some("unique local (fc00::/7)");
+    }
+    // Discard-only prefix 100::/64 (RFC6666).
+    if seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 {
+        return Some("discard-only (100::/64)");
+    }
+    // Teredo tunneling 2001::/32 — outer IPv6 wraps an IPv4 endpoint
+    // in the lower 32 bits; a crafted Teredo address can embed
+    // loopback / IMDS. Block the whole range.
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return Some("Teredo tunneling (2001::/32)");
+    }
+    // 6to4 2002::/16 — bits [16..48] of the v6 address encode an IPv4.
+    // Unwrap that IPv4 and re-check against the v4 block table so a
+    // 2002:7f00:0001:: can't sneak loopback past us.
+    if seg[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        if let Some(_reason) = is_blocked_v4(embedded) {
+            return Some("6to4 tunnel with blocked embedded IPv4 (2002::/16)");
+        }
+        return Some("6to4 tunnel (2002::/16)");
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC6052) and local prefix
+    // 64:ff9b:1::/48 (RFC8215). Both embed an IPv4 in the low 32 bits.
+    // Block unconditionally — safer than per-address unwrap because
+    // the model has no business reaching these tunnels.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return Some("NAT64 prefix (64:ff9b::/96 or 64:ff9b:1::/48)");
     }
     // IETF documentation prefix.
     if seg[0] == 0x2001 && seg[1] == 0xdb8 {
@@ -334,6 +384,91 @@ mod tests {
     fn allows_public_v6() {
         assert!(block("2606:4700:4700::1111").is_none(), "Cloudflare DNS");
         assert!(block("2001:4860:4860::8888").is_none(), "Google DNS");
+    }
+
+    // --- Special-use ranges added after M4 adversarial review -------
+
+    #[test]
+    fn blocks_oracle_imds_v4() {
+        // 192.0.0.192 is Oracle Cloud's IMDS endpoint; the 192.0.0.0/24
+        // IETF protocol-assignments block catches it and several other
+        // metadata-service-class addresses.
+        let reason = block("192.0.0.192").expect("Oracle IMDS must block");
+        assert!(reason.contains("192.0.0.0/24"));
+        assert!(block("192.0.0.1").is_some(), "whole 192.0.0.0/24 blocked");
+    }
+
+    #[test]
+    fn blocks_alibaba_imds_via_cgnat() {
+        // 100.100.100.200 is Alibaba Cloud's IMDS; it falls inside
+        // 100.64.0.0/10 and should already be blocked. Pin the
+        // guarantee as a regression test so a future CGNAT refactor
+        // can't silently re-expose it.
+        assert!(block("100.100.100.200").is_some());
+    }
+
+    #[test]
+    fn blocks_teredo_v6() {
+        // Teredo 2001::/32 — the prefix itself must block regardless
+        // of the embedded IPv4, because a rebinding attacker can craft
+        // the inner bits.
+        assert!(block("2001::1").is_some());
+        let reason = block("2001::1").unwrap();
+        assert!(reason.contains("Teredo"), "got: {reason}");
+    }
+
+    #[test]
+    fn blocks_6to4_with_embedded_loopback() {
+        // 2002:7f00:0001:: embeds 127.0.0.1 in the 6to4 prefix.
+        let reason = block("2002:7f00:0001::").expect("6to4 loopback must block");
+        assert!(
+            reason.contains("6to4"),
+            "should name 6to4 family; got: {reason}"
+        );
+    }
+
+    #[test]
+    fn blocks_6to4_with_embedded_imds() {
+        // 2002:a9fe:a9fe:: embeds 169.254.169.254 (AWS IMDS).
+        assert!(block("2002:a9fe:a9fe::").is_some());
+    }
+
+    #[test]
+    fn blocks_6to4_with_public_embed_still() {
+        // Plain 6to4 is deprecated in practice (RFC7526). Block the
+        // whole /16 even if the embedded IPv4 looks public.
+        let reason = block("2002:0808:0808::").expect("whole 2002::/16 must block");
+        assert!(reason.contains("6to4"));
+    }
+
+    #[test]
+    fn blocks_nat64_well_known() {
+        // 64:ff9b::7f00:1 is the NAT64 well-known mapping of 127.0.0.1.
+        // Block the whole /96 unconditionally.
+        let reason = block("64:ff9b::7f00:1").expect("NAT64 must block");
+        assert!(reason.contains("NAT64"));
+    }
+
+    #[test]
+    fn blocks_nat64_local() {
+        // RFC8215 local NAT64 prefix 64:ff9b:1::/48 — also blocked by
+        // the same check.
+        assert!(block("64:ff9b:1::1").is_some());
+    }
+
+    #[test]
+    fn blocks_site_local_v6() {
+        // Deprecated fec0::/10 (RFC3879). Some legacy networks still
+        // route it internally.
+        let reason = block("fec0::1").expect("site-local must block");
+        assert!(reason.contains("site-local"));
+    }
+
+    #[test]
+    fn blocks_discard_only_v6() {
+        // RFC6666 discard-only 100::/64.
+        let reason = block("100::1").expect("discard-only must block");
+        assert!(reason.contains("discard"));
     }
 
     // --- URL validation ------------------------------------------------------

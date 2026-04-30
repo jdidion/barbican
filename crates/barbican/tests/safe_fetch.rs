@@ -166,7 +166,7 @@ fn rejects_localhost_hostname() {
     clippy::await_holding_lock,
     reason = "the guard is the whole point — it serializes env-var mutation across tests"
 )]
-async fn wiremock_benign_html_is_wrapped() {
+async fn wiremock_loopback_source_is_ssrf_rejected() {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
