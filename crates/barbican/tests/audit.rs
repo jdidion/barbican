@@ -212,10 +212,8 @@ fn audit_rejects_pre_existing_symlink_at_log_path() {
     let log_dir = home.join(".claude").join("barbican");
     std::fs::create_dir_all(&log_dir).unwrap();
     // Plant a target file that the symlink will point at.
-    let target = std::env::temp_dir().join(format!(
-        "barbican-symlink-target-{}",
-        std::process::id()
-    ));
+    let target =
+        std::env::temp_dir().join(format!("barbican-symlink-target-{}", std::process::id()));
     std::fs::write(&target, b"pre-existing content\n").unwrap();
     let before = std::fs::read(&target).unwrap();
     // Symlink audit.log -> target.
@@ -289,20 +287,30 @@ fn audit_log_sanitizes_nonstring_top_level_fields() {
 #[test]
 fn audit_hook_rejects_huge_stdin_without_oom() {
     let home = tempdir("bigstdin");
-    // 50 MB should be well above our cap (we use 8 MB). Must return
-    // quickly without allocating the whole stream.
+    // 50 MB should be well above our 8 MB cap. Must return quickly
+    // without allocating the whole stream. The hook will read up to
+    // the cap and close stdin, which can surface as EPIPE on the
+    // writing side — tolerate that; what we care about is exit code.
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = std::process::Command::new(bin)
+        .arg("audit")
+        .env("HOME", &home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn barbican audit");
     let huge = "A".repeat(50 * 1024 * 1024);
-    let input = format!(
-        "{{\"tool_name\":\"Bash\",\"tool_input\":{{\"command\":\"{huge}\"}}}}"
-    );
+    let input = format!("{{\"tool_name\":\"Bash\",\"tool_input\":{{\"command\":\"{huge}\"}}}}");
     let start = std::time::Instant::now();
-    let exit = run_audit(&input, &home);
+    // Ignore EPIPE — the hook legitimately closes stdin after the cap.
+    let _ = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+    let code = child.wait().expect("wait").code().unwrap_or(-1);
     let elapsed = start.elapsed();
-    assert_eq!(exit, 0);
+    assert_eq!(code, 0);
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "50MB stdin took {:?} (expected <5s)",
-        elapsed
+        "50MB stdin took {elapsed:?} (expected <5s)"
     );
 }
 
@@ -319,11 +327,7 @@ fn audit_log_parent_dir_is_0700() {
         0,
     );
     let parent = log_path(&home).parent().unwrap().to_path_buf();
-    let mode = std::fs::metadata(&parent)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
+    let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode, 0o700,
         "~/.claude/barbican dir must be 0o700, got {mode:o}"
