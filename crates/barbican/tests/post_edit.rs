@@ -104,17 +104,14 @@ fn benign_write_to_tmp_file_no_advisory() {
     let input = write_input("/tmp/notes.txt", "Just a text file.");
     let (code, stdout, stderr) = run_post_edit(&input, &home);
     assert_eq!(code, 0);
-    assert!(stdout.is_empty(), "no advisory expected; got {:?}", stdout);
-    assert!(stderr.is_empty(), "no advisory expected; got {:?}", stderr);
+    assert!(stdout.is_empty(), "no advisory expected; got {stdout:?}");
+    assert!(stderr.is_empty(), "no advisory expected; got {stderr:?}");
 }
 
 #[test]
 fn benign_source_file_no_advisory() {
     let home = tempdir("benign-src");
-    let input = write_input(
-        "src/foo.rs",
-        "fn main() { println!(\"Hello, world!\"); }",
-    );
+    let input = write_input("src/foo.rs", "fn main() { println!(\"Hello, world!\"); }");
     let (code, stdout, _) = run_post_edit(&input, &home);
     assert_eq!(code, 0);
     assert!(stdout.is_empty());
@@ -150,7 +147,9 @@ fn write_to_ssh_config_flags() {
     let (code, _, stderr) = run_post_edit(&input, &home);
     assert_eq!(code, 0);
     assert!(
-        String::from_utf8_lossy(&stderr).to_lowercase().contains("ssh"),
+        String::from_utf8_lossy(&stderr)
+            .to_lowercase()
+            .contains("ssh"),
         "expected SSH-config advisory"
     );
 }
@@ -330,7 +329,9 @@ fn edit_uses_new_string_field() {
     let (code, _, stderr) = run_post_edit(&input, &home);
     assert_eq!(code, 0);
     assert!(
-        String::from_utf8_lossy(&stderr).to_lowercase().contains("curl"),
+        String::from_utf8_lossy(&stderr)
+            .to_lowercase()
+            .contains("curl"),
         "Edit's new_string must be scanned"
     );
 }

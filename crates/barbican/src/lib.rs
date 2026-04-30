@@ -10,4 +10,5 @@ pub mod hooks;
 pub mod mcp;
 pub mod parser;
 pub mod sanitize;
+pub mod scan;
 pub mod tables;
