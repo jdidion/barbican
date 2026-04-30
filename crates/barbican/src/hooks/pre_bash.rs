@@ -26,13 +26,17 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::parser::{self, ParseError, Pipeline, RedirectKind, Script};
+use crate::parser::{self, ParseError, Pipeline, RedirectFd, RedirectKind, Script};
 use crate::tables::SHELL_INTERPRETERS;
 
 /// Maximum depth of M1 wrapper-unwrap recursion. Beyond this, a
 /// pathological nesting like `bash -c "bash -c 'bash -c ...'"`
 /// collapses to a deny (same posture as the parser's MAX_DEPTH).
-const M1_MAX_DEPTH: usize = 16;
+///
+/// Lowered from 16 to 8 per Phase-4 review: real workflows never
+/// nest wrappers more than 2-3 deep, and a tighter cap shrinks the
+/// CPU budget available to a pathological input.
+const M1_MAX_DEPTH: usize = 8;
 
 /// Exit code Claude Code reads as "allow the tool call."
 const EXIT_ALLOW: i32 = 0;
@@ -212,13 +216,17 @@ fn unwrap_wrappers_in_pipeline(pipeline: &Pipeline) -> Option<Script> {
             if inner_pipelines.is_empty() {
                 continue;
             }
-            // If the wrapper stage itself has redirects (e.g. `find -exec
-            // base64 -d blob \; > /tmp/a.sh`), those redirects apply to
-            // the stdout of the inner command's last stage. Graft them
-            // on so H2's last-stage-writes-to-exec check sees them.
+            // If the wrapper stage itself has redirects (e.g. `bash -c
+            // 'a; b; c' > /tmp/a.sh` or `find -exec base64 -d blob \;
+            // > /tmp/a.sh`), in real shell semantics EVERY inner
+            // pipeline inherits those redirects. Graft the outer
+            // redirects onto the tail of every inner pipeline so H2
+            // fires regardless of which `;`-separated clause is the
+            // decoder. Fixes the Phase-4 bypass where the outer
+            // redirect only attached to the last inner pipeline.
             if !stage.redirects.is_empty() {
-                if let Some(tail) = inner_pipelines.last_mut() {
-                    if let Some(last_stage) = tail.stages.last_mut() {
+                for inner_pipeline in &mut inner_pipelines {
+                    if let Some(last_stage) = inner_pipeline.stages.last_mut() {
                         last_stage.redirects.extend(stage.redirects.clone());
                     }
                 }
@@ -285,8 +293,12 @@ const MALFORMED_REENTRY_MARKER: &str = "__barbican_malformed_reentry__";
 
 /// Return the text of a wrapper command's inner bash source, or `None`
 /// if `stage` is not a recognized wrapper.
+///
+/// Case-insensitive — `cUrL | BaSh` on macOS APFS executes the real
+/// binaries, so classifier lookups must lowercase too.
 fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
-    let basename = stage.basename.as_str();
+    let basename_lc = stage.basename.to_ascii_lowercase();
+    let basename = basename_lc.as_str();
     // --- Shell -c wrappers: basename is a shell, args contain "-c STR"
     if matches!(basename, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
         return extract_dash_c_arg(&stage.args);
@@ -302,13 +314,22 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
     if matches!(basename, "su" | "runuser") {
         return extract_dash_c_arg(&stage.args);
     }
-    // --- watch 'cmd' — first positional (non-flag) arg is a bash string.
-    if basename == "watch" {
-        return stage.args.iter().find(|a| !a.starts_with('-')).cloned();
+    // --- watch and parallel — first positional is a bash command
+    // string, but they take value-consuming flags too. Use the full
+    // prefix-runner logic.
+    if basename == "watch" || basename == "parallel" {
+        return extract_prefix_runner_command(basename, &stage.args);
     }
     // --- find ... -exec <cmd> [args] \; or +
     if basename == "find" {
         return extract_find_exec_command(&stage.args);
+    }
+    // --- env -S "cmd" / --split-string=cmd — the flag's value IS the
+    // inner source, not an env setting.
+    if basename == "env" {
+        if let Some(inner) = extract_env_dash_s(&stage.args) {
+            return Some(inner);
+        }
     }
     // --- Prefix runners: first non-flag, non-assignment arg is the
     // inner command name; remaining args are its argv.
@@ -331,47 +352,102 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
     None
 }
 
-/// Scan `args` for the first `-c` flag (or `-c=STR`) and return the
-/// string after it. Handles `-c STR`, `--command STR`, `-c=STR`,
-/// `--command=STR`. Returns `None` if there's no `-c` or no value.
-fn extract_dash_c_arg(args: &[String]) -> Option<String> {
+/// `env -S "whole command"` and `env --split-string=...` treat the
+/// flag's value as a complete shell command string. Return it verbatim
+/// (the caller parses it).
+fn extract_env_dash_s(args: &[String]) -> Option<String> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "-c" || arg == "--command" {
+        if arg == "-S" || arg == "--split-string" {
             return iter.next().cloned();
         }
-        if let Some(rest) = arg.strip_prefix("-c=") {
+        if let Some(rest) = arg.strip_prefix("--split-string=") {
             return Some(rest.to_string());
         }
-        if let Some(rest) = arg.strip_prefix("--command=") {
-            return Some(rest.to_string());
+        // GNU long-flag prefix abbreviation — `--split`, `--sp`.
+        if arg.starts_with("--split") {
+            if let Some((_, rest)) = arg.split_once('=') {
+                return Some(rest.to_string());
+            }
+            // `--split VALUE` form.
+            return iter.next().cloned();
         }
     }
     None
 }
 
-/// `find <paths> <predicates> -exec <cmd> <args...> \;` — extract
-/// the command + args between `-exec` and `;`/`+` into a single
-/// shell-parseable string.
+/// Scan `args` for a `-c`-style flag and return the command string.
+///
+/// Handles:
+/// - `-c STR` / `--command STR`
+/// - `-c=STR` / `--command=STR`
+/// - Bundled short flags containing `c`: `-lc`, `-xc`, `-cx`, `-lxc`, …
+///   (shells parse any cluster of single-char flags; if `c` is in the
+///   cluster, the next argv element is the command string).
+///
+/// Returns `None` if no `-c`-like flag is present.
+fn extract_dash_c_arg(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        // Long forms — exact and `=value`.
+        if arg == "--command" {
+            return iter.next().cloned();
+        }
+        if let Some(rest) = arg.strip_prefix("--command=") {
+            return Some(rest.to_string());
+        }
+        // Short form with `=` stuffed in (`-c=STR`).
+        if let Some(rest) = arg.strip_prefix("-c=") {
+            return Some(rest.to_string());
+        }
+        // Single-dash bundle containing `c`: `-c`, `-lc`, `-xc`, `-cx`,
+        // `-lxc`, etc. Require the bundle to not be a long-form (`--`)
+        // and to contain a literal `c`. Consume next arg as the
+        // command string.
+        if let Some(rest) = arg.strip_prefix('-') {
+            if !rest.is_empty() && !rest.starts_with('-') && rest.contains('c') {
+                return iter.next().cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Extract EVERY `-exec*` clause from a `find` invocation and join
+/// them as `;`-separated inner script. Prior code stopped at the
+/// first clause and silently skipped the rest — classic bypass.
+///
+/// Each `-exec* CMD... \;|+` clause becomes one statement in the
+/// returned string; the joined script will parse as multiple
+/// pipelines and each is classified independently.
 fn extract_find_exec_command(args: &[String]) -> Option<String> {
+    let mut clauses: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-exec" || args[i] == "-execdir" || args[i] == "-ok" || args[i] == "-okdir" {
             let mut parts: Vec<String> = Vec::new();
-            for arg in &args[i + 1..] {
-                if arg == ";" || arg == "\\;" || arg == "+" {
+            let mut j = i + 1;
+            while j < args.len() {
+                let a = &args[j];
+                if a == ";" || a == "\\;" || a == "+" {
                     break;
                 }
-                parts.push(arg.clone());
+                parts.push(a.clone());
+                j += 1;
             }
-            if parts.is_empty() {
-                return None;
+            if !parts.is_empty() {
+                clauses.push(parts.join(" "));
             }
-            return Some(parts.join(" "));
+            i = j + 1; // Step past the `;`/`+` terminator.
+            continue;
         }
         i += 1;
     }
-    None
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join("; "))
+    }
 }
 
 /// Prefix runner — skip leading flags / VAR=x style env assignments;
@@ -384,7 +460,8 @@ fn extract_find_exec_command(args: &[String]) -> Option<String> {
 fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<String> {
     // Number of leading positional args that belong to the wrapper
     // itself, not the inner command. Most wrappers consume 0; timeout
-    // consumes 1 (the duration).
+    // consumes 1 (the duration); watch consumes 0 — its "interval"
+    // arrives via `-n` not a bare positional.
     let positional_skip: usize = match wrapper {
         "timeout" => 1,
         _ => 0,
@@ -393,28 +470,21 @@ fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<Strin
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        // Env-style `VAR=value` assignment (recognized by `env`; harmless
-        // to other wrappers — they won't parse it as their own flag).
-        if arg.contains('=') && !arg.starts_with('-') {
+        // `VAR=value` env-assignment skip is ONLY valid for `env` —
+        // other wrappers treat a positional containing `=` as data,
+        // not as an env assignment.
+        if wrapper == "env" && arg.contains('=') && !arg.starts_with('-') {
             i += 1;
             continue;
         }
         // Wrapper's own flags:
         if arg.starts_with('-') {
-            let takes_value = matches!(
-                (wrapper, arg.as_str()),
-                ("sudo", "-u" | "-g" | "-p" | "-C" | "-T")
-                    | ("doas", "-u" | "-C")
-                    | ("timeout", "-s" | "--signal" | "-k" | "--kill-after")
-                    | ("nice", "-n")
-                    | ("ionice", "-c" | "-n" | "-t")
-                    | (
-                        "env",
-                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
-                    )
-                    | ("xargs", "-I" | "-L" | "-n" | "-P" | "-d" | "-E" | "-s")
-                    | ("stdbuf", "-i" | "-o" | "-e")
-            );
+            let takes_value = is_value_taking_flag(wrapper, arg);
+            // GNU-style `--flag=VAL` — flag+value in one token.
+            if arg.starts_with("--") && arg.contains('=') {
+                i += 1;
+                continue;
+            }
             if takes_value {
                 i += 2;
             } else {
@@ -430,6 +500,32 @@ fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<Strin
             i += 1;
             continue;
         }
+        // `watch` treats the first user-positional as a SHELL COMMAND
+        // STRING, not argv[0] of a binary. Return it verbatim so the
+        // caller parses it through bash.
+        if wrapper == "watch" {
+            return Some(args[i].clone());
+        }
+        // `parallel` can run either a shell string OR an argv-style
+        // command. Its argv list is terminated by `:::` (colon triplet)
+        // or `::::` — everything before is the command, everything
+        // after is data. Join the pre-`:::` positionals as an inner
+        // command string (shell-parseable).
+        if wrapper == "parallel" {
+            let rest: Vec<&String> = args[i..]
+                .iter()
+                .take_while(|a| a.as_str() != ":::" && a.as_str() != "::::")
+                .collect();
+            if rest.is_empty() {
+                return None;
+            }
+            let joined = rest
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(joined);
+        }
         // First positional that belongs to the inner command: rest of
         // argv is the inner's args.
         let cmd_name = &args[i];
@@ -442,6 +538,42 @@ fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<Strin
         return Some(out);
     }
     None
+}
+
+/// Known value-taking flags per wrapper. Exhaustive enough to cover
+/// documented flags; unknown flags are treated as boolean (safer: we
+/// might miss a real-inner extraction, but we won't skip one token
+/// too many and misidentify the inner).
+fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
+    // GNU long-flag unambiguous prefix matching: `--sig` → `--signal`,
+    // `--kil` → `--kill-after`, etc. Only check after a literal match.
+    matches!(
+        (wrapper, arg),
+        ("sudo", "-u" | "-g" | "-p" | "-C" | "-T" | "-h" | "-U" | "-r" | "-t")
+            | ("doas", "-u" | "-C")
+            | ("timeout", "-s" | "--signal" | "-k" | "--kill-after")
+            | ("nice", "-n")
+            | ("ionice", "-c" | "-n" | "-t")
+            // `env`: `-u VAR`, `-C DIR`. `-S`/`--split-string` is handled
+            // earlier by extract_env_dash_s (inner source, not flag value).
+            | ("env", "-u" | "--unset" | "-C" | "--chdir")
+            | (
+                "xargs",
+                "-I" | "-L" | "-n" | "-P" | "-d" | "-E" | "-s"
+                    | "-a" | "--arg-file" | "-r" | "--replace" | "--max-args"
+                    | "--max-procs" | "--max-chars"
+            )
+            | ("stdbuf", "-i" | "-o" | "-e")
+            // `watch`: `-n INTERVAL`, `-d differ`, `-g exit-on-change`
+            // only -n takes a value.
+            | ("watch", "-n" | "--interval" | "-p" | "--precise")
+            // `parallel`: a LOT of options. Value-taking ones we care about.
+            | (
+                "parallel",
+                "-j" | "--jobs" | "-n" | "--max-args" | "-N"
+                    | "--colsep" | "-C" | "--delimiter" | "-d"
+            )
+    )
 }
 
 /// H1 audit finding: a pipeline with `curl` or `wget` as any stage and
@@ -461,7 +593,7 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
     let shell_stage = stages
         .iter()
         .skip(net_idx + 1)
-        .find(|s| SHELL_INTERPRETERS.contains(s.basename.as_str()))?;
+        .find(|s| SHELL_INTERPRETERS.contains(s.basename.to_ascii_lowercase().as_str()))?;
     Some(format!(
         "blocked: `{net}` piped to shell interpreter `{sh}` (H1 — \
          downloaded-content executed as script)",
@@ -475,7 +607,10 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
 /// `socat`, `ssh`, …) live in `NETWORK_TOOLS_HARD` and will be gated
 /// by later-phase classifiers.
 fn is_curl_or_wget(basename: &str) -> bool {
-    matches!(basename, "curl" | "wget")
+    // Case-insensitive — macOS APFS is case-insensitive by default so
+    // `cUrL` invokes the same binary as `curl`. Phase-4 review: H1
+    // was bypassable with tricky casing.
+    matches!(basename.to_ascii_lowercase().as_str(), "curl" | "wget")
 }
 
 /// H2 audit finding: a pipeline that decodes content and writes the
@@ -537,18 +672,19 @@ fn decoder_name(pipeline: &Pipeline) -> String {
         .unwrap_or_default()
 }
 
-/// Return the EFFECTIVE `>` / `>>` target of a command's redirects,
-/// matching shell "last wins" semantics.
+/// Return the EFFECTIVE STDOUT target of a command's redirects,
+/// matching shell "last wins" semantics — BUT only for fd 1.
 ///
-/// Bash's `cmd > a > b` opens both files but writes only to `b`. A
-/// "first wins" scan allowed attackers to hide the real target behind
-/// a benign-looking first redirect.
+/// Prior code ignored fd, so `base64 -d > /tmp/a.sh 2> /dev/null`
+/// (two OutFile redirects, one for stdout, one for stderr) picked the
+/// last one (`/dev/null`) and masked the real stdout target. Now we
+/// filter to stdout-facing redirects before the reverse scan.
 fn effective_out_file_target(stage: &crate::parser::Command) -> Option<String> {
-    stage
-        .redirects
-        .iter()
-        .rev()
-        .find_map(|r| matches!(r.kind, RedirectKind::OutFile { .. }).then(|| r.target.clone()))
+    stage.redirects.iter().rev().find_map(|r| {
+        let is_out_file = matches!(r.kind, RedirectKind::OutFile { .. });
+        let targets_stdout = matches!(r.fd, RedirectFd::Stdout | RedirectFd::StdoutAndStderr);
+        (is_out_file && targets_stdout).then(|| r.target.clone())
+    })
 }
 
 /// For stages that carry their own write-to-file flag (instead of a
@@ -559,17 +695,19 @@ fn effective_out_file_target(stage: &crate::parser::Command) -> Option<String> {
 /// Returns `None` for any other command; that's fine, Rule 1 already
 /// handles `>` / `>>` redirects.
 fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
-    match stage.basename.as_str() {
+    match stage.basename.to_ascii_lowercase().as_str() {
         "tee" => {
             // Skip flags; take the first positional arg.
             stage.args.iter().find(|a| !a.starts_with('-')).cloned()
         }
         "uudecode" => {
-            // Take the value following `-o`. Accept both `-o PATH` and
-            // `-o=PATH` forms.
+            // Take the value following `-o`. Accept `-o PATH`, `-o=PATH`,
+            // and the GNU long-flag prefix-abbreviation forms
+            // (`--out`, `--outp`, …, `--output-file`, with or without
+            // `=value`).
             let mut args = stage.args.iter();
             while let Some(arg) = args.next() {
-                if arg == "-o" || arg == "--output-file" {
+                if arg == "-o" {
                     if let Some(path) = args.next() {
                         return Some(path.clone());
                     }
@@ -577,8 +715,15 @@ fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
                 if let Some(rest) = arg.strip_prefix("-o=") {
                     return Some(rest.to_string());
                 }
-                if let Some(rest) = arg.strip_prefix("--output-file=") {
-                    return Some(rest.to_string());
+                // `--out...=PATH` OR `--out... PATH` — unambiguous
+                // prefix of `--output-file`.
+                if arg.starts_with("--out") {
+                    if let Some((_, rest)) = arg.split_once('=') {
+                        return Some(rest.to_string());
+                    }
+                    if let Some(path) = args.next() {
+                        return Some(path.clone());
+                    }
                 }
             }
             None
@@ -601,7 +746,7 @@ fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
 ///
 /// Encoders, dumpers, and help flags don't match.
 fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
-    match cmd.basename.as_str() {
+    match cmd.basename.to_ascii_lowercase().as_str() {
         "base64" => cmd.args.iter().any(|a| is_base64_decode_flag(a)),
         "xxd" => cmd.args.iter().any(|a| is_xxd_reverse_flag(a)),
         "openssl" => cmd.args.iter().any(|a| a == "-d" || a == "-D"),
@@ -611,7 +756,9 @@ fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
 }
 
 fn is_base64_decode_flag(arg: &str) -> bool {
-    if arg == "--decode" || arg == "--Decode" {
+    // GNU long-flag unambiguous prefix matching: `--dec`, `--deco`,
+    // `--decod`, `--decode`, `--Decode`.
+    if arg.starts_with("--dec") || arg.starts_with("--Dec") {
         return true;
     }
     // Single-dash form: `-` followed by chars; at least one char is 'd'/'D'.
@@ -624,6 +771,11 @@ fn is_base64_decode_flag(arg: &str) -> bool {
 }
 
 fn is_xxd_reverse_flag(arg: &str) -> bool {
+    // GNU long-flag abbreviation for `--reverse`. xxd typically ships
+    // only short flags, but cover the prefix form defensively.
+    if arg.starts_with("--rev") {
+        return true;
+    }
     if let Some(rest) = arg.strip_prefix('-') {
         if !rest.is_empty() && !rest.starts_with('-') {
             return rest.chars().any(|c| c == 'r');
@@ -688,7 +840,13 @@ fn is_exec_target(path: &str) -> bool {
         // SHELL_RC_FILES above; `.foo` without a script ext falls here
         // as "no extension after the lead dot".
         None => true,
-        Some(("", _)) => false, // dotfile like ".env" — data, not exec
+        // Trailing dot — `/tmp/payload.` has rsplit_once giving
+        // ("payload", ""). Empty extension = no meaningful extension
+        // = extensionless exec shape. Prior code returned false here
+        // and allowed the write to slip past H2.
+        Some((stem, "")) if !stem.is_empty() => true,
+        // Leading dot only, like ".env" — data, not exec.
+        Some(("", _)) => false,
         Some((_, ext)) => SCRIPT_EXTS.contains(ext.to_ascii_lowercase().as_str()),
     }
 }
