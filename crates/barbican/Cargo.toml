@@ -13,12 +13,37 @@ workspace = true
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+# DNS resolver with tokio integration — we resolve hostnames ourselves
+# (not via reqwest's builtin) so safe_fetch can filter every A/AAAA
+# record against the SSRF table before reqwest opens a socket. This is
+# the core of the DNS-rebinding defense for M4.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+    "system-config",
+    "tokio",
+] }
 phf = { version = "0.11", features = ["macros"] }
 regex = "1.11"
+# safe_fetch HTTP client. rustls-only (no OpenSSL), redirects disabled
+# so we can re-check each hop against the SSRF filter manually, and
+# default-features off to keep the dependency graph tight. `charset`
+# covers non-UTF-8 declared HTML. `socks` / `cookies` / `gzip` etc.
+# are deliberately NOT enabled — nothing in safe_fetch needs them.
+reqwest = { version = "0.13", default-features = false, features = [
+    "charset",
+    "http2",
+    "rustls",
+] }
 rmcp = { version = "1.5", default-features = false, features = ["server", "macros", "transport-io"] }
+# Used by `#[derive(JsonSchema)]` on our MCP tool argument structs. rmcp
+# pulls in schemars transitively via its `server` feature, but we list
+# it directly here so the derive macro resolves without relying on the
+# transitive path.
+schemars = { version = "1.0", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "io-std", "io-util", "time", "sync"] }
+# Tokio was already pulled in by rmcp; add `net` so we can bind local
+# TcpListeners in integration tests and safe_fetch.
+tokio = { version = "1.47", default-features = false, features = ["macros", "net", "rt", "io-std", "io-util", "time", "sync"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 # Bash parser: exact-pinned — runtime ABI between tree-sitter core and
@@ -27,3 +52,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 tree-sitter = "=0.25.0"
 tree-sitter-bash = "=0.25.1"
 unicode-normalization = "0.1"
+url = "2.5"
+
+[dev-dependencies]
+# Local HTTP mock server for safe_fetch integration tests. Dev-only —
+# does not affect release build size or runtime.
+wiremock = "0.6"

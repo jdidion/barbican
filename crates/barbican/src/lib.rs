@@ -8,6 +8,7 @@
 pub mod cmd;
 pub mod hooks;
 pub mod mcp;
+pub mod net;
 pub mod parser;
 pub mod sanitize;
 pub mod scan;
