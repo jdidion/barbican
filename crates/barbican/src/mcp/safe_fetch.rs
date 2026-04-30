@@ -27,7 +27,7 @@
 //! returning a string. Errors come back as `<barbican-error>...</>`
 //! content rather than MCP-level errors, to match Narthex's shape.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use hickory_resolver::config::{ResolverConfig, CLOUDFLARE};
@@ -102,16 +102,31 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchErr
     let resolver = build_resolver()?;
 
     loop {
-        let host = current
+        let raw_host = current
             .host_str()
             .ok_or(FetchError::Reject(RejectReason::NoHost))?
             .to_string();
+        // Normalize: reqwest's resolve_to_addrs key-matches on the exact
+        // host string. A trailing dot (`example.com.`) is a valid FQDN
+        // root marker but would miss the map, and the client would fall
+        // through to system DNS — bypassing SSRF pinning. Strip it.
+        let host = raw_host.trim_end_matches('.').to_string();
+        // host_str keeps brackets around IPv6 literals (`[::1]`).
+        // hickory's lookup_ip can't parse that form, so strip them
+        // before DNS resolution.
+        let lookup_host = host.trim_start_matches('[').trim_end_matches(']');
 
-        let addrs = resolve_and_filter(&resolver, &host, current.port_or_known_default()).await?;
+        let addrs =
+            resolve_and_filter(&resolver, lookup_host, current.port_or_known_default()).await?;
 
         let client = Client::builder()
             .redirect(Policy::none())
             .timeout(timeout)
+            // no_proxy() is critical: without it, reqwest honors the
+            // ambient HTTP_PROXY / HTTPS_PROXY env vars and sends the
+            // full URL to the proxy, which does its own DNS lookup.
+            // That defeats our `resolve_to_addrs` pin entirely.
+            .no_proxy()
             .resolve_to_addrs(&host, &addrs)
             .user_agent("barbican-safe-fetch/0.1 (+SSRF-hardened)")
             .build()
@@ -200,6 +215,17 @@ async fn resolve_and_filter(
     port: Option<u16>,
 ) -> Result<Vec<SocketAddr>, FetchError> {
     let port = port.unwrap_or(0);
+    // Short-circuit: if the host is already an IP literal, don't call
+    // DNS — hickory may fail to parse some literal forms anyway, and
+    // `validate_url` already ran `is_blocked_ip` against it when the
+    // override is set. Re-run the check here defensively so a future
+    // refactor that loosens `validate_url` can't open a hole.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if let Some(reason) = is_blocked_ip(ip) {
+            return Err(FetchError::Reject(RejectReason::BlockedIp(reason)));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
     let lookup = resolver
         .lookup_ip(host)
         .await
