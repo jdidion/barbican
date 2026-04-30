@@ -82,13 +82,70 @@ pub fn nfkc(s: &str) -> String {
     s.nfkc().collect()
 }
 
-/// Convenience: apply all three passes for prompt-injection scanning.
-/// Order matters: invisible chars removed first (so NFKC doesn't try to
-/// fold them), then NFKC. ANSI strip is separate since we may want the
-/// raw string for logging.
+/// Convenience: apply all four passes for prompt-injection scanning.
+/// Order: strip invisible → confusables-fold → NFKC. ANSI strip stays
+/// separate (callers may want the raw string for logging).
+///
+/// Phase-7 review (GPT): NFKC alone does NOT fold Cyrillic `і` (U+0456)
+/// or Greek `Ο` (U+039F) to their Latin counterparts — they are
+/// canonically distinct even though they're visually identical. The
+/// audit's M3 test specifically includes the Cyrillic homoglyph, so
+/// we run a dedicated confusables pass here. Narrow and hand-maintained
+/// rather than pulling an old UTS-39-skeleton crate.
 #[must_use]
 pub fn normalize_for_scan(s: &str) -> String {
-    nfkc(&strip_invisible(s))
+    nfkc(&confusables_fold(&strip_invisible(s)))
+}
+
+/// Fold the most common Cyrillic / Greek / other homoglyphs to their
+/// ASCII Latin equivalents. Intentionally small and focused — we only
+/// cover the codepoints that realistically appear in adversarial
+/// prompt-injection payloads.
+///
+/// The covered set below folds into ASCII letters when scanning, so a
+/// `іgnore` (U+0456 + "gnore") normalizes to `ignore` and the
+/// jailbreak regex fires. Non-covered codepoints pass through
+/// unchanged.
+#[must_use]
+pub fn confusables_fold(s: &str) -> String {
+    s.chars().map(fold_confusable).collect()
+}
+
+/// Map one codepoint through the confusables table. Split out of
+/// `confusables_fold` so we can document the mapping without making
+/// clippy complain about multi-alternation match arms that all fold
+/// to the same letter.
+fn fold_confusable(c: char) -> char {
+    match c {
+        // Cyrillic / Greek / other → Latin lowercase
+        '\u{0430}' => 'a', // Cyrillic а
+        '\u{0435}' => 'e', // Cyrillic е
+        '\u{0456}' | '\u{0457}' | '\u{04CF}' | '\u{0131}' => 'i',
+        '\u{0458}' => 'j',              // Cyrillic ј
+        '\u{043E}' | '\u{03BF}' => 'o', // Cyrillic о / Greek ο
+        '\u{0440}' | '\u{03C1}' => 'p', // Cyrillic р / Greek ρ
+        '\u{0441}' => 'c',              // Cyrillic с
+        '\u{0443}' | '\u{03C5}' | '\u{1D59F}' => 'y',
+        '\u{0445}' => 'x', // Cyrillic х
+        '\u{04BB}' => 'h', // Cyrillic һ
+        // Cyrillic / Greek → Latin uppercase
+        '\u{0410}' | '\u{0391}' => 'A',
+        '\u{0412}' | '\u{0392}' => 'B',
+        '\u{0415}' | '\u{0395}' => 'E',
+        '\u{041A}' | '\u{039A}' => 'K',
+        '\u{041C}' | '\u{039C}' => 'M',
+        '\u{041D}' | '\u{0397}' => 'H',
+        '\u{041E}' | '\u{039F}' => 'O',
+        '\u{0420}' | '\u{03A1}' => 'P',
+        '\u{0421}' => 'C',
+        '\u{0422}' | '\u{03A4}' => 'T',
+        '\u{0423}' | '\u{03A5}' => 'Y',
+        '\u{0425}' | '\u{03A7}' => 'X',
+        '\u{039D}' => 'N',
+        '\u{0396}' => 'Z',
+        '\u{0399}' => 'I',
+        other => other,
+    }
 }
 
 #[cfg(test)]

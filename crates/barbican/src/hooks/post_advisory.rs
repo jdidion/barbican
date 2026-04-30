@@ -7,11 +7,13 @@
 //!   render `additionalContext` still see it);
 //! - append one JSONL entry to `~/.claude/barbican/audit.log`.
 
-use std::fs::OpenOptions;
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use serde_json::json;
+
+use crate::sanitize::strip_ansi;
 
 /// Shape of a single advisory emission.
 pub struct Finding<'a> {
@@ -32,21 +34,45 @@ pub struct Finding<'a> {
 }
 
 pub fn emit_advisory(f: &Finding<'_>) {
+    // Strip ANSI from every attacker-influenced string that reaches
+    // the terminal or the audit log. Matches the L1 hardening in
+    // hooks/audit.rs — a malicious MCP tool name or file path cannot
+    // rewrite the user's terminal via `less ~/.claude/barbican/audit.log`
+    // or the Claude Code transcript.
+    let tool = strip_ansi(f.tool).into_owned();
+    let path = f.path.map(|p| strip_ansi(p).into_owned());
+    let findings: Vec<String> = f
+        .findings
+        .iter()
+        .map(|s| strip_ansi(s).into_owned())
+        .collect();
+    let intro = strip_ansi(&f.advisory_intro).into_owned();
+
     // Stdout JSON → Claude Code renders this in the transcript.
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": f.advisory_intro,
+            "additionalContext": &intro,
         }
     });
     let _ = writeln!(std::io::stdout(), "{out}");
 
     // Stderr duplicate so harnesses without additionalContext rendering
     // still surface the warning.
-    let _ = writeln!(std::io::stderr(), "{}", f.advisory_intro);
+    let _ = writeln!(std::io::stderr(), "{intro}");
 
-    // Audit log append (best effort).
-    let _ = append_audit_jsonl(f);
+    // Audit log append (best effort). We pass the sanitized copies
+    // through the struct so append_audit_jsonl doesn't need to know
+    // anything about ANSI.
+    let sanitized = Finding {
+        event: f.event,
+        tool: &tool,
+        path: path.as_deref(),
+        session_id: f.session_id,
+        findings: &findings,
+        advisory_intro: intro,
+    };
+    let _ = append_audit_jsonl(&sanitized);
 }
 
 fn append_audit_jsonl(f: &Finding<'_>) -> std::io::Result<()> {
@@ -59,9 +85,20 @@ fn append_audit_jsonl(f: &Finding<'_>) -> std::io::Result<()> {
     }
     let log = home.join(".claude").join("barbican").join("audit.log");
     let parent = log.parent().unwrap();
-    std::fs::create_dir_all(parent)?;
-    // 0o700 — match the hardening in hooks/audit.rs.
-    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    // DirBuilder with mode(0o700) sets the mode atomically at creation
+    // time — no race between create_dir_all and a subsequent chmod.
+    // Also handles the already-exists case gracefully (returns Ok).
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    // If the dir pre-existed with wider perms, tighten it now.
+    let current_mode = std::fs::metadata(parent)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0);
+    if current_mode != 0o700 {
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
 
     let entry = json!({
         "ts": iso8601_now(),

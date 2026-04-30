@@ -16,7 +16,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::hooks::post_advisory::{emit_advisory, Finding};
-use crate::scan::{scan_cap_from_env, scan_injection, truncate_for_scan};
+use crate::scan::{flatten_value_strings, scan_cap_from_env, scan_injection, truncate_for_scan};
 
 pub fn run() -> Result<()> {
     let mut buf = String::new();
@@ -68,7 +68,10 @@ fn stringify_response(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        // For objects / arrays, extract string leaves and join with
+        // spaces. serde_json::to_string() would re-escape `\n` → `\\n`
+        // and hide jailbreak phrases whose regex relies on `\s+`.
+        other => flatten_value_strings(other),
     }
 }
 

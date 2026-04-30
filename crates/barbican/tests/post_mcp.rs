@@ -385,9 +385,7 @@ fn post_mcp_rejects_huge_stdin_without_oom() {
         .spawn()
         .expect("spawn");
     let huge = "A".repeat(50 * 1024 * 1024);
-    let input = format!(
-        "{{\"tool_name\":\"mcp__x__y\",\"tool_response\":\"{huge}\"}}"
-    );
+    let input = format!("{{\"tool_name\":\"mcp__x__y\",\"tool_response\":\"{huge}\"}}");
     let start = std::time::Instant::now();
     let _ = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     let code = child.wait().unwrap().code().unwrap_or(-1);

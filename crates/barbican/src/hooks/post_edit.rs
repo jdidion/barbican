@@ -15,6 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::hooks::post_advisory::{emit_advisory, Finding};
+use crate::sanitize::normalize_for_scan;
 use crate::scan::{
     scan_cap_from_env, scan_sensitive_path, scan_suspicious_content, truncate_for_scan,
 };
@@ -41,7 +42,19 @@ pub fn run() -> Result<()> {
 
     let cap = scan_cap_from_env();
     let (scan_text, truncated) = truncate_for_scan(&content, cap);
+    // Normalize before surface-form regex match so fullwidth Latin,
+    // ZWSP-separated, and bidi-wrapped attack shapes all fold into
+    // the plain-ASCII regex (Phase-7 review W2). Scans both the raw
+    // and normalized views: raw catches things like long base64 blobs
+    // whose character class would be mangled by normalization; normal-
+    // ized catches the obfuscated injections.
+    let normalized = normalize_for_scan(scan_text);
     let mut content_findings = scan_suspicious_content(scan_text);
+    for f in scan_suspicious_content(&normalized) {
+        if !content_findings.contains(&f) {
+            content_findings.push(f);
+        }
+    }
     if truncated {
         content_findings.push(format!("scan-truncated at {cap} bytes (content larger)"));
     }
@@ -129,4 +142,3 @@ fn advisory_text(tool: &str, path: &str, findings: &[String]) -> String {
          driving the assistant to plant persistence or exfiltration code.",
     )
 }
-
