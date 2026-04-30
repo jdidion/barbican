@@ -47,11 +47,7 @@ fn log_path(home: &std::path::Path) -> PathBuf {
 }
 
 fn tempdir(name: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "barbican-audit-{}-{}",
-        name,
-        std::process::id()
-    ));
+    let base = std::env::temp_dir().join(format!("barbican-audit-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     base
@@ -96,32 +92,24 @@ fn audit_log_created_with_mode_0600() {
     assert!(log.exists(), "log file should be created at {log:?}");
     let meta = std::fs::metadata(&log).unwrap();
     let mode = meta.permissions().mode() & 0o777;
-    assert_eq!(
-        mode, 0o600,
-        "audit log must be mode 0600, got {:o}",
-        mode
-    );
+    assert_eq!(mode, 0o600, "audit log must be mode 0600, got {mode:o}");
 }
 
 #[test]
 fn audit_log_appends_jsonl() {
     let home = tempdir("append");
     for cmd in ["ls", "pwd", "git status"] {
-        let json = format!(
-            r#"{{"tool_name":"Bash","tool_input":{{"command":"{cmd}"}}}}"#
-        );
+        let json = format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"{cmd}"}}}}"#);
         assert_eq!(run_audit(&json, &home), 0);
     }
     let contents = std::fs::read_to_string(log_path(&home)).unwrap();
     assert_eq!(
         contents.lines().count(),
         3,
-        "expected 3 JSONL entries, got {:?}",
-        contents
+        "expected 3 JSONL entries, got {contents:?}"
     );
     for line in contents.lines() {
-        let _: serde_json::Value =
-            serde_json::from_str(line).expect("each line parses as JSON");
+        let _: serde_json::Value = serde_json::from_str(line).expect("each line parses as JSON");
     }
 }
 
@@ -131,8 +119,7 @@ fn audit_entry_contains_required_fields() {
     let input = r#"{"hook_event_name":"PreToolUse","session_id":"abc123","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
     assert_eq!(run_audit(input, &home), 0);
     let contents = std::fs::read_to_string(log_path(&home)).unwrap();
-    let entry: serde_json::Value =
-        serde_json::from_str(contents.trim()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
     assert!(entry.get("ts").is_some(), "ts missing: {entry}");
     assert_eq!(entry["event"], "PreToolUse");
     assert_eq!(entry["tool"], "Bash");
@@ -148,21 +135,21 @@ fn audit_entry_contains_required_fields() {
 #[test]
 fn audit_log_strips_ansi_escapes_from_command() {
     let home = tempdir("ansi");
-    // `echo \x1b[31mred\x1b[0m` — ESC is encoded as JSON .
-    let input = r#"{"tool_name":"Bash","tool_input":{"command":"echo [31mred[0m"}}"#;
+    // `echo \x1b[31mred\x1b[0m` — ESC is encoded as JSON .
+    let input =
+        "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo \\u001b[31mred\\u001b[0m\"}}";
     assert_eq!(run_audit(input, &home), 0);
     let bytes = std::fs::read(log_path(&home)).unwrap();
     assert!(
         !bytes.contains(&0x1b),
-        "ANSI ESC (0x1b) must not appear in the written log; got bytes {:?}",
-        bytes
+        "ANSI ESC (0x1b) must not appear in the written log; got bytes {bytes:?}"
     );
 }
 
 #[test]
 fn audit_log_strips_ansi_from_nested_string_fields() {
     let home = tempdir("nested");
-    let input = r#"{"tool_name":"Bash","tool_input":{"command":"x","description":"[2K clobber"}}"#;
+    let input = "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"x\",\"description\":\"\\u001b[2K clobber\"}}";
     assert_eq!(run_audit(input, &home), 0);
     let bytes = std::fs::read(log_path(&home)).unwrap();
     assert!(
@@ -175,7 +162,7 @@ fn audit_log_strips_ansi_from_nested_string_fields() {
 fn audit_log_strips_ansi_from_session_id() {
     // Attacker-controllable-ish — ensure top-level strings sanitize too.
     let home = tempdir("topstr");
-    let input = r#"{"session_id":"[31mid","tool_name":"Bash","tool_input":{"command":"x"}}"#;
+    let input = "{\"session_id\":\"\\u001b[31mid\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"x\"}}";
     assert_eq!(run_audit(input, &home), 0);
     let bytes = std::fs::read(log_path(&home)).unwrap();
     assert!(!bytes.contains(&0x1b));
