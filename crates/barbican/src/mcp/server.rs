@@ -68,8 +68,9 @@ impl ServerHandler for Barbican {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::default()
             .with_instructions(
-                "Barbican MCP server. Tool implementations land in upcoming \
-                 feature branches (safe_fetch, safe_read, inspect).",
+                "Barbican MCP server. Tools: safe_fetch (SSRF-hardened HTTP \
+                 fetch with prompt-injection sanitization). safe_read and \
+                 inspect land in upcoming branches.",
             )
             .with_protocol_version(rmcp::model::ProtocolVersion::default())
             .with_server_info(rmcp::model::Implementation::from_build_env())

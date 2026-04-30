@@ -157,6 +157,39 @@ fn rejects_localhost_hostname() {
     );
 }
 
+#[test]
+fn rejects_localhost_with_trailing_dot() {
+    // Trailing dot is the DNS-root FQDN form. Without explicit
+    // normalization, `resolve_to_addrs("localhost.", ...)` would miss
+    // the map key and reqwest would fall through to system DNS,
+    // bypassing the pin. Normalization ensures the pre-DNS filter still
+    // fires on the resolved loopback IP.
+    let out = run("http://localhost./");
+    assert!(out.contains("<barbican-error"));
+    assert!(
+        out.contains("loopback") || out.contains("blocked"),
+        "want loopback-blocked for trailing-dot host; got: {out}"
+    );
+}
+
+#[test]
+fn rejects_ipv6_loopback_literal_via_ssrf_filter() {
+    // Gemini review finding #6: `host_str()` returns `[::1]` with
+    // brackets; the previous code passed that string straight to
+    // hickory, which failed with DNS error. After the fix the IPv6
+    // literal should route through the IP-literal short-circuit and
+    // hit the SSRF filter with a named loopback reason.
+    let _g = env_guard();
+    std::env::set_var("BARBICAN_ALLOW_IP_LITERALS", "1");
+    let out = run("http://[::1]/");
+    std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
+    assert!(out.contains("<barbican-error"));
+    assert!(
+        out.contains("loopback") || out.contains("blocked"),
+        "want loopback-blocked, not DNS error; got: {out}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Happy path + content sanitization (wiremock).
 // ---------------------------------------------------------------------
@@ -166,7 +199,7 @@ fn rejects_localhost_hostname() {
     clippy::await_holding_lock,
     reason = "the guard is the whole point — it serializes env-var mutation across tests"
 )]
-async fn wiremock_benign_html_is_wrapped() {
+async fn wiremock_loopback_source_is_ssrf_rejected() {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
