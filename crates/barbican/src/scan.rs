@@ -24,9 +24,40 @@
 //! can't see (arbitrary file contents and untrusted MCP output).
 
 use regex::Regex;
+use serde_json::Value;
 use std::sync::OnceLock;
 
 use crate::sanitize::{normalize_for_scan, strip_invisible};
+
+/// Recursively extract every string leaf from a JSON value and join
+/// them with a space. Used to scan a nested `tool_response` without
+/// going through `serde_json::to_string`, which would escape `\n`/`\t`
+/// etc. and hide jailbreak phrases that rely on whitespace (GPT +
+/// Gemini P7 CRITICAL finding).
+#[must_use]
+pub fn flatten_value_strings(v: &Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    walk_strings(v, &mut parts);
+    parts.join(" ")
+}
+
+fn walk_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) => out.push(s.as_str()),
+        Value::Array(xs) => {
+            for x in xs {
+                walk_strings(x, out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.as_str());
+                walk_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Default per-payload scan cap. The audit's M3 finding raised this
 /// from Narthex's 200 KB to 5 MB. Configurable via
