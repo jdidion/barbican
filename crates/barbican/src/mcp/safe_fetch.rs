@@ -537,7 +537,10 @@ mod tests {
     fn sanitize_body_strips_xhtml_script() {
         let raw = "<html><script>evil()</script><p>ok</p></html>";
         let (out, _) = sanitize_body(raw, "application/xhtml+xml", false);
-        assert!(!out.contains("<script>"), "xhtml script not stripped: {out}");
+        assert!(
+            !out.contains("<script>"),
+            "xhtml script not stripped: {out}"
+        );
     }
 
     #[test]
