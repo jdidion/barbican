@@ -65,6 +65,38 @@ const fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Strip `<script>` / `<style>` / HTML-comment blocks from `s`.
+///
+/// `safe_fetch` returns HTML bodies wrapped in `<untrusted-content>`
+/// sentinels; before wrapping we drop the tag bodies that are most
+/// likely to carry injection payloads or obfuscated code. This is not
+/// a real HTML parser — it uses non-greedy regexes with the `(?s)` dot-
+/// matches-newline flag. That is enough for the threat model: an
+/// attacker can still leave plain `<p>` text to talk to the model, but
+/// can't hide code inside a `<script>` block or an HTML comment.
+///
+/// The regex is intentionally loose around the tag — `<script` with
+/// any attributes up to the closing `>`, then the shortest match to
+/// `</script>`. Same for `<style>`. HTML comments match `<!--` to the
+/// next `-->`.
+#[must_use]
+pub fn strip_html_tags(s: &str) -> String {
+    static SCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static STYLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static COMMENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let script = SCRIPT_RE
+        .get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex"));
+    let style = STYLE_RE
+        .get_or_init(|| Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex"));
+    let comment =
+        COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex"));
+
+    let out = script.replace_all(s, "");
+    let out = style.replace_all(&out, "");
+    comment.replace_all(&out, "").into_owned()
+}
+
 /// NFKC-normalize `s`.
 ///
 /// Converts compatibility variants to their canonical forms so
@@ -220,5 +252,41 @@ mod tests {
         // Invisible + fullwidth.
         let s = "\u{2066}ｉｇｎｏｒｅ\u{2069}";
         assert_eq!(normalize_for_scan(s), "ignore");
+    }
+
+    #[test]
+    fn strip_html_removes_script_block() {
+        let s = "<p>ok</p><script>alert(1)</script>";
+        assert_eq!(strip_html_tags(s), "<p>ok</p>");
+    }
+
+    #[test]
+    fn strip_html_removes_script_with_attrs_and_newlines() {
+        let s = "<p>ok</p>\n<script type=\"text/javascript\">\nfoo();\nbar();\n</script>after";
+        assert_eq!(strip_html_tags(s), "<p>ok</p>\nafter");
+    }
+
+    #[test]
+    fn strip_html_removes_style_block() {
+        let s = "<p>ok</p><style>body{color:red}</style>after";
+        assert_eq!(strip_html_tags(s), "<p>ok</p>after");
+    }
+
+    #[test]
+    fn strip_html_removes_comment() {
+        let s = "before<!-- secret payload -->after";
+        assert_eq!(strip_html_tags(s), "beforeafter");
+    }
+
+    #[test]
+    fn strip_html_case_insensitive_script() {
+        let s = "<SCRIPT>x</ScRiPt>ok";
+        assert_eq!(strip_html_tags(s), "ok");
+    }
+
+    #[test]
+    fn strip_html_multiple_scripts() {
+        let s = "<script>a</script>B<script>c</script>D";
+        assert_eq!(strip_html_tags(s), "BD");
     }
 }

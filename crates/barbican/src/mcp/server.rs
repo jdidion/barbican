@@ -9,12 +9,14 @@
 
 use anyhow::Result;
 use rmcp::{
-    handler::server::router::tool::ToolRouter,
-    model::{ServerCapabilities, ServerInfo},
-    tool_handler, tool_router,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
+
+use crate::mcp::safe_fetch::{self, SafeFetchArgs};
 
 /// Barbican's MCP server state. Currently empty; later branches will
 /// hold per-tool state such as the DNS resolver for `safe_fetch`.
@@ -32,6 +34,32 @@ impl Barbican {
         Self {
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// MCP tool: fetch a URL with SSRF and prompt-injection hardening.
+    ///
+    /// Blocks RFC1918 / loopback / link-local / CGNAT / IMDS addresses
+    /// even when the hostname resolves to one of them (DNS rebinding
+    /// defense). Strips zero-width/bidi Unicode, removes HTML
+    /// `<script>` / `<style>` / comment blocks, NFKC-normalizes, and
+    /// wraps the result in `<untrusted-content>` sentinels so the
+    /// model treats the body as data. Use instead of `WebFetch` for
+    /// attacker-influenced sources (forum threads, PR descriptions,
+    /// scraped pages).
+    #[tool(
+        name = "safe_fetch",
+        description = "Fetch a URL with SSRF and prompt-injection hardening. \
+                       Blocks RFC1918/loopback/link-local/CGNAT/IMDS. Strips \
+                       zero-width/bidi unicode and <script>/<style>. Wraps body \
+                       in <untrusted-content>. Use instead of WebFetch for \
+                       attacker-influenced sources."
+    )]
+    pub async fn safe_fetch(
+        &self,
+        Parameters(args): Parameters<SafeFetchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = safe_fetch::run(args).await;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
 
