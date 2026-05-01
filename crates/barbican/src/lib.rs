@@ -7,6 +7,7 @@
 
 pub mod cmd;
 pub mod hooks;
+pub mod installer;
 pub mod mcp;
 pub mod net;
 pub mod parser;
