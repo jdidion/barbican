@@ -76,7 +76,10 @@ fn install_creates_barbican_dir_and_copies_binary() {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&binary).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "binary must be executable (0o755), got {mode:o}");
+        assert_eq!(
+            mode, 0o755,
+            "binary must be executable (0o755), got {mode:o}"
+        );
     }
 }
 
@@ -91,7 +94,11 @@ fn install_writes_settings_with_allow_ask_hooks() {
         allow.iter().any(|v| v == "mcp__barbican"),
         "mcp__barbican must be in allow list: {allow:?}"
     );
-    assert!(allow.len() >= 15, "want ≥15 allow entries, got {}", allow.len());
+    assert!(
+        allow.len() >= 15,
+        "want ≥15 allow entries, got {}",
+        allow.len()
+    );
 
     let ask = settings["permissions"]["ask"].as_array().unwrap();
     assert!(
@@ -104,7 +111,11 @@ fn install_writes_settings_with_allow_ask_hooks() {
     let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
     let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
     assert_eq!(pre.len(), 1, "want 1 PreToolUse entry");
-    assert_eq!(post.len(), 3, "want 3 PostToolUse entries (audit, mcp scanner, edit scanner)");
+    assert_eq!(
+        post.len(),
+        3,
+        "want 3 PostToolUse entries (audit, mcp scanner, edit scanner)"
+    );
 
     let bin = home.join("barbican").join("barbican");
     let bin_str = bin.to_string_lossy();
@@ -123,7 +134,10 @@ fn install_registers_mcp_server_in_claude_json() {
     installer::install(&opts(&home)).expect("install");
 
     let claude_json = dir.path().join(".claude.json");
-    assert!(claude_json.exists(), "~/.claude.json should exist after install");
+    assert!(
+        claude_json.exists(),
+        "~/.claude.json should exist after install"
+    );
 
     let cfg = read_json(&claude_json);
     let server = &cfg["mcpServers"]["barbican"];
@@ -170,7 +184,10 @@ fn backup_created_on_first_install_and_preserved_on_second() {
     installer::install(&opts(&home)).expect("install #1");
 
     let backup = home.join("settings.json.pre-barbican");
-    assert!(backup.exists(), "first install should back up settings.json");
+    assert!(
+        backup.exists(),
+        "first install should back up settings.json"
+    );
     let backup_v1 = read_json(&backup);
     assert_eq!(backup_v1, original, "backup must contain pre-install data");
 
@@ -234,10 +251,7 @@ fn config_files_written_with_mode_0o600() {
     let (dir, home) = fake_home();
     installer::install(&opts(&home)).expect("install");
 
-    for path in [
-        home.join("settings.json"),
-        dir.path().join(".claude.json"),
-    ] {
+    for path in [home.join("settings.json"), dir.path().join(".claude.json")] {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
@@ -258,9 +272,18 @@ fn dry_run_install_writes_nothing() {
 
     installer::install(&o).expect("dry-run install");
 
-    assert!(!home.join("barbican").exists(), "dry run must not create barbican/");
-    assert!(!home.join("settings.json").exists(), "dry run must not write settings.json");
-    assert!(!dir.path().join(".claude.json").exists(), "dry run must not write ~/.claude.json");
+    assert!(
+        !home.join("barbican").exists(),
+        "dry run must not create barbican/"
+    );
+    assert!(
+        !home.join("settings.json").exists(),
+        "dry run must not write settings.json"
+    );
+    assert!(
+        !dir.path().join(".claude.json").exists(),
+        "dry run must not write ~/.claude.json"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -403,11 +426,24 @@ fn uninstall_keep_files_preserves_binary_dir() {
         home.join("barbican").join("barbican").is_file(),
         "--keep-files must leave the binary on disk"
     );
-    // Hooks should still be stripped from settings.json.
+    // Hooks must be unwired. After pruning, the `hooks` key is gone
+    // entirely (no user-owned hooks remained); the key absence IS
+    // the unwiring.
     let settings = read_json(&home.join("settings.json"));
+    let pre = settings
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        settings["hooks"]["PreToolUse"].as_array().unwrap().is_empty(),
-        "--keep-files must still unwire hooks"
+        pre.iter().all(|entry| {
+            entry["hooks"][0]["command"]
+                .as_str()
+                .map(|c| !c.contains("barbican/barbican"))
+                .unwrap_or(true)
+        }),
+        "--keep-files must still unwire barbican hooks: {pre:?}"
     );
 }
 
@@ -425,7 +461,10 @@ fn uninstall_dry_run_writes_nothing() {
     })
     .expect("uninstall --dry-run");
 
-    assert!(home.join("barbican").is_dir(), "dry-run must not delete dir");
+    assert!(
+        home.join("barbican").is_dir(),
+        "dry-run must not delete dir"
+    );
     let settings_after = read_json(&home.join("settings.json"));
     assert_eq!(
         settings_before, settings_after,
@@ -475,5 +514,224 @@ fn install_never_leaves_partial_config_file() {
             !name.contains(".tmp") && !name.contains(".swp"),
             "stray temp file left: {name}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Phase-11 adversarial-review regression tests.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn stale_pid_scoped_temp_symlink_is_refused() {
+    // HIGH: write_json_mode_0600 used O_CREAT+O_TRUNC. Now it uses
+    // `create_new(true) + O_NOFOLLOW` against a PID-scoped tmp path.
+    // A leftover symlink at exactly that PID's path (planted by a
+    // prior crashed run that happened to share the same PID, or by
+    // an attacker with pid-guessing) must cause the install to
+    // refuse rather than follow.
+    let (_dir, home) = fake_home();
+    fs::write(home.join("settings.json"), "{}").unwrap();
+
+    let bait_dir = tempfile::tempdir().unwrap();
+    let bait = bait_dir.path().join("victim");
+    fs::write(&bait, "pre-existing bait data").unwrap();
+    // Plant a symlink at the exact PID-scoped tmp the installer is
+    // about to use this run. This is a same-process test harness, so
+    // the PID matches.
+    let tmp = home.join(format!("settings.json.barbican-tmp.{}", std::process::id()));
+    std::os::unix::fs::symlink(&bait, &tmp).unwrap();
+
+    let err = installer::install(&opts(&home)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stale") || msg.contains("AlreadyExists") || msg.contains("already exists"),
+        "installer must refuse to write through a stale temp symlink; got: {msg}"
+    );
+    // Bait file must remain unchanged — symlink was not followed.
+    let bait_contents = fs::read_to_string(&bait).unwrap();
+    assert_eq!(
+        bait_contents, "pre-existing bait data",
+        "bait file must not be overwritten"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn torn_backup_from_prior_crash_is_detected_not_reused() {
+    // HIGH: fs::copy for the backup was not atomic; a truncated
+    // `.pre-barbican` from a killed prior run was silently reused.
+    // Seed a plausibly-torn backup and verify the installer either
+    // repairs it (re-copies the current source) or errors clearly.
+    let (_dir, home) = fake_home();
+    let settings = home.join("settings.json");
+    let backup = home.join("settings.json.pre-barbican");
+    let pristine = r#"{"permissions":{"allow":["MyRule"],"ask":[]}}"#;
+    fs::write(&settings, pristine).unwrap();
+    // Truncated prefix that parses as invalid JSON.
+    fs::write(&backup, "{\"permi").unwrap();
+
+    // Install should NOT proceed and leave a corrupt backup in place.
+    // Accept either: (a) install succeeds after rewriting the
+    // backup atomically (so the backup matches current settings), OR
+    // (b) install errors clearly naming the corrupt backup.
+    let result = installer::install(&opts(&home));
+    match result {
+        Ok(()) => {
+            let b = fs::read_to_string(&backup).unwrap();
+            // If install proceeded, the backup must now be valid JSON
+            // reflecting the pre-install settings. Previously, the
+            // installer left the truncated "{\"permi" in place.
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&b).is_ok(),
+                "backup must be valid JSON after install, got: {b}"
+            );
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("backup") || msg.contains("pre-barbican"),
+                "install error must mention the backup; got: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn uninstall_does_not_strip_user_hook_with_barbican_substring_in_path() {
+    // HIGH: is_barbican_hook_command matched substring
+    // 'barbican/barbican' — a user's own hook at
+    // /opt/barbican/barbican-helper would be falsely stripped.
+    let (_dir, home) = fake_home();
+    let user_hook_cmd = "/opt/barbican/barbican-helper --mode=check";
+    let original = json!({
+        "permissions": { "allow": [], "ask": [] },
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": user_hook_cmd}]
+            }]
+        }
+    });
+    write_json(&home.join("settings.json"), &original);
+
+    installer::install(&opts(&home)).expect("install");
+    installer::uninstall(&UninstallOptions {
+        claude_home: home.clone(),
+        dry_run: false,
+        keep_files: false,
+    })
+    .expect("uninstall");
+
+    let settings = read_json(&home.join("settings.json"));
+    let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+    let preserved = pre.iter().any(|entry| {
+        entry["hooks"][0]["command"]
+            .as_str()
+            .map(|c| c == user_hook_cmd)
+            .unwrap_or(false)
+    });
+    assert!(
+        preserved,
+        "user hook at /opt/barbican/barbican-helper must survive uninstall: {pre:?}"
+    );
+}
+
+#[test]
+fn install_errors_cleanly_on_non_object_permissions() {
+    // LOW-2 (elevated): panic if user's settings.json contains
+    // `"permissions": "disabled"` — a string where we expected an
+    // object. Installer must surface a clear error, not crash.
+    let (_dir, home) = fake_home();
+    let malformed = json!({ "permissions": "disabled" });
+    write_json(&home.join("settings.json"), &malformed);
+
+    let err = installer::install(&opts(&home)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("permissions") || msg.contains("object"),
+        "want helpful error about malformed config; got: {msg}"
+    );
+}
+
+#[test]
+fn install_errors_cleanly_on_non_array_allow() {
+    // LOW-2: same class — permissions.allow is a string. Must not
+    // panic through array_entry().
+    let (_dir, home) = fake_home();
+    let malformed = json!({ "permissions": { "allow": "nope" } });
+    write_json(&home.join("settings.json"), &malformed);
+
+    let err = installer::install(&opts(&home)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("allow") || msg.contains("array"),
+        "want helpful error about allow-list type; got: {msg}"
+    );
+}
+
+#[test]
+fn install_preserves_user_key_order() {
+    // MEDIUM: serde_json::Map without `preserve_order` reorders keys
+    // on every round-trip, churning the user's dotfile diff.
+    let (_dir, home) = fake_home();
+    // Hand-crafted key order that serde_json's default hash-map
+    // would scramble.
+    let original_str = "{\n  \"model\": \"opus\",\n  \"permissions\": {\n    \"allow\": [],\n    \"ask\": []\n  },\n  \"hooks\": {},\n  \"experimental\": {\n    \"foo\": 1\n  }\n}\n";
+    fs::write(home.join("settings.json"), original_str).unwrap();
+
+    installer::install(&opts(&home)).expect("install");
+
+    let out = fs::read_to_string(home.join("settings.json")).unwrap();
+    let model_idx = out.find("\"model\"").expect("model key present");
+    let perms_idx = out
+        .find("\"permissions\"")
+        .expect("permissions key present");
+    let hooks_idx = out.find("\"hooks\"").expect("hooks key present");
+    let exp_idx = out
+        .find("\"experimental\"")
+        .expect("experimental key present");
+    assert!(
+        model_idx < perms_idx && perms_idx < hooks_idx && hooks_idx < exp_idx,
+        "user key order must be preserved on round-trip; got:\n{out}"
+    );
+}
+
+#[test]
+fn uninstall_removes_empty_scaffolding() {
+    // MEDIUM: after a fresh install+uninstall on a previously-empty
+    // config, no orphan `hooks: {}`, `permissions.allow: []`, etc.
+    // should be left behind.
+    let (_dir, home) = fake_home();
+    installer::install(&opts(&home)).expect("install");
+    installer::uninstall(&UninstallOptions {
+        claude_home: home.clone(),
+        dry_run: false,
+        keep_files: false,
+    })
+    .expect("uninstall");
+
+    let settings = read_json(&home.join("settings.json"));
+    // Empty arrays/objects inserted by install must be removed once
+    // they're no longer populated.
+    if let Some(perms) = settings.get("permissions") {
+        if let Some(obj) = perms.as_object() {
+            assert!(
+                obj.get("allow")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|a| !a.is_empty())
+                    || obj.get("allow").is_none(),
+                "empty permissions.allow must be removed: {settings}"
+            );
+        }
+    }
+    if let Some(hooks) = settings.get("hooks") {
+        if let Some(obj) = hooks.as_object() {
+            for (_k, v) in obj {
+                if let Some(arr) = v.as_array() {
+                    assert!(!arr.is_empty(), "empty hook event arrays must be removed");
+                }
+            }
+        }
     }
 }

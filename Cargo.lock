@@ -138,6 +138,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hickory-resolver",
+ "libc",
  "phf",
  "regex",
  "reqwest",
