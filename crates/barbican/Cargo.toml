@@ -55,6 +55,8 @@ unicode-normalization = "0.1"
 url = "2.5"
 
 [dev-dependencies]
+# Ephemeral directories and files for safe_read integration tests. Dev-only.
+tempfile = "3.13"
 # Local HTTP mock server for safe_fetch integration tests. Dev-only —
 # does not affect release build size or runtime.
 wiremock = "0.6"

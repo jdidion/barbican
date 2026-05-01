@@ -71,7 +71,8 @@ All knobs are environment variables read at process start; none are persistent o
 | `BARBICAN_ALLOW_IP_LITERALS` | `0` | If `1`, `safe_fetch` accepts raw IP literals (still subject to SSRF filter). (M4) |
 | `BARBICAN_SAFE_READ_ALLOW_SENSITIVE` | `0` | If `1`, `safe_read` permits reads under `~/.ssh/`, `~/.aws/`, etc. (L3) |
 | `BARBICAN_SAFE_READ_EXTRA_DENY` | _(empty)_ | Colon-separated path prefixes to add to the sensitive list. |
-| `BARBICAN_SAFE_READ_ALLOW` | _(empty)_ | Colon-separated path prefixes to carve out of the sensitive list. |
+| `BARBICAN_SAFE_READ_ALLOW` | _(empty)_ | Colon-separated paths to carve exact-match holes in the deny list. |
+| `BARBICAN_SAFE_READ_MAX_BYTES` | `1048576` (1 MiB) | Default `safe_read` cap. Callers can override per-call; clamped to 10 MiB. |
 
 The rule for new knobs: **strict default, named opt-out, documented here**. Never silently weaken a check; if a real false positive surfaces, add a knob.
 
