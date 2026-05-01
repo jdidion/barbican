@@ -110,7 +110,7 @@ impl Barbican {
         &self,
         Parameters(args): Parameters<InspectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let body = inspect::run(args);
+        let body = inspect::run(&args);
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }

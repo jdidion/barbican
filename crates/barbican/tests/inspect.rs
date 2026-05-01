@@ -9,7 +9,7 @@
 use barbican::mcp::inspect::{self, InspectArgs};
 
 fn run(text: &str) -> String {
-    inspect::run(InspectArgs {
+    inspect::run(&InspectArgs {
         text: text.to_string(),
     })
 }
@@ -293,6 +293,6 @@ fn deny_unknown_fields_rejects_extras() {
 
 #[test]
 fn missing_text_field_fails_to_deserialize() {
-    let json = r#"{}"#;
+    let json = r"{}";
     assert!(serde_json::from_str::<InspectArgs>(json).is_err());
 }

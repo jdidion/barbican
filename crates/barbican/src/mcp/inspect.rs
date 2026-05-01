@@ -49,7 +49,7 @@ pub struct InspectArgs {
 /// surfaces as a finding. Synchronous because every step is CPU-only;
 /// the rmcp handler in `mcp::server` is the `async` wrapper.
 #[must_use]
-pub fn run(args: InspectArgs) -> String {
+pub fn run(args: &InspectArgs) -> String {
     let (text, truncated) = truncate_for_scan(&args.text, MAX_INPUT_BYTES);
     let (cleaned, mut findings) = inspect(text);
     if truncated {
