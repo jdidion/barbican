@@ -80,6 +80,14 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "setsid",  // setsid <cmd>
     "stdbuf",  // stdbuf <cmd>
     "unbuffer", // unbuffer <cmd>
+    // 1.2.0 adversarial-review additions — shell builtins that
+    // transparently run the remainder of argv as an inner command.
+    // Without these in the unwrap set, `time curl | bash` and
+    // `command bash -c '...'` route around H1/M1 entirely.
+    "time",    // time <cmd>  (also the `time` keyword form)
+    "command", // command [-pVv] <cmd>  (bypasses function shadowing)
+    "builtin", // builtin <cmd>
+    "exec",    // exec [-cl] [-a NAME] <cmd>
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.

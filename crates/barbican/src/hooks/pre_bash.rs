@@ -366,6 +366,12 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
             | "stdbuf"
             | "unbuffer"
             | "xargs"
+            // 1.2.0 adversarial-review additions — transparent shell
+            // builtins that prefix argv directly without a -c flag.
+            | "time"
+            | "command"
+            | "builtin"
+            | "exec"
     ) {
         return extract_prefix_runner_command(basename, &stage.args);
     }
@@ -593,6 +599,15 @@ fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
                 "-j" | "--jobs" | "-n" | "--max-args" | "-N"
                     | "--colsep" | "-C" | "--delimiter" | "-d"
             )
+            // 1.2.0 adversarial-review additions.
+            // `exec -a NAME CMD`: `-a` renames argv[0] of the inner
+            // command, so it consumes the next token. Without this the
+            // prefix-runner misidentifies the inner as NAME (an
+            // attacker-controlled label).
+            | ("exec", "-a")
+            // `time -p`, `-o FILE`, `-f FORMAT` are `/usr/bin/time` flags
+            // (the builtin accepts no flags). `-o` / `-f` take values.
+            | ("time", "-o" | "--output" | "-f" | "--format")
     )
 }
 
