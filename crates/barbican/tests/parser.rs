@@ -537,9 +537,9 @@ fn deeply_nested_command_substitutions_are_denied() {
 
 #[test]
 fn very_long_pipeline_parses_without_stack_overflow() {
-    // 500-stage pipeline: `cmd | cmd | cmd | ...`. Pipelines are
-    // left-recursive in the grammar so this exercises iterative
-    // tree-walking rather than recursion. The parser must succeed and
+    // 500-stage pipeline: `cmd | cmd | cmd | ...`. The walker iterates
+    // over named children rather than recursing per stage, so 500 is
+    // comfortably under any stack limit. The parser must succeed and
     // surface every stage so a later `curl | … | bash` fuse can't be
     // diluted by noise stages.
     let stage = "cmd";
@@ -569,7 +569,15 @@ fn multi_megabyte_argument_word_parses_in_bounded_time() {
     for _ in 0..SIZE {
         cmd.push('a');
     }
+    let start = std::time::Instant::now();
     let script = parse(&cmd).expect("5 MiB argv word must parse (no classifier gate)");
+    let elapsed = start.elapsed();
+    // Locally this parses in <100 ms. 10 s is 100x slack to survive
+    // cold CI runners; far under that catches a quadratic regression.
+    assert!(
+        elapsed.as_secs() < 10,
+        "5 MiB parse took {elapsed:?} — regression to quadratic time?"
+    );
     assert_eq!(script.pipelines.len(), 1);
     assert_eq!(script.pipelines[0].stages[0].basename, "echo");
     let args = &script.pipelines[0].stages[0].args;

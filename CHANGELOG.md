@@ -8,7 +8,7 @@ Polish release — closes the Phase-1 post-review below-medium follow-ups and th
 
 ### Changed
 
-- **`safe_fetch` reads `BARBICAN_ALLOW_IP_LITERALS` once per fetch.** Previously the env was re-read by `validate_url` on every redirect hop; a concurrent mutator to the process's environment could flip policy mid-fetch and permit a redirect to a raw-IP target that the initial call would have rejected. Now the flag is captured once at entry and passed down as an explicit bool. Public API: new `validate_url_with(s, allow_ip_literals: bool)` in `net`; `validate_url` becomes a thin env-reading wrapper for backward compatibility.
+- **`safe_fetch` reads `BARBICAN_ALLOW_IP_LITERALS` once per fetch.** Defense-in-depth against in-process env mutation: previously the env was re-read by `validate_url` on every redirect hop, so any code running in the Barbican process that called `std::env::set_var` between hops could toggle policy mid-fetch. No known external attacker path exercised this; the narrowing removes the surface rather than patching a known bypass. Now the flag is captured once at entry of `fetch()` and passed down as an explicit bool. Internal API: new `pub(crate) validate_url_with(s, allow: bool)` in `net`; `validate_url` becomes a thin env-reading wrapper.
 
 ### Added
 

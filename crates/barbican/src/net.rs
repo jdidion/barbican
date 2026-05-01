@@ -85,7 +85,7 @@ pub fn validate_url(s: &str) -> Result<Url, RejectReason> {
 /// Reading the env per-hop leaves a narrow TOCTOU where a concurrent
 /// writer to the process's environment could flip policy mid-fetch;
 /// this variant removes that surface.
-pub fn validate_url_with(s: &str, allow_ip_literals: bool) -> Result<Url, RejectReason> {
+pub(crate) fn validate_url_with(s: &str, allow: bool) -> Result<Url, RejectReason> {
     let url = Url::parse(s).map_err(|_| RejectReason::NoHost)?;
     match url.scheme() {
         "http" | "https" => {}
@@ -96,12 +96,12 @@ pub fn validate_url_with(s: &str, allow_ip_literals: bool) -> Result<Url, Reject
         url::Host::Domain(_) => Ok(url),
         url::Host::Ipv4(v4) => {
             let ip = IpAddr::V4(v4);
-            check_ip_literal(ip, allow_ip_literals)?;
+            check_ip_literal(ip, allow)?;
             Ok(url)
         }
         url::Host::Ipv6(v6) => {
             let ip = IpAddr::V6(v6);
-            check_ip_literal(ip, allow_ip_literals)?;
+            check_ip_literal(ip, allow)?;
             Ok(url)
         }
     }
@@ -114,8 +114,8 @@ pub fn allow_ip_literals() -> bool {
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-fn check_ip_literal(ip: IpAddr, allow_ip_literals: bool) -> Result<(), RejectReason> {
-    if !allow_ip_literals {
+fn check_ip_literal(ip: IpAddr, allow: bool) -> Result<(), RejectReason> {
+    if !allow {
         return Err(RejectReason::RawIpLiteral);
     }
     if let Some(reason) = is_blocked_ip(ip) {
@@ -524,18 +524,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_url_with_ignores_env_when_flag_is_false() {
-        // Even if the env override is set, passing `false` explicitly
-        // must reject IP literals. This is the TOCTOU-narrowing
-        // contract: safe_fetch captures the flag once and a concurrent
-        // env mutator can't flip it mid-fetch.
-        std::env::set_var("BARBICAN_ALLOW_IP_LITERALS", "1");
+    fn validate_url_with_rejects_raw_ip_when_flag_is_false() {
+        // Passing `false` explicitly must reject IP literals. The
+        // function is pure (no env read) by design — that's the whole
+        // TOCTOU-narrowing point — so the test must be pure too and
+        // must NOT mutate BARBICAN_ALLOW_IP_LITERALS. Setting it here
+        // would race the other env-sensitive tests under the default
+        // parallel test runner.
         let err = validate_url_with("http://127.0.0.1/", false).unwrap_err();
         assert!(
             matches!(err, RejectReason::RawIpLiteral),
             "explicit allow=false must reject; got {err:?}"
         );
-        std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
     }
 
     #[test]
