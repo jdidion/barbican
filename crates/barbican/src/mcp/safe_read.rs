@@ -396,8 +396,7 @@ fn path_contains_symlink(path: &Path) -> bool {
 }
 
 fn allow_sensitive_override() -> bool {
-    std::env::var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::env_flag("BARBICAN_SAFE_READ_ALLOW_SENSITIVE")
 }
 
 /// Parse a colon-separated path list from an env var. Every entry

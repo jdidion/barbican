@@ -386,3 +386,55 @@ fn deny_reason_is_ascii_clean_on_normal_deny() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 1.2.0 adversarial-review: malformed hook JSON must DENY, not allow.
+// CLAUDE.md rule #1 (deny by default). Previously the hook exited 0 on
+// any serde_json::from_str failure — a full bypass surface whenever
+// the attacker could influence the JSON payload shape.
+// ---------------------------------------------------------------------
+
+#[test]
+fn malformed_hook_json_denies_by_default() {
+    // Unterminated JSON — classic parse failure.
+    assert_eq!(run_pre_bash(r#"{"tool_name":"Bash","tool_input":"#), 2);
+    // Garbage bytes.
+    assert_eq!(run_pre_bash("this is not json"), 2);
+    // Trailing comma — accepted by JSON5 but not by serde_json.
+    assert_eq!(run_pre_bash(r#"{"tool_name":"Bash",}"#), 2);
+    // Wrong type for tool_input — forces serde to reject.
+    assert_eq!(run_pre_bash(r#"{"tool_name":"Bash","tool_input":42}"#), 2);
+}
+
+#[test]
+fn malformed_hook_json_escape_hatch_allows_when_env_set() {
+    // The escape hatch is for a scenario where Claude Code's own hook
+    // JSON contract has changed and Barbican is blocking every Bash
+    // call while the user investigates. Setting the env to "1" must
+    // restore the pre-1.2.0 allow-on-parse-fail behavior.
+    //
+    // NOTE: env is process-global; we set it ONLY for the child, not
+    // the test process, using Command::env so the test itself never
+    // observes the var.
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = std::process::Command::new(bin)
+        .arg("pre-bash")
+        .env("BARBICAN_ALLOW_MALFORMED_HOOK_JSON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"garbage")
+        .unwrap();
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "escape hatch must restore allow-on-fail behavior"
+    );
+}

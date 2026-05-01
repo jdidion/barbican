@@ -28,6 +28,7 @@ use std::io::{Read, Write};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::env_flag;
 use crate::parser::{self, ParseError, Pipeline, RedirectFd, RedirectKind, Script};
 use crate::tables::{ENV_DUMPERS, EXFIL_NETWORK_TOOLS, SHELL_INTERPRETERS};
 
@@ -93,8 +94,34 @@ pub fn run() -> Result<()> {
         match serde_json::from_str(&buf) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "pre-bash: unparseable hook JSON — allowing");
-                std::process::exit(EXIT_ALLOW);
+                // CLAUDE.md rule #1: deny by default. An attacker who
+                // can influence tool-call JSON shape (e.g. by prompting
+                // the model to emit a payload that trips serde_json
+                // parsing) must not get a fail-open on command
+                // classification — that's a full bypass of every
+                // classifier downstream. We log loudly to stderr (so
+                // the user sees it) and exit DENY.
+                //
+                // Escape hatch: BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1
+                // reverts to the pre-1.2.0 behavior. Only set this if
+                // Claude Code itself has changed its hook JSON contract
+                // and Barbican is blocking every Bash call while you
+                // upgrade / re-install.
+                if env_flag("BARBICAN_ALLOW_MALFORMED_HOOK_JSON") {
+                    tracing::warn!(
+                        error = %e,
+                        "pre-bash: unparseable hook JSON — allowing \
+                         (BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1)"
+                    );
+                    std::process::exit(EXIT_ALLOW);
+                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "barbican: unparseable hook JSON ({e}) — denying. \
+                     Set BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1 to revert \
+                     to allow-on-fail while you investigate."
+                );
+                std::process::exit(EXIT_DENY);
             }
         }
     };
@@ -1246,7 +1273,7 @@ fn network_tool_word_regex() -> &'static regex::Regex {
 /// no secret reference is allowed; with it, even benign git is blocked
 /// so attackers can't quietly use it as the exfil channel.
 fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<String> {
-    if std::env::var("BARBICAN_GIT_HARD_DENY").ok().as_deref() != Some("1") {
+    if !env_flag("BARBICAN_GIT_HARD_DENY") {
         return None;
     }
     let git_stage = pipeline

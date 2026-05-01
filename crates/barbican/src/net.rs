@@ -110,8 +110,7 @@ pub(crate) fn validate_url_with(s: &str, allow: bool) -> Result<Url, RejectReaso
 /// Whether the raw-IP-literal override is on.
 #[must_use]
 pub fn allow_ip_literals() -> bool {
-    std::env::var("BARBICAN_ALLOW_IP_LITERALS")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::env_flag("BARBICAN_ALLOW_IP_LITERALS")
 }
 
 fn check_ip_literal(ip: IpAddr, allow: bool) -> Result<(), RejectReason> {
