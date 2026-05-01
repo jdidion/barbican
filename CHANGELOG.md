@@ -2,6 +2,27 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.1.0] — 2026-05-01
+
+Polish release — closes the Phase-1 post-review below-medium follow-ups and the Phase-8 redirect-hop TOCTOU. No audit findings open. Roadmap retires: remaining work moves to GitHub issues.
+
+### Changed
+
+- **`safe_fetch` reads `BARBICAN_ALLOW_IP_LITERALS` once per fetch.** Previously the env was re-read by `validate_url` on every redirect hop; a concurrent mutator to the process's environment could flip policy mid-fetch and permit a redirect to a raw-IP target that the initial call would have rejected. Now the flag is captured once at entry and passed down as an explicit bool. Public API: new `validate_url_with(s, allow_ip_literals: bool)` in `net`; `validate_url` becomes a thin env-reading wrapper for backward compatibility.
+
+### Added
+
+- **Defense-in-depth parser tests** (integration, `tests/parser.rs`):
+  - `deeply_nested_command_substitutions_are_denied` — 200 levels of `$(...)` returns `Malformed` (pins `MAX_DEPTH = 100`).
+  - `very_long_pipeline_parses_without_stack_overflow` — 500-stage pipeline parses and surfaces every stage to classifiers.
+  - `multi_megabyte_argument_word_parses_in_bounded_time` — 5 MiB argv word parses cleanly.
+- **Unit tests for `validate_url_with`**: explicit-false rejects raw IPs even when env override is on; explicit-true permits public IPs and still blocks loopback.
+
+### Deferred to GitHub issues
+
+- `safe_fetch` happy-path integration test — requires a resolver/connector abstraction in `fetch()`. Existing tests cover every rejection path; the happy-path test is not release-blocking.
+- Any other below-medium follow-ups surfaced by later review.
+
 ## [1.0.0] — 2026-05-01
 
 Initial release. Rust port of [Narthex](https://github.com/fitz2882/narthex) (pinned at commit `071fec0`) with every finding from the upstream security audit fixed and pinned by a regression test.
