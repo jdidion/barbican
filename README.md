@@ -2,7 +2,7 @@
 
 A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a single static Rust binary. Barbican runs as a `PreToolUse` / `PostToolUse` hook and as an MCP server that exposes sanitized fetch / read / inspect tools, blocking a concrete list of known-dangerous bash compositions and prompt-injection patterns before they reach the model.
 
-This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`PLAN.md`](PLAN.md) for the port plan and [`SECURITY.md`](SECURITY.md) for the threat model.
+This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 Status: **1.0.0**. All 12 roadmap phases and every audit finding (H1, H2, M1-M4, L1-L3) have shipped, each with a regression test. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
 
