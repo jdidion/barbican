@@ -20,6 +20,7 @@
 //! and lexically normalized before the policy check, so traversal
 //! tricks (`/etc/hosts/../shadow`) and symlink bait cannot bypass.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -98,7 +99,6 @@ fn read_blocking(path: &str, max_bytes: usize) -> Result<ReadOutcome, ReadError>
     // procfs entries all lie about length).
     let file = std::fs::File::open(&canonical).map_err(ReadError::from)?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
-    use std::io::Read;
     let mut reader = file.take((max_bytes as u64).saturating_add(1));
     reader
         .read_to_end(&mut buf)
@@ -406,9 +406,8 @@ fn allow_sensitive_override() -> bool {
 /// would otherwise match globally, and the `.env` special case is a
 /// hardcoded default rule that cannot be composed by env var.
 fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
-    let raw = match std::env::var(var) {
-        Ok(v) => v,
-        Err(_) => return Ok(Vec::new()),
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for entry in raw.split(':').filter(|s| !s.is_empty()) {
@@ -572,16 +571,15 @@ fn matches_dotenv(name: &str) -> bool {
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
     if FS_CASE_INSENSITIVE {
-        let ac = a.components();
-        let bc = b.components();
-        let av: Vec<_> = ac.collect();
-        let bv: Vec<_> = bc.collect();
-        if av.len() != bv.len() {
-            return false;
+        let mut ac = a.components();
+        let mut bc = b.components();
+        loop {
+            match (ac.next(), bc.next()) {
+                (None, None) => return true,
+                (Some(x), Some(y)) if eq_component(x.as_os_str(), y.as_os_str()) => continue,
+                _ => return false,
+            }
         }
-        av.iter()
-            .zip(bv.iter())
-            .all(|(x, y)| eq_component(x.as_os_str(), y.as_os_str()))
     } else {
         a == b
     }
@@ -625,9 +623,8 @@ impl From<std::io::Error> for ReadError {
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(s) => f.write_str(s),
             Self::NotAFile => f.write_str("not a regular file"),
-            Self::PolicyDenied(s) => f.write_str(s),
+            Self::Io(s) | Self::PolicyDenied(s) => f.write_str(s),
         }
     }
 }
