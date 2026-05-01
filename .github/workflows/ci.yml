@@ -57,7 +57,11 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit
-        run: cargo audit --deny warnings
+        # RUSTSEC-2026-0118: NSEC3 validation DoS in hickory-proto.
+        # We do not enable any `dnssec-*` feature on hickory-resolver
+        # (only `system-config` + `tokio`), so the vulnerable code path
+        # isn't compiled into Barbican. Documented in SECURITY.md.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0118
 
   release-build:
     name: release build (aarch64-apple-darwin)

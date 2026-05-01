@@ -77,6 +77,12 @@ All knobs are environment variables read at process start; none are persistent o
 
 The rule for new knobs: **strict default, named opt-out, documented here**. Never silently weaken a check; if a real false positive surfaces, add a knob.
 
+## Known advisories we ignore (with rationale)
+
+CI runs `cargo audit --deny warnings` with a narrow allowlist. Any entry here must include: advisory ID, advisory URL, why the vulnerable code is not reachable in Barbican, and what would invalidate the ignore.
+
+- **RUSTSEC-2026-0118** (`hickory-proto 0.26.1`) — NSEC3 closest-encloser proof validation enters an unbounded loop on cross-zone responses. The vulnerable code lives in hickory-proto's DNSSEC validation path. Barbican pulls hickory-resolver with `default-features = false` and only enables `system-config` + `tokio`; no `dnssec-*` feature is enabled, so the NSEC3 validator is never compiled in. Advisory: https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-3v94-mw7p-v465. **Invalidates the ignore:** enabling any DNSSEC feature on hickory-resolver, or a future hickory-proto release that enables the affected code unconditionally — at which point the ignore must be dropped and the dep upgraded.
+
 ## Reporting security issues
 
 - Private report: open a [security advisory on GitHub](https://github.com/jdidion/barbican/security/advisories/new).
