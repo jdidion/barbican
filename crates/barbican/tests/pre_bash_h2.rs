@@ -409,3 +409,30 @@ fn deny_reason_is_ascii_clean_for_h2_target() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 1.2.0 adversarial-review: decoder-stage redirect in a non-tail
+// position. Pre-1.2.0 rule 1 only checked the pipeline tail, so
+// `base64 -d > /tmp/p.sh | cat >/dev/null` slipped through — the
+// decoder's write to the exec target happened in a non-tail stage.
+// ---------------------------------------------------------------------
+
+#[test]
+fn decoder_writes_in_non_tail_stage_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "printf 'ZWNobyBwd25lZAo=' | base64 -d > /tmp/p.sh | cat >/dev/null"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn xxd_decoder_non_tail_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "cat payload.hex | xxd -r -p > /tmp/x.sh | wc -l"
+        )),
+        2,
+    );
+}

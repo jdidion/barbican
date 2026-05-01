@@ -214,6 +214,9 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = shell_with_network_substitution(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -730,9 +733,14 @@ fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<String> {
     if !has_decoder {
         return None;
     }
-    // Rule 1: effective `>` / `>>` target on the pipeline's tail stage.
-    if let Some(tail) = pipeline.stages.last() {
-        if let Some(target) = effective_out_file_target(tail) {
+    // 1.2.0 adversarial review (GPT SEVERE #2): the per-pipeline rule
+    // used to check ONLY the tail stage's redirect. That missed shapes
+    // like `base64 -d > /tmp/p.sh | cat > /dev/null` where the decoder
+    // writes to the exec target via its OWN redirect in a non-tail
+    // position. Extend rule 1 to scan EVERY stage's stdout redirect,
+    // not just the tail. The exec-shape check is the same.
+    for stage in &pipeline.stages {
+        if let Some(target) = effective_out_file_target(stage) {
             if is_exec_target(&target) {
                 return Some(format_h2_reason(&decoder_name(pipeline), &target));
             }
@@ -1299,6 +1307,52 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
                  (M2 — staged exfiltration)",
                 t = sanitize_reason_text(&target),
             ));
+        }
+    }
+    None
+}
+
+/// Deny when a shell interpreter stage has a process substitution
+/// (or command substitution) whose body contains a network-egress
+/// tool as the first stage of its inner pipeline.
+///
+/// 1.2.0 adversarial review (GPT SEVERE #1): `bash <(curl url)` and
+/// `bash <<<"$(curl url)"` are full H1-equivalent download-and-exec
+/// shapes that the per-stage H1 classifier doesn't catch —
+/// the outer pipeline is 1-stage `bash`, the network tool lives in a
+/// substitution that H1 walks as an independent script. A bare
+/// `curl url` substitution has no shell interpreter in it, so
+/// h1_pipeline_curl_to_shell doesn't fire on the inner either. But
+/// bash will execute whatever the substitution writes / emits.
+///
+/// Classification: when argv[0] of the outer stage is a shell
+/// interpreter AND a substitution under that stage starts with curl
+/// or wget, deny. A benign shell that happens to embed a curl
+/// substitution (e.g. `echo "$(curl url)"`) still runs the curl, but
+/// the result is a string, not executable code — the attack shape
+/// requires argv[0]'s basename to be the shell.
+fn shell_with_network_substitution(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        let bn = stage.basename.to_ascii_lowercase();
+        if !SHELL_INTERPRETERS.contains(bn.as_str()) && !matches!(bn.as_str(), "source" | ".") {
+            continue;
+        }
+        for sub in &stage.substitutions {
+            for sub_pipeline in &sub.pipelines {
+                if sub_pipeline
+                    .stages
+                    .iter()
+                    .any(|s| is_curl_or_wget(&s.basename))
+                {
+                    return Some(format!(
+                        "blocked: shell interpreter `{sh}` reads a \
+                         network-tool substitution (curl/wget inside \
+                         `$(...)` or `<(...)`) — download-and-execute \
+                         shape",
+                        sh = stage.basename,
+                    ));
+                }
+            }
         }
     }
     None
