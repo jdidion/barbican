@@ -145,7 +145,10 @@ fn sentinel_breakout_in_file_is_neutralized() {
 #[test]
 fn missing_file_returns_barbican_error() {
     let out = run("/nonexistent/path/does/not/exist.txt");
-    assert!(out.contains("<barbican-error"), "want error tag; got: {out}");
+    assert!(
+        out.contains("<barbican-error"),
+        "want error tag; got: {out}"
+    );
     assert!(out.to_lowercase().contains("not found") || out.contains("No such file"));
 }
 
@@ -153,7 +156,10 @@ fn missing_file_returns_barbican_error() {
 fn directory_returns_barbican_error() {
     let dir = tmp();
     let out = run(dir.path().to_str().unwrap());
-    assert!(out.contains("<barbican-error"), "want error tag; got: {out}");
+    assert!(
+        out.contains("<barbican-error"),
+        "want error tag; got: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------

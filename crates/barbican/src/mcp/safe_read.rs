@@ -208,11 +208,7 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
 /// case. Adversarial review flagged that `<HtMl>` / `<SvG>` bypassed
 /// a case-sensitive `starts_with`.
 fn sniff_looks_like_markup(s: &str) -> bool {
-    let prefix: String = s
-        .chars()
-        .take(10)
-        .flat_map(char::to_lowercase)
-        .collect();
+    let prefix: String = s.chars().take(10).flat_map(char::to_lowercase).collect();
     prefix.starts_with("<!doctype")
         || prefix.starts_with("<html")
         || prefix.starts_with("<svg")
@@ -686,7 +682,10 @@ mod tests {
 
     #[test]
     fn path_matches_rule_bare_dotenv() {
-        assert!(path_matches_rule(Path::new("/srv/app/.env"), Path::new(".env")));
+        assert!(path_matches_rule(
+            Path::new("/srv/app/.env"),
+            Path::new(".env")
+        ));
         assert!(!path_matches_rule(
             Path::new("/srv/app/.env.example"),
             Path::new(".env"),
