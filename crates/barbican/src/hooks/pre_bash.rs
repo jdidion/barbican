@@ -658,13 +658,33 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
     let shell_stage = stages
         .iter()
         .skip(net_idx + 1)
-        .find(|s| SHELL_INTERPRETERS.contains(s.basename.to_ascii_lowercase().as_str()))?;
+        .find(|s| is_h1_shell_sink(&s.basename))?;
     Some(format!(
         "blocked: `{net}` piped to shell interpreter `{sh}` (H1 — \
          downloaded-content executed as script)",
         net = stages[net_idx].basename,
         sh = shell_stage.basename,
     ))
+}
+
+/// Is this basename a shell-level "run the stdin as bash" sink?
+///
+/// Originally this was just `SHELL_INTERPRETERS` (bash/sh/zsh/dash/ksh).
+/// 1.2.0 adversarial review (Claude S3 + GPT HIGH #2): `source` and
+/// `.` are builtins that run the contents of a file (including
+/// `/dev/stdin`) as shell, so `curl ... | . /dev/stdin` is a full
+/// download-and-execute equivalent that the narrow SHELL_INTERPRETERS
+/// set missed. `source` / `.` on the downstream side of `curl | …` are
+/// now treated as shell sinks.
+fn is_h1_shell_sink(basename: &str) -> bool {
+    let bn = basename.to_ascii_lowercase();
+    if SHELL_INTERPRETERS.contains(bn.as_str()) {
+        return true;
+    }
+    // `.` (posix dot) and `source` (bash/zsh) both execute the file's
+    // contents in the current shell. Basename `.` round-trips through
+    // cmd_basename unchanged.
+    matches!(bn.as_str(), "source" | ".")
 }
 
 /// H1's narrowed network-tool set. See `h1_pipeline_curl_to_shell` and

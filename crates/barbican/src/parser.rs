@@ -577,9 +577,30 @@ fn extract_word_text(node: Node<'_>, src: &[u8]) -> Result<String, ParseError> {
             }
             Ok(s)
         }
-        // `word`, `simple_expansion`, `expansion`, `command_name` (when
-        // the command_name wraps another word-like child), and every
-        // other kind: use the raw byte slice.
+        // 1.2.0 adversarial review (Claude H-2): `command_name` is a
+        // grammar node that wraps the actual word/concatenation/string
+        // for argv[0]. For `"ba""sh" -c ...`, the shape is
+        // command_name > concatenation > [string("ba"), string("sh")].
+        // Taking the raw byte slice returns `"ba""sh"` with the quotes
+        // intact, which cmd_basename can't normalize past — a direct
+        // H1/M1 bypass (`"ba""sh" -c 'curl|bash'` exited 0 pre-1.2.0).
+        // Recurse into the single named child so concatenation folds
+        // to `bash` before basename normalization.
+        "command_name" => {
+            let mut cursor = node.walk();
+            let count = node.named_child_count();
+            if count == 0 {
+                // Defensive: a command_name with no child is malformed.
+                return Err(ParseError::Malformed);
+            }
+            let mut s = String::new();
+            for child in node.named_children(&mut cursor) {
+                s.push_str(&extract_word_text(child, src)?);
+            }
+            Ok(s)
+        }
+        // `word`, `simple_expansion`, `expansion`, and every other
+        // kind: use the raw byte slice.
         _ => Ok(raw_text(node, src)?.to_string()),
     }
 }
