@@ -404,10 +404,44 @@ fn allow_rule_permits(original: &Path, canonical: &Path, _denies: &[PathBuf]) ->
 /// A path that doesn't exist returns `false` — the subsequent open
 /// will fail anyway, and we don't want to refuse to allow a
 /// not-yet-created file.
+///
+/// 1.2.0 adversarial review (Claude H-8) widened this to walk
+/// ancestors UNDER the user's home directory — an attacker who can
+/// only write under `$HOME` can still swap `~/shared/` for a symlink
+/// to `/etc/`. System-level ancestor symlinks (those above HOME) stay
+/// exempt to avoid false-positives on macOS's `/var` → `/private/var`
+/// and similar platform fixtures.
 fn path_contains_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|md| md.file_type().is_symlink())
-        .unwrap_or(false)
+    // Leaf check — the most common attack shape.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return true;
+        }
+    }
+    // Ancestor walk, but only components under $HOME. If the path
+    // isn't under HOME (e.g. a `/etc/…` allow entry) we skip the walk
+    // — system-level symlinks aren't attacker-plantable under the
+    // accepted 1.2.0 threat model.
+    let home = home_dir();
+    if !path.starts_with(&home) {
+        return false;
+    }
+    let mut cur = path.parent();
+    while let Some(p) = cur {
+        // Stop climbing once we exit HOME — the ancestors above HOME
+        // are platform fixtures (/, /Users, /home) and their symlink
+        // status is not in the user's attacker model.
+        if !p.starts_with(&home) {
+            break;
+        }
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if md.file_type().is_symlink() {
+                return true;
+            }
+        }
+        cur = p.parent();
+    }
+    false
 }
 
 fn allow_sensitive_override() -> bool {

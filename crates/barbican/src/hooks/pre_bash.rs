@@ -670,6 +670,16 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
     ))
 }
 
+/// Does the stage's argv[0] look like a variable expansion or command
+/// substitution rather than a concrete binary name? Matches `$FOO`,
+/// `${FOO}`, `$(...)` — any shape that begins with `$`. Used for the
+/// risk-context override in `m2_secret_or_base64_to_network` so a
+/// secret-bearing pipeline terminated by an expansion-valued argv[0]
+/// is treated as exfil.
+fn is_expansion_argv0(stage: &crate::parser::Command) -> bool {
+    stage.argv0_raw.trim_start().starts_with('$')
+}
+
 /// Is this basename a shell-level "run the stdin as bash" sink?
 ///
 /// Originally this was just `SHELL_INTERPRETERS` (bash/sh/zsh/dash/ksh).
@@ -1135,7 +1145,19 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
         .iter()
         .find(|s| {
             let bn = stage_bn_lc(s);
-            EXFIL_NETWORK_TOOLS.contains(bn.as_str()) || (has_secret && bn == "git")
+            EXFIL_NETWORK_TOOLS.contains(bn.as_str())
+                || (has_secret && bn == "git")
+                // 1.2.0 adversarial review (GPT HIGH #11): an
+                // expansion-valued argv[0] like `$NET` is a concrete
+                // laundering shape for exfiltration — the user (or
+                // the model) sets `NET=curl` in a prior stage and
+                // pipes a secret to `$NET`. Basename lookup sees the
+                // expansion marker verbatim and misses every table.
+                // When a secret IS in the pipeline, treat any
+                // expansion-argv0 stage as a potential network tool
+                // and deny. Benign pipelines without a secret
+                // reference stay unaffected.
+                || (has_secret && is_expansion_argv0(s))
         })
         .cloned()?;
     if has_secret {
