@@ -39,7 +39,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::mcp::wrap::{render_error as wrap_render_error, wrap_untrusted, WrapAttrs};
-use crate::net::{is_blocked_ip, validate_url, RejectReason};
+use crate::net::{allow_ip_literals, is_blocked_ip, validate_url_with, RejectReason};
 use crate::sanitize::{normalize_for_scan, strip_html_tags};
 use crate::scan::scan_injection;
 
@@ -97,7 +97,12 @@ pub async fn run(args: SafeFetchArgs) -> String {
 /// The fetch state machine: resolve, SSRF-filter, send, follow
 /// redirects manually, truncate, decode.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchError> {
-    let mut current = validate_url(url).map_err(FetchError::Reject)?;
+    // Pin BARBICAN_ALLOW_IP_LITERALS once per fetch. If we re-read env
+    // on every redirect hop, a concurrent writer to the process's
+    // environment can flip policy mid-fetch, permitting a redirect to
+    // a raw-IP target that the initial call would have rejected.
+    let allow_ip_lit = allow_ip_literals();
+    let mut current = validate_url_with(url, allow_ip_lit).map_err(FetchError::Reject)?;
     let mut hops = 0_u8;
     let timeout = Duration::from_secs(timeout_from_env());
     let resolver = build_resolver()?;
@@ -158,7 +163,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchErr
             let next = current
                 .join(loc)
                 .map_err(|_| FetchError::BadRedirect("unparseable Location"))?;
-            current = validate_url(next.as_str()).map_err(FetchError::Reject)?;
+            current = validate_url_with(next.as_str(), allow_ip_lit).map_err(FetchError::Reject)?;
             continue;
         }
 
