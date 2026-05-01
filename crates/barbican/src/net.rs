@@ -76,6 +76,16 @@ impl std::fmt::Display for RejectReason {
 /// run it through [`is_blocked_ip`] so loopback / RFC1918 / IMDS are
 /// always blocked even in opt-in mode.
 pub fn validate_url(s: &str) -> Result<Url, RejectReason> {
+    validate_url_with(s, allow_ip_literals())
+}
+
+/// Explicit-flag variant of [`validate_url`] for callers that want to
+/// pin the `BARBICAN_ALLOW_IP_LITERALS` policy once and reuse it across
+/// multiple calls (e.g. every redirect hop of a single `safe_fetch`).
+/// Reading the env per-hop leaves a narrow TOCTOU where a concurrent
+/// writer to the process's environment could flip policy mid-fetch;
+/// this variant removes that surface.
+pub(crate) fn validate_url_with(s: &str, allow: bool) -> Result<Url, RejectReason> {
     let url = Url::parse(s).map_err(|_| RejectReason::NoHost)?;
     match url.scheme() {
         "http" | "https" => {}
@@ -86,12 +96,12 @@ pub fn validate_url(s: &str) -> Result<Url, RejectReason> {
         url::Host::Domain(_) => Ok(url),
         url::Host::Ipv4(v4) => {
             let ip = IpAddr::V4(v4);
-            check_ip_literal(ip)?;
+            check_ip_literal(ip, allow)?;
             Ok(url)
         }
         url::Host::Ipv6(v6) => {
             let ip = IpAddr::V6(v6);
-            check_ip_literal(ip)?;
+            check_ip_literal(ip, allow)?;
             Ok(url)
         }
     }
@@ -104,8 +114,8 @@ pub fn allow_ip_literals() -> bool {
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-fn check_ip_literal(ip: IpAddr) -> Result<(), RejectReason> {
-    if !allow_ip_literals() {
+fn check_ip_literal(ip: IpAddr, allow: bool) -> Result<(), RejectReason> {
+    if !allow {
         return Err(RejectReason::RawIpLiteral);
     }
     if let Some(reason) = is_blocked_ip(ip) {
@@ -511,5 +521,40 @@ mod tests {
     fn validate_allows_domain_host() {
         let url = validate_url("https://example.com/x").unwrap();
         assert_eq!(url.host_str(), Some("example.com"));
+    }
+
+    #[test]
+    fn validate_url_with_rejects_raw_ip_when_flag_is_false() {
+        // Passing `false` explicitly must reject IP literals. The
+        // function is pure (no env read) by design — that's the whole
+        // TOCTOU-narrowing point — so the test must be pure too and
+        // must NOT mutate BARBICAN_ALLOW_IP_LITERALS. Setting it here
+        // would race the other env-sensitive tests under the default
+        // parallel test runner.
+        let err = validate_url_with("http://127.0.0.1/", false).unwrap_err();
+        assert!(
+            matches!(err, RejectReason::RawIpLiteral),
+            "explicit allow=false must reject; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_url_with_allows_public_ip_when_flag_is_true() {
+        // Public (routable) IP with the flag on: passes the RawIpLiteral
+        // gate AND the is_blocked_ip check, so we get a valid Url back.
+        let url = validate_url_with("http://1.1.1.1/", true).expect("public IP with flag=true");
+        assert_eq!(url.host_str(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn validate_url_with_still_blocks_loopback_when_flag_is_true() {
+        // The flag only unlocks "IP literals are spellable as hosts" —
+        // it never weakens the is_blocked_ip SSRF filter. Loopback must
+        // still be rejected.
+        let err = validate_url_with("http://127.0.0.1/", true).unwrap_err();
+        assert!(
+            matches!(err, RejectReason::BlockedIp(_)),
+            "loopback must stay blocked even with flag=true; got {err:?}"
+        );
     }
 }
