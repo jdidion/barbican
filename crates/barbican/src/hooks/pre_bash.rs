@@ -693,14 +693,10 @@ fn is_expansion_argv0(stage: &crate::parser::Command) -> bool {
 /// set missed. `source` / `.` on the downstream side of `curl | …` are
 /// now treated as shell sinks.
 fn is_h1_shell_sink(basename: &str) -> bool {
-    let bn = basename.to_ascii_lowercase();
-    if SHELL_INTERPRETERS.contains(bn.as_str()) {
-        return true;
-    }
-    // `.` (posix dot) and `source` (bash/zsh) both execute the file's
-    // contents in the current shell. Basename `.` round-trips through
-    // cmd_basename unchanged.
-    matches!(bn.as_str(), "source" | ".")
+    // 1.2.0 second-pass review: unified with is_shell_code_sink so
+    // every shell-code execution path (bash, sh, zsh, dash, ksh,
+    // source, ., eval) is a valid H1 downstream sink.
+    is_shell_code_sink(basename)
 }
 
 /// H1's narrowed network-tool set. See `h1_pipeline_curl_to_shell` and
@@ -1129,11 +1125,18 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
         .stages
         .iter()
         .position(|s| ENV_DUMPERS.contains(stage_bn_lc(s).as_str()))?;
+    // 1.2.0 second-pass review (HIGH #2): expansion-argv[0] like
+    // `env | $NET url` must fire the env-exfil classifier even
+    // though `$NET` doesn't match EXFIL_NETWORK_TOOLS. An env dump
+    // is high-signal-on-its-own; any downstream network-tool-ish
+    // stage (known tool OR expansion-valued argv[0]) qualifies.
     let net_stage = pipeline
         .stages
         .iter()
         .skip(env_idx + 1)
-        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))?;
+        .find(|s| {
+            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
+        })?;
     Some(format!(
         "blocked: environment dump (`{env}`) piped to network tool \
          `{net}` (M2 — env-exfil)",
@@ -1148,35 +1151,41 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
 /// policy — benign `git push` without a secret reference is allowed).
 fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
     let has_secret = pipeline_mentions_secret(pipeline);
-    let net_stage = pipeline
-        .stages
-        .iter()
-        .find(|s| {
+
+    // First branch: secret-path + any downstream network-ish stage.
+    // 1.2.0 adversarial review (GPT HIGH #11): treat
+    // expansion-argv[0] (`$NET`) as a potential network tool when a
+    // secret is present. No over-deny on benign expansion pipelines.
+    if has_secret {
+        if let Some(net_stage) = pipeline.stages.iter().find(|s| {
             let bn = stage_bn_lc(s);
             EXFIL_NETWORK_TOOLS.contains(bn.as_str())
-                || (has_secret && bn == "git")
-                // 1.2.0 adversarial review (GPT HIGH #11): an
-                // expansion-valued argv[0] like `$NET` is a concrete
-                // laundering shape for exfiltration — the user (or
-                // the model) sets `NET=curl` in a prior stage and
-                // pipes a secret to `$NET`. Basename lookup sees the
-                // expansion marker verbatim and misses every table.
-                // When a secret IS in the pipeline, treat any
-                // expansion-argv0 stage as a potential network tool
-                // and deny. Benign pipelines without a secret
-                // reference stay unaffected.
-                || (has_secret && is_expansion_argv0(s))
-        })
-        .cloned()?;
-    if has_secret {
-        return Some(format!(
-            "blocked: secret-path reference alongside network tool \
-             `{net}` (M2 — credential exfil)",
-            net = net_stage.basename,
-        ));
+                || bn == "git"
+                || is_expansion_argv0(s)
+        }) {
+            return Some(format!(
+                "blocked: secret-path reference alongside network tool \
+                 `{net}` (M2 — credential exfil)",
+                net = net_stage.basename,
+            ));
+        }
+    } else if let Some(net_stage) = pipeline
+        .stages
+        .iter()
+        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))
+    {
+        // Without a secret, require a concrete network tool —
+        // base64-only-to-known-net still falls through to the second
+        // branch below, but we don't deny an arbitrary pipeline just
+        // because it has a curl in it (that's H1's job).
+        let _ = net_stage;
     }
-    // Fallback: base64 encode piped into a network tool. Classic
-    // "obfuscate before upload" shape.
+
+    // Second branch: base64-encode piped into a network tool
+    // (classic "obfuscate before upload"). 1.2.0 second-pass review
+    // (HIGH #2): accept expansion-argv[0] as the downstream network
+    // tool here too — `base64 blob | $NET url` was a laundering
+    // bypass otherwise.
     let base64_idx = pipeline
         .stages
         .iter()
@@ -1185,7 +1194,9 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
         .stages
         .iter()
         .skip(base64_idx + 1)
-        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))?;
+        .find(|s| {
+            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
+        })?;
     Some(format!(
         "blocked: base64-encoded content piped to network tool \
          `{net}` (M2 — obfuscated exfil)",
@@ -1333,29 +1344,60 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
 /// requires argv[0]'s basename to be the shell.
 fn shell_with_network_substitution(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
-        let bn = stage.basename.to_ascii_lowercase();
-        if !SHELL_INTERPRETERS.contains(bn.as_str()) && !matches!(bn.as_str(), "source" | ".") {
+        if !is_shell_code_sink(&stage.basename) {
             continue;
         }
         for sub in &stage.substitutions {
-            for sub_pipeline in &sub.pipelines {
-                if sub_pipeline
-                    .stages
-                    .iter()
-                    .any(|s| is_curl_or_wget(&s.basename))
-                {
-                    return Some(format!(
-                        "blocked: shell interpreter `{sh}` reads a \
-                         network-tool substitution (curl/wget inside \
-                         `$(...)` or `<(...)`) — download-and-execute \
-                         shape",
-                        sh = stage.basename,
-                    ));
-                }
+            if script_contains_network_tool_transitively(sub) {
+                return Some(format!(
+                    "blocked: shell interpreter `{sh}` reads a \
+                     network-tool substitution (curl/wget inside \
+                     `$(...)` or `<(...)`, possibly via laundering \
+                     layers like `echo $(curl ...)`) — \
+                     download-and-execute shape",
+                    sh = stage.basename,
+                ));
             }
         }
     }
     None
+}
+
+/// Does this basename count as a shell-code sink — anything that will
+/// execute its stdin, argument, or redirect body as bash?
+///
+/// 1.2.0 second-pass adversarial review: the first 1.2.0 patch added
+/// `source` / `.` to H1's sink set but missed `eval`. `eval <(curl …)`,
+/// `eval "$(curl …)"`, and `eval <<< "payload"` are all shell-code
+/// executors. Unified the set here so every classifier gate shares
+/// one source of truth.
+fn is_shell_code_sink(basename: &str) -> bool {
+    let bn = basename.to_ascii_lowercase();
+    if SHELL_INTERPRETERS.contains(bn.as_str()) {
+        return true;
+    }
+    matches!(bn.as_str(), "source" | "." | "eval")
+}
+
+/// True if any stage, transitively through nested substitutions, is
+/// `curl` or `wget`. 1.2.0 second-pass review: `shell_with_network_
+/// substitution` only looked one hop deep; `bash <(echo $(curl url))`
+/// slipped past because the outer sub was `echo`, not curl. Walk
+/// transitively to kill the laundering class.
+fn script_contains_network_tool_transitively(script: &crate::parser::Script) -> bool {
+    for pipeline in &script.pipelines {
+        for stage in &pipeline.stages {
+            if is_curl_or_wget(&stage.basename) {
+                return true;
+            }
+            for sub in &stage.substitutions {
+                if script_contains_network_tool_transitively(sub) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Deny when a shell interpreter stage has a here-string or heredoc
@@ -1372,8 +1414,11 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
         return None;
     }
     for stage in &pipeline.stages {
-        let bn = stage.basename.to_ascii_lowercase();
-        if !SHELL_INTERPRETERS.contains(bn.as_str()) {
+        // 1.2.0 second-pass adversarial review: the original gate
+        // only accepted SHELL_INTERPRETERS. `source <<< "curl|bash"`
+        // and `eval <<< "curl|bash"` both execute the body, so every
+        // shell-code sink has to be gated the same way.
+        if !is_shell_code_sink(&stage.basename) {
             continue;
         }
         for redirect in &stage.redirects {
@@ -1443,18 +1488,89 @@ fn strip_surrounding_quotes_owned(s: &str) -> String {
 /// output target cover both forms.
 fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
-        let out_target = effective_out_file_target(stage).or_else(|| argv_output_target(stage));
-        let Some(target) = out_target else { continue };
-        if is_persistence_target(&target) {
-            return Some(format!(
-                "blocked: write to shell-startup / persistence path \
-                 `{t}` — next login or service start would execute \
-                 this content (persistence-class)",
-                t = sanitize_reason_text(&target),
-            ));
+        // Cover shell redirects (`>` / `>>`), tee/uudecode argv
+        // outputs, and file-copy tool destinations (cp/mv/install/ln/
+        // dd/rsync/sed -i). 1.2.0 second-pass adversarial review
+        // (SEVERE #2): the original persistence classifier only
+        // inspected redirect / tee targets, so `cp /tmp/x ~/.bashrc`
+        // slipped through. `file_copy_destination` closes that gap.
+        let targets = [
+            effective_out_file_target(stage),
+            argv_output_target(stage),
+            file_copy_destination(stage),
+        ];
+        for target in targets.iter().flatten() {
+            if is_persistence_target(target) {
+                return Some(format!(
+                    "blocked: write to shell-startup / persistence path \
+                     `{t}` — next login or service start would execute \
+                     this content (persistence-class)",
+                    t = sanitize_reason_text(target),
+                ));
+            }
         }
     }
     None
+}
+
+/// Extract the destination path for common file-copy tools.
+///
+/// 1.2.0 second-pass adversarial review (SEVERE #2): `cp`, `mv`,
+/// `install`, `ln -s[f]`, `dd if=… of=…`, `rsync`, and `sed -i` are
+/// all file-write mechanisms whose destinations weren't captured by
+/// the existing `tee` / `uudecode -o` extractors, leaving persistence
+/// writes via these tools unclassified.
+///
+/// Returns the first destination path we're confident about. Returns
+/// `None` if the tool isn't one we know OR the argv shape is
+/// ambiguous enough that a false positive is likely.
+fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
+    let bn = stage_bn_lc(stage);
+    match bn.as_str() {
+        // `cp [-flags] SRC DEST` / `cp [-flags] SRC1 SRC2 ... DEST`.
+        // `mv` and `install` have the same shape. The destination is
+        // the last non-flag positional arg. If argv has only one
+        // positional, there is no dest (copying to cwd) — skip.
+        // cp/mv/install/ln/rsync: destination is the last non-flag
+        // positional. `ln -s[f] TARGET LINK_NAME` — LINK_NAME is the
+        // NEW file that gets created; that's the persistence write.
+        "cp" | "mv" | "install" | "ln" | "rsync" => last_positional_arg(&stage.args, 2),
+        // `dd if=SRC of=DEST [...]`.
+        "dd" => stage
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("of=").map(str::to_string)),
+        // `sed -i [suffix] [-e ...] FILE ...` — every non-flag
+        // positional is modified in place. Return the first one we
+        // see that is_persistence_target cares about. For simplicity
+        // return the LAST positional; if there are multiple files
+        // targeted, per-stage re-checking catches each on its own
+        // call (there is only one `sed -i` stage per invocation).
+        "sed" => {
+            if stage.args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
+                last_positional_arg(&stage.args, 1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Return the last non-flag positional in `args` IF there are at
+/// least `min_positional` such args. This is the standard
+/// `TOOL [-flags] SRC ... DEST` shape; a single positional means
+/// "no destination specified" for most tools (cp/mv treat it as
+/// "copy to cwd") so we don't flag it.
+fn last_positional_arg(args: &[String], min_positional: usize) -> Option<String> {
+    let positionals: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if positionals.len() < min_positional {
+        return None;
+    }
+    positionals.last().map(|s| (*s).clone())
 }
 
 /// Is `path` a shell-startup file, or under a persistence-class dir?

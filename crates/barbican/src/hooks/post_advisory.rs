@@ -92,23 +92,27 @@ fn append_audit_jsonl(f: &Finding<'_>) -> std::io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(parent)?;
-    // 1.2.0 adversarial review (Claude H-7): before chmod'ing, verify
-    // parent is a real directory (not a symlink). `set_permissions`
-    // follows symlinks, so a pre-planted symlink `~/.claude/barbican`
-    // -> `/etc/` would turn into chmod 0o700 /etc. `symlink_metadata`
-    // inspects without following.
-    let sym_meta = std::fs::symlink_metadata(parent);
-    let is_real_dir = sym_meta
-        .as_ref()
-        .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
-        .unwrap_or(false);
-    if is_real_dir {
-        let current_mode = std::fs::metadata(parent)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0);
-        if current_mode != 0o700 {
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    // 1.2.0 second-pass adversarial review (HIGH #1): if the parent
+    // dir is a symlink, short-circuit the entire advisory-write.
+    // Without this the subsequent OpenOptions open traverses the
+    // symlink and writes into the attacker's target dir even though
+    // O_NOFOLLOW on the leaf blocks a symlinked log-file entry.
+    match std::fs::symlink_metadata(parent) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Upgrade a would-be success to a clean early return;
+            // post_advisory is best-effort anyway (it does not block
+            // the hook if the log can't be written).
+            return Ok(());
         }
+        Ok(meta) if meta.file_type().is_dir() => {
+            let current_mode = std::fs::metadata(parent)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            if current_mode != 0o700 {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        _ => {}
     }
 
     let entry = json!({
