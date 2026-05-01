@@ -593,11 +593,19 @@ fn policy_reason(rule: &Path) -> String {
     )
 }
 
+/// Minimum effective read cap regardless of env. Prevents
+/// `BARBICAN_SAFE_READ_MAX_BYTES=0` from silently making every
+/// `safe_read` return zero bytes — useless-but-silent degradation that
+/// the 1.2.0 adversarial review called out. Any caller that actually
+/// wants a small cap can still pass one via the per-call `max_bytes`.
+pub const MIN_MAX_BYTES: usize = 4096;
+
 fn cap_from_env() -> usize {
-    std::env::var("BARBICAN_SAFE_READ_MAX_BYTES")
+    let raw = std::env::var("BARBICAN_SAFE_READ_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_BYTES)
+        .unwrap_or(DEFAULT_MAX_BYTES);
+    raw.max(MIN_MAX_BYTES)
 }
 
 /// Error taxonomy. The string form is what the model sees inside

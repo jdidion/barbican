@@ -733,3 +733,46 @@ fn uninstall_removes_empty_scaffolding() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn install_refuses_to_follow_binary_dst_symlink() {
+    // 1.2.0 adversarial review (GPT HIGH #16): `fs::copy(src, dst)` in
+    // copy_binary followed symlinks at dst. An attacker who pre-plants
+    // `~/.claude/barbican/barbican` as a symlink to (e.g.) `~/.bashrc`
+    // would get that file silently overwritten by the Barbican binary
+    // on the next install. The fix routes binary staging through the
+    // same O_NOFOLLOW + O_EXCL + fsync + rename discipline the JSON
+    // writers already use.
+    let (_dir, home) = fake_home();
+    // Plant `~/.claude/barbican/` with `barbican` as a symlink to a
+    // sibling bait file.
+    fs::create_dir_all(home.join("barbican")).unwrap();
+    let bait_dir = tempfile::tempdir().unwrap();
+    let bait = bait_dir.path().join("victim");
+    fs::write(&bait, b"pre-existing bait data").unwrap();
+    let dst = home.join("barbican").join("barbican");
+    std::os::unix::fs::symlink(&bait, &dst).unwrap();
+
+    // Install may succeed (atomic rename REPLACES the symlink rather
+    // than following it) or fail (if the symlink existed pre-staging
+    // and rename trips), but in EITHER case the bait file must be
+    // untouched. The previous `fs::copy(src, dst)` implementation
+    // followed the symlink and clobbered the bait file.
+    let _ = installer::install(&opts(&home));
+    let bait_contents = fs::read(&bait).unwrap();
+    assert_eq!(
+        bait_contents, b"pre-existing bait data",
+        "symlink target must not be followed (the previous fs::copy \
+         implementation would have clobbered the bait file)"
+    );
+    // If install succeeded, dst must now be a regular file, not a
+    // symlink (the atomic rename replaces the symlink with the real
+    // binary file).
+    if let Ok(meta) = fs::symlink_metadata(&dst) {
+        assert!(
+            !meta.file_type().is_symlink(),
+            "dst must no longer be a symlink after a successful install"
+        );
+    }
+}

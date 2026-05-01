@@ -31,7 +31,26 @@ pub fn run() -> Result<()> {
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if !tool.starts_with("mcp__") || tool.starts_with("mcp__barbican__") {
+    // Only scan MCP tool responses; Claude Code tool hooks fire on
+    // every tool call but post-mcp is MCP-specific.
+    if !tool.starts_with("mcp__") {
+        return Ok(());
+    }
+    // 1.2.0 adversarial review (Claude M-3 + GPT HIGH): previously the
+    // skip-list was a string prefix, `tool.starts_with("mcp__barbican__")`.
+    // Any third-party MCP server that registered a tool whose name
+    // started with that prefix could ship unsanitized prompt-injection
+    // responses past the scanner — no privilege check beyond the name.
+    // Switch to an exact allowlist of the three Barbican-internal tool
+    // IDs. The tools themselves sanitize their output (`<barbican-...>`
+    // sentinels, sentinel neutralization in `wrap.rs`) so we don't need
+    // to double-scan them.
+    if matches!(
+        tool,
+        "mcp__barbican__safe_fetch"
+            | "mcp__barbican__safe_read"
+            | "mcp__barbican__inspect"
+    ) {
         return Ok(());
     }
 
