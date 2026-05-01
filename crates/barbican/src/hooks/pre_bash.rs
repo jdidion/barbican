@@ -211,6 +211,9 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = persistence_write_to_shell_startup(pipeline) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -1277,6 +1280,73 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
         }
     }
     None
+}
+
+/// Deny when a shell interpreter stage has a here-string or heredoc
+/// redirect whose body contains classifiable bash. `bash <<<
+/// "curl|bash"` and `bash <<EOF\ncurl|bash\nEOF` both feed the
+/// redirect content to stdin of the shell, which executes it
+/// line-by-line.
+///
+/// 1.2.0 adversarial review (Claude S2 / S6): before 1.2.0 the parser
+/// dropped heredoc bodies and the classifier never inspected
+/// here-string bodies, so both shapes were full H1 bypasses.
+fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> Option<String> {
+    if depth + 1 > M1_MAX_DEPTH {
+        return None;
+    }
+    for stage in &pipeline.stages {
+        let bn = stage.basename.to_ascii_lowercase();
+        if !SHELL_INTERPRETERS.contains(bn.as_str()) {
+            continue;
+        }
+        for redirect in &stage.redirects {
+            let body = match redirect.kind {
+                RedirectKind::HereString => {
+                    // For `<<<`, the body lives in `target` per the
+                    // parser's doc comment.
+                    Some(strip_surrounding_quotes_owned(&redirect.target))
+                }
+                RedirectKind::Heredoc => redirect.body.clone(),
+                _ => None,
+            };
+            let Some(body) = body else { continue };
+            // Re-parse the body as an independent Script and run it
+            // through the classifier. If anything in the body would
+            // deny on its own, fail the whole command.
+            let Ok(inner) = parser::parse(&body) else {
+                return Some(format!(
+                    "blocked: shell interpreter `{sh}` reads an \
+                     unparseable heredoc / here-string body — denying \
+                     per parser fail-closed policy",
+                    sh = stage.basename,
+                ));
+            };
+            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+                return Some(format!(
+                    "blocked: shell interpreter `{sh}` executes a \
+                     heredoc / here-string body — inner: {reason}",
+                    sh = stage.basename,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Strip a single pair of matching surrounding quotes (single or double)
+/// from the owned string. Used for here-string bodies where the outer
+/// quoting is syntactic and the interior is the shell command to exec.
+fn strip_surrounding_quotes_owned(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// Deny any write to a shell rc / login file or a known persistence
