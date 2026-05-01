@@ -17,6 +17,7 @@ use rmcp::{
 };
 
 use crate::mcp::safe_fetch::{self, SafeFetchArgs};
+use crate::mcp::safe_read::{self, SafeReadArgs};
 
 /// Barbican's MCP server state. Currently empty; later branches will
 /// hold per-tool state such as the DNS resolver for `safe_fetch`.
@@ -61,6 +62,32 @@ impl Barbican {
         let body = safe_fetch::run(args).await;
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
+
+    /// MCP tool: read a local file, sanitize it, wrap it in an
+    /// `<untrusted-content>` sentinel.
+    ///
+    /// Denies well-known sensitive paths by default
+    /// (`~/.ssh/`, `~/.aws/`, `~/.gnupg/`, `~/.config/gh/`, `~/.netrc`,
+    /// `~/.docker/config.json`, `/etc/shadow`, `/etc/sudoers`,
+    /// `/etc/sudoers.d/`, any `.env` file except `.env.example` /
+    /// `.env.sample` / `.env.template`). Symlinks are resolved before
+    /// the policy check so they can't be used to bypass the deny list.
+    /// Opt out with `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`.
+    #[tool(
+        name = "safe_read",
+        description = "Read a local file, sanitize it, wrap it in <untrusted-content>. \
+                       Denies ~/.ssh/, ~/.aws/, ~/.gnupg/, /etc/shadow, .env, and \
+                       similar sensitive paths by default. Resolves symlinks before \
+                       the policy check. Use for files that came from outside your \
+                       trust boundary (downloads, pasted transcripts, scraped pages)."
+    )]
+    pub async fn safe_read(
+        &self,
+        Parameters(args): Parameters<SafeReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = safe_read::run(args).await;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
 }
 
 #[tool_handler]
@@ -69,8 +96,9 @@ impl ServerHandler for Barbican {
         ServerInfo::default()
             .with_instructions(
                 "Barbican MCP server. Tools: safe_fetch (SSRF-hardened HTTP \
-                 fetch with prompt-injection sanitization). safe_read and \
-                 inspect land in upcoming branches.",
+                 fetch with prompt-injection sanitization); safe_read \
+                 (local file read with sensitive-path deny list). inspect \
+                 lands in an upcoming branch.",
             )
             .with_protocol_version(rmcp::model::ProtocolVersion::default())
             .with_server_info(rmcp::model::Implementation::from_build_env())
