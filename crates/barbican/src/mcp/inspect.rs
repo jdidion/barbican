@@ -46,8 +46,10 @@ pub struct InspectArgs {
 /// as a plain string. Never errors — unlike `safe_read` / `safe_fetch`
 /// this tool only operates on in-memory text, so there's nothing to
 /// reject. Oversize input is silently truncated; the truncation
-/// surfaces as a finding.
-pub async fn run(args: InspectArgs) -> String {
+/// surfaces as a finding. Synchronous because every step is CPU-only;
+/// the rmcp handler in `mcp::server` is the `async` wrapper.
+#[must_use]
+pub fn run(args: InspectArgs) -> String {
     let (text, truncated) = truncate_for_scan(&args.text, MAX_INPUT_BYTES);
     let (cleaned, mut findings) = inspect(text);
     if truncated {
@@ -68,6 +70,7 @@ pub async fn run(args: InspectArgs) -> String {
 /// without a tokio runtime. The `cleaned` output is advisory — callers
 /// (including this module's `run`) do not pass it back to the model,
 /// they only report its size.
+#[must_use]
 pub fn inspect(text: &str) -> (String, Vec<String>) {
     let mut findings = Vec::new();
 

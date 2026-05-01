@@ -9,13 +9,9 @@
 use barbican::mcp::inspect::{self, InspectArgs};
 
 fn run(text: &str) -> String {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(inspect::run(InspectArgs {
-            text: text.to_string(),
-        }))
+    inspect::run(InspectArgs {
+        text: text.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------
