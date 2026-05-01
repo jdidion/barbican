@@ -345,3 +345,152 @@ fn path_traversal_is_resolved_before_policy_check() {
     let out = run("/etc/hosts/../shadow");
     assert!(out.contains("<barbican-error"), "traversal: {out}");
 }
+
+// ---------------------------------------------------------------------
+// Phase-9 adversarial-review regression tests (Claude code-reviewer
+// findings, branch feat/safe-read-l3 first round).
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn allow_rule_via_symlink_cannot_exfiltrate_sensitive() {
+    // CRITICAL #1: attacker controls a path on the user's ALLOW list
+    // and symlinks it to a deny-listed target. Previously the allow
+    // check short-circuited on the ORIGINAL path equaling the allow
+    // entry, skipping the deny check against the canonical target.
+    let _g = env_guard();
+    let home = tempfile::tempdir().unwrap();
+    let ssh_dir = home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    let key = ssh_dir.join("id_rsa");
+    std::fs::write(&key, "sensitive-key-data").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let allowed = tmp.path().join("session.json");
+    std::os::unix::fs::symlink(&key, &allowed).unwrap();
+
+    std::env::set_var("HOME", home.path());
+    std::env::set_var("BARBICAN_SAFE_READ_ALLOW", allowed.to_str().unwrap());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let out = run(allowed.to_str().unwrap());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW");
+    std::env::remove_var("HOME");
+    assert!(
+        out.contains("<barbican-error"),
+        "allow-list must not let a symlink-to-sensitive through: {out}"
+    );
+    assert!(
+        !out.contains("sensitive-key-data"),
+        "key bytes leaked through allow rule: {out}"
+    );
+}
+
+#[test]
+fn extra_deny_rejects_bare_filename_with_clear_error() {
+    // CRITICAL #2: a bare-filename entry like "secret.yaml" in
+    // EXTRA_DENY previously matched globally. Force operators to
+    // write absolute paths so the knob composes predictably with the
+    // deny list.
+    let _g = env_guard();
+    let dir = tmp();
+    let p = dir.path().join("innocuous.txt");
+    std::fs::write(&p, "hello").unwrap();
+    std::env::set_var("BARBICAN_SAFE_READ_EXTRA_DENY", "innocuous.txt");
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let out = run(p.to_str().unwrap());
+    std::env::remove_var("BARBICAN_SAFE_READ_EXTRA_DENY");
+    // Either the file reads normally (if the bare entry was ignored)
+    // OR the read returns a clear error. Either is acceptable; what
+    // must NOT happen is a global filename match.
+    assert!(
+        out.contains("<untrusted-content") || out.contains("absolute"),
+        "bare-filename EXTRA_DENY must not match globally: {out}"
+    );
+}
+
+#[test]
+fn envrc_is_denied() {
+    // MEDIUM: direnv `.envrc` routinely contains AWS keys / DB URLs.
+    let _g = env_guard();
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let dir = tmp();
+    let p = dir.path().join(".envrc");
+    std::fs::write(&p, "export AWS_ACCESS_KEY_ID=AKIA...\n").unwrap();
+    let out = run(p.to_str().unwrap());
+    assert!(
+        out.contains("<barbican-error"),
+        ".envrc must be denied: {out}"
+    );
+}
+
+#[test]
+fn denies_kube_config() {
+    let _g = env_guard();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let out = run("~/.kube/config");
+    std::env::remove_var("HOME");
+    assert!(out.contains("<barbican-error"), "~/.kube/config: {out}");
+}
+
+#[test]
+fn denies_git_credentials() {
+    let _g = env_guard();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let out = run("~/.git-credentials");
+    std::env::remove_var("HOME");
+    assert!(out.contains("<barbican-error"), "~/.git-credentials: {out}");
+}
+
+#[test]
+fn denies_npmrc_cargo_pypirc() {
+    let _g = env_guard();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    for sub in ["~/.npmrc", "~/.pypirc", "~/.cargo/credentials"] {
+        let out = run(sub);
+        assert!(
+            out.contains("<barbican-error"),
+            "{sub} must be denied: {out}"
+        );
+    }
+    std::env::remove_var("HOME");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn case_variant_home_dotssh_is_denied() {
+    // HIGH: macOS APFS is case-insensitive by default. ~/.SSH/id_rsa
+    // previously bypassed ~/.ssh on not-yet-existing paths because the
+    // ancestor-canonicalize fallback re-attached the literal tail
+    // without case-folding, and `starts_with` is byte-exact.
+    let _g = env_guard();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+    let out = run("~/.SSH/id_rsa");
+    std::env::remove_var("HOME");
+    assert!(
+        out.contains("<barbican-error"),
+        "case-variant must be denied on case-insensitive FS: {out}"
+    );
+}
+
+#[test]
+fn mixed_case_html_in_non_markup_extension_gets_script_stripped() {
+    // MEDIUM: `<HtMl>` / `<SvG>` was not caught by the sniff. Attacker
+    // serves a .bin with mixed-case markup; <script> survives to the
+    // model because neither extension sniff nor prefix sniff fires.
+    let dir = tmp();
+    let p = dir.path().join("blob.bin");
+    std::fs::write(&p, "<HtMl><script>alert(1)</script></HtMl>").unwrap();
+    let out = run(p.to_str().unwrap());
+    assert!(
+        !out.contains("<script>alert(1)</script>"),
+        "mixed-case markup must be stripped: {out}"
+    );
+}

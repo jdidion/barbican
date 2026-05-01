@@ -155,14 +155,10 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
         "html" | "htm" | "xhtml" | "svg" | "xml" | "markdown" | "md"
     );
     let trimmed = raw.trim_start();
-    let sniff_markup = trimmed.starts_with("<!DOCTYPE")
-        || trimmed.starts_with("<html")
-        || trimmed.starts_with("<HTML")
-        || trimmed.starts_with("<svg")
-        || trimmed.starts_with("<SVG")
-        || trimmed.starts_with("<?xml");
+    let sniff_markup = sniff_looks_like_markup(trimmed);
 
-    let stripped = if is_markup_ext || sniff_markup {
+    let should_strip = is_markup_ext || sniff_markup;
+    let stripped = if should_strip {
         let original_len = raw.len();
         let out = strip_html_tags(raw);
         if out.len() != original_len {
@@ -176,9 +172,24 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
         raw.to_string()
     };
 
-    let normalized = normalize_for_scan(&stripped);
+    let mut normalized = normalize_for_scan(&stripped);
     if normalized.len() != stripped.len() {
         notes.push("stripped invisible/bidi unicode".to_string());
+    }
+    // Re-run the markup stripper AFTER normalization so fullwidth /
+    // mathematical `<script>` forms (e.g. `＜script＞`) that NFKC folds
+    // into ASCII `<script>` are also removed. Otherwise an attacker
+    // with a `.bin` file can ship a confusable-masked script that
+    // survives the first strip pass.
+    if should_strip || sniff_looks_like_markup(normalized.trim_start()) {
+        let before = normalized.len();
+        normalized = strip_html_tags(&normalized);
+        if normalized.len() != before {
+            notes.push(format!(
+                "removed normalized HTML blocks ({} bytes)",
+                before - normalized.len()
+            ));
+        }
     }
 
     let hits = scan_injection(&normalized);
@@ -190,6 +201,22 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
     }
 
     (normalized, notes)
+}
+
+/// Case-insensitive markup-prefix sniff. Returns `true` if the first
+/// few characters of `s` look like HTML / SVG / XML regardless of
+/// case. Adversarial review flagged that `<HtMl>` / `<SvG>` bypassed
+/// a case-sensitive `starts_with`.
+fn sniff_looks_like_markup(s: &str) -> bool {
+    let prefix: String = s
+        .chars()
+        .take(10)
+        .flat_map(char::to_lowercase)
+        .collect();
+    prefix.starts_with("<!doctype")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<svg")
+        || prefix.starts_with("<?xml")
 }
 
 /// Expand a leading `~` or `~user` in a path. Anything else is
@@ -291,27 +318,85 @@ fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
         return Ok(());
     }
 
-    // Explicit allow-list wins: if either the canonical path or the
-    // original (pre-symlink-resolve) path exactly matches an entry, we
-    // let it through even if the deny list would otherwise fire.
-    let allows = parse_path_list("BARBICAN_SAFE_READ_ALLOW");
-    for a in &allows {
-        if paths_equal(canonical, a) || paths_equal(original, a) {
-            return Ok(());
-        }
-    }
-
-    let denies = default_deny_list()
+    let extra_deny = parse_absolute_path_list("BARBICAN_SAFE_READ_EXTRA_DENY")?;
+    let denies: Vec<PathBuf> = default_deny_list()
         .into_iter()
-        .chain(parse_path_list("BARBICAN_SAFE_READ_EXTRA_DENY"))
-        .collect::<Vec<_>>();
+        .chain(extra_deny.into_iter().map(canonical_or_same))
+        .collect();
 
-    for d in &denies {
-        if path_matches_rule(canonical, d) || path_matches_rule(original, d) {
-            return Err(ReadError::PolicyDenied(policy_reason(d)));
+    let hit_rule = denies
+        .iter()
+        .find(|d| path_matches_rule(canonical, d) || path_matches_rule(original, d));
+
+    let Some(sensitive_rule) = hit_rule else {
+        return Ok(());
+    };
+
+    // Allow list ("hole punch"): lets a specific path escape the deny
+    // list when the user is sure it's safe. TWO conditions:
+    //   1. `original` path (what the caller asked for) exactly
+    //      matches an allow entry; AND
+    //   2. the allow entry's canonical form equals the CANONICAL
+    //      target AND does NOT itself hit the deny list.
+    //
+    // (2) is the key symlink defense: if the allow entry points at
+    // (or is a symlink to) a sensitive file, the allow rule does NOT
+    // fire — whether the symlink was created by the user or an
+    // attacker.  ALLOW_SENSITIVE=1 is the only way to read sensitive
+    // canonical targets.
+    if allow_rule_permits(original, canonical, &denies) {
+        return Ok(());
+    }
+    Err(ReadError::PolicyDenied(policy_reason(sensitive_rule)))
+}
+
+/// Implements the allow-rule semantics documented in `enforce_policy`.
+///
+/// Anti-laundering rule: the allow entry AND every path component
+/// under it must be a regular file or directory (not a symlink). This
+/// is the only way to prevent an attacker who controls the allow
+/// path from symlinking to a sensitive target. We walk the allow
+/// entry one component at a time, calling `symlink_metadata` (which
+/// does NOT follow symlinks) and rejecting anything that is a symlink
+/// anywhere along the chain.
+///
+/// Users who legitimately need to allow a symlink should point
+/// `BARBICAN_SAFE_READ_ALLOW` at the symlink's target directly.
+fn allow_rule_permits(original: &Path, canonical: &Path, _denies: &[PathBuf]) -> bool {
+    let Ok(allows) = parse_absolute_path_list("BARBICAN_SAFE_READ_ALLOW") else {
+        return false;
+    };
+    for a in &allows {
+        if !paths_equal(original, a) {
+            continue;
+        }
+        if path_contains_symlink(a) {
+            continue;
+        }
+        let a_canon = canonical_or_same(a.clone());
+        if paths_equal(canonical, &a_canon) {
+            return true;
         }
     }
-    Ok(())
+    false
+}
+
+/// Return `true` if `path` itself is a symlink.
+///
+/// This is the specific symlink check used by the allow-list: if the
+/// leaf of the allow entry is a symlink, an attacker with write
+/// permission to the parent directory could have pointed it at a
+/// sensitive file. Symlinks further up (e.g. macOS `/var` →
+/// `/private/var`) are system-level and not attacker-plantable, so we
+/// don't penalize them.
+///
+/// A path that doesn't exist returns `false` — the subsequent open
+/// will fail anyway, and we don't want to refuse to allow a
+/// not-yet-created file.
+fn path_contains_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|md| md.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 fn allow_sensitive_override() -> bool {
@@ -319,16 +404,30 @@ fn allow_sensitive_override() -> bool {
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-fn parse_path_list(var: &str) -> Vec<PathBuf> {
-    std::env::var(var)
-        .ok()
-        .map(|v| {
-            v.split(':')
-                .filter(|s| !s.is_empty())
-                .map(|s| expand_tilde(s))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Parse a colon-separated path list from an env var. Every entry
+/// must be absolute after tilde expansion — bare filenames
+/// (e.g. `"secret.yaml"`) are rejected with a clear error because they
+/// would otherwise match globally, and the `.env` special case is a
+/// hardcoded default rule that cannot be composed by env var.
+fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
+    let raw = match std::env::var(var) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for entry in raw.split(':').filter(|s| !s.is_empty()) {
+        let expanded = expand_tilde(entry);
+        if !expanded.is_absolute() {
+            return Err(ReadError::PolicyDenied(format!(
+                "`{var}` entry `{entry}` must be absolute after ~ expansion. \
+                 Bare filenames are rejected because they would match \
+                 globally; if you want to deny `.env` anywhere, that is a \
+                 built-in default rule."
+            )));
+        }
+        out.push(expanded);
+    }
+    Ok(out)
 }
 
 /// The baked-in deny list. Every entry is expanded against the current
@@ -344,12 +443,25 @@ fn parse_path_list(var: &str) -> Vec<PathBuf> {
 fn default_deny_list() -> Vec<PathBuf> {
     let home = canonical_or_same(home_dir());
     vec![
+        // SSH + AWS + GnuPG + GitHub CLI + Docker — per L3 audit.
         home.join(".ssh"),
         home.join(".aws"),
         home.join(".gnupg"),
         home.join(".config/gh"),
         home.join(".netrc"),
         home.join(".docker/config.json"),
+        // Cloud + cluster creds: adversarial review follow-ups.
+        home.join(".kube/config"),
+        // Source-control credential helpers (plain-text user:pass).
+        home.join(".git-credentials"),
+        home.join(".config/git/credentials"),
+        // Package-registry publish tokens.
+        home.join(".npmrc"),
+        home.join(".pypirc"),
+        home.join(".cargo/credentials"),
+        home.join(".cargo/credentials.toml"),
+        // System-level SSH config + host keys.
+        canonical_or_same(PathBuf::from("/etc/ssh")),
         // `.env` on any filesystem — matched by filename rather than
         // prefix (see `path_matches_rule`).
         PathBuf::from(".env"),
@@ -376,34 +488,107 @@ fn canonical_or_same(p: PathBuf) -> PathBuf {
 ///   `.env.example` / `.env.sample` / `.env.template`.
 /// - Rule is an absolute path: match as an exact path OR as a path
 ///   prefix so `~/.ssh/id_rsa` falls under the `~/.ssh` rule.
+///
+/// Case-sensitivity: matched case-insensitively on macOS and Windows
+/// (default filesystems are case-insensitive on both). Using
+/// case-sensitive matching on those platforms would let a compromised
+/// LLM probe `~/.SSH/id_rsa` and bypass the deny rule because the
+/// nearest-ancestor canonicalize fallback re-attaches the literal
+/// tail. Linux uses case-sensitive matching (ext4/btrfs/xfs are all
+/// case-sensitive by default).
 fn path_matches_rule(path: &Path, rule: &Path) -> bool {
     if rule.components().count() == 1 {
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             if let Some(rule_name) = rule.to_str() {
                 // Only allow the three recognized non-secret variants.
+                // Bare-filename rules are still case-sensitive on
+                // Linux — `.envrc` is distinct from `.ENVRC` on ext4.
                 if rule_name == ".env" {
                     return matches_dotenv(name);
                 }
-                return name == rule_name;
+                return eq_path_component(name, rule_name);
             }
         }
         return false;
     }
-    paths_equal(path, rule) || path.starts_with(rule)
+    paths_equal(path, rule) || path_starts_with(path, rule)
 }
+
+/// Path-prefix check that respects component boundaries and uses
+/// case-folded comparison on typically-case-insensitive filesystems.
+fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    let mut p = path.components();
+    for pc in prefix.components() {
+        let Some(pp) = p.next() else {
+            return false;
+        };
+        if !eq_component(pc.as_os_str(), pp.as_os_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn eq_component(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    if FS_CASE_INSENSITIVE {
+        match (a.to_str(), b.to_str()) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => a == b,
+        }
+    } else {
+        a == b
+    }
+}
+
+fn eq_path_component(a: &str, b: &str) -> bool {
+    if FS_CASE_INSENSITIVE {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// True on filesystems whose default mount configuration is
+/// case-insensitive. macOS APFS and Windows NTFS both default to
+/// case-insensitive-case-preserving. Linux ext4/btrfs/xfs are
+/// case-sensitive by default. This is a coarse heuristic; users on
+/// case-sensitive APFS volumes get stricter behavior than they strictly
+/// need, which is the safe direction.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
+const FS_CASE_INSENSITIVE: bool = true;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+const FS_CASE_INSENSITIVE: bool = false;
 
 /// `.env` matching: deny `.env` and any env-family filename that
 /// looks like it holds real secrets. Allow three explicit template
 /// variants that the ecosystem uses for non-secret templates.
+///
+/// Also denies `.envrc` — direnv's config routinely contains
+/// `export AWS_ACCESS_KEY_ID=...` and other live credentials in
+/// practice, even though it's technically a shell script rather than
+/// a dotenv file.
 fn matches_dotenv(name: &str) -> bool {
     if name == ".env.example" || name == ".env.sample" || name == ".env.template" {
         return false;
     }
-    name == ".env" || name.starts_with(".env.")
+    name == ".env" || name == ".envrc" || name.starts_with(".env.")
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
-    a == b
+    if FS_CASE_INSENSITIVE {
+        let ac = a.components();
+        let bc = b.components();
+        let av: Vec<_> = ac.collect();
+        let bv: Vec<_> = bc.collect();
+        if av.len() != bv.len() {
+            return false;
+        }
+        av.iter()
+            .zip(bv.iter())
+            .all(|(x, y)| eq_component(x.as_os_str(), y.as_os_str()))
+    } else {
+        a == b
+    }
 }
 
 fn policy_reason(rule: &Path) -> String {

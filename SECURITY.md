@@ -27,7 +27,8 @@ This document enumerates what Barbican tries to defend against, what it explicit
 Barbican does not defend against these classes; the user's operating environment or Claude Code itself must.
 
 - **The underlying model being asked to produce malicious code that Barbican's parser can't classify.** If `tree-sitter-bash` cannot parse a construct, Barbican denies it (deny-by-default rule). We do not attempt to outsmart adversarial bash grammars.
-- **Kernel / hypervisor exploits, TOCTOU against the filesystem.** Barbican runs as the same user as Claude Code with no privilege boundary.
+- **Kernel / hypervisor exploits, TOCTOU against the filesystem.** Barbican runs as the same user as Claude Code with no privilege boundary. In particular, `safe_read` canonicalizes + policy-checks before calling `File::open`; a concurrent attacker who swaps a path component between the check and the open can defeat the policy. Our defense is to canonicalize through symlinks at both check time and read time; we do not attempt `open(O_NOFOLLOW) + fstat` re-verification.
+- **Hardlinks to deny-listed targets.** `safe_read` blocks by canonical path; hardlinks share an inode and cannot be distinguished from the original file through path-based policy. If an attacker can create a hardlink from an allowed path to `/etc/shadow` on the same filesystem, they can exfiltrate it. Defense-in-depth here belongs to filesystem permissions.
 - **Claude Code itself being compromised.** A modified Claude Code binary can bypass its own hooks.
 - **The user granting Claude Code broad permissions outside of Barbican's scope** (e.g. enabling arbitrary MCP servers with no safety layer).
 - **Prompt injection via attachments Claude Code hasn't yet rendered through a hook** (e.g. a PDF read directly by the model without triggering a PostToolUse hook we observe).
