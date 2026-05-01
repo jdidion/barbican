@@ -16,6 +16,7 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
 
+use crate::mcp::inspect::{self, InspectArgs};
 use crate::mcp::safe_fetch::{self, SafeFetchArgs};
 use crate::mcp::safe_read::{self, SafeReadArgs};
 
@@ -88,6 +89,30 @@ impl Barbican {
         let body = safe_read::run(args).await;
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
+
+    /// MCP tool: run Barbican's sanitizer on a string already in
+    /// context and return a diagnostic report. Unlike `safe_fetch` /
+    /// `safe_read`, the result is NOT wrapped in `<untrusted-content>`
+    /// — it's a plain-text report with byte counts and findings.
+    /// Use for a quick "is this pasted blob suspicious?" check on
+    /// content you already have from another tool.
+    #[tool(
+        name = "inspect",
+        description = "Run Barbican's sanitizer on text you already have \
+                       in context and report byte-count diffs, which passes \
+                       fired (invisible/bidi strip, HTML block removal, \
+                       confusables fold, jailbreak-pattern detection). \
+                       Plain-text diagnostic — does NOT wrap in sentinels. \
+                       Use for pasted blobs, tool outputs you want to \
+                       audit, or when triaging suspected prompt injection."
+    )]
+    pub async fn inspect(
+        &self,
+        Parameters(args): Parameters<InspectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = inspect::run(&args);
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
 }
 
 #[tool_handler]
@@ -97,8 +122,8 @@ impl ServerHandler for Barbican {
             .with_instructions(
                 "Barbican MCP server. Tools: safe_fetch (SSRF-hardened HTTP \
                  fetch with prompt-injection sanitization); safe_read \
-                 (local file read with sensitive-path deny list). inspect \
-                 lands in an upcoming branch.",
+                 (local file read with sensitive-path deny list); inspect \
+                 (diagnostic sanitizer report on an in-context string).",
             )
             .with_protocol_version(rmcp::model::ProtocolVersion::default())
             .with_server_info(rmcp::model::Implementation::from_build_env())
