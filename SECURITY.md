@@ -34,6 +34,7 @@ Barbican does not defend against these classes; the user's operating environment
 - **Prompt injection via attachments Claude Code hasn't yet rendered through a hook** (e.g. a PDF read directly by the model without triggering a PostToolUse hook we observe).
 - **Confusables outside NFKC.** Specifically: Cyrillic `і` (U+0456) is NFKC-distinct from Latin `i` (U+0069). Catching Cyrillic-vs-Latin homoglyph attacks requires a dedicated confusables normalization pass, which is future work. A test in `sanitize.rs` documents this limit.
 - **Process-level side channels** (timing, thermal, power) and network-level traffic analysis.
+- **Untrusted-launch environment.** An attacker who controls the Barbican process's environment at launch (e.g. a hostile `.envrc` the user direnv-allowed, a compromised parent shell, a malicious Claude Code replacement) can set `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`, `BARBICAN_SAFE_READ_ALLOW=/absolute/secret`, `BARBICAN_ALLOW_IP_LITERALS=1`, `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1`, or set `HOME` to relocate the deny-list base and the audit log. All of these are documented opt-outs — by the time the attacker has this foothold, they can also set `PATH`, `LD_PRELOAD`, or replace the Barbican binary outright. Barbican does not attempt to outrun a hostile launcher; defense-in-depth here belongs to the user's trust in their shell startup.
 
 ## Known parser limits
 

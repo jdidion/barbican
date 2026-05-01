@@ -231,6 +231,21 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve the current user's home directory. Intentionally reads
+/// `$HOME` / `$USERPROFILE` each call.
+///
+/// 1.2.0 adversarial review (GPT HIGH #15) flagged that an attacker
+/// who can set `HOME` before Barbican starts relocates both the
+/// deny-list base and the audit log destination. This is accepted as
+/// out-of-scope and documented in SECURITY.md §Untrusted-launch
+/// environment: any attacker who controls the Barbican process's
+/// launch environment is already able to set `$PATH`, `$LD_PRELOAD`,
+/// or `$BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1` and game over.
+///
+/// Process-lifetime caching was considered but rejected — it breaks
+/// the safe_read integration tests that cycle `$HOME` across tempdirs
+/// to exercise different policy shapes, and it doesn't close the real
+/// attacker path (launch-env control).
 fn home_dir() -> PathBuf {
     if let Ok(h) = std::env::var("HOME") {
         if !h.is_empty() {
