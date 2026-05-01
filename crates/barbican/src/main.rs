@@ -39,6 +39,9 @@ enum Command {
         /// Print the planned changes without touching the filesystem.
         #[arg(long)]
         dry_run: bool,
+        /// Override the Claude Code config directory (default: ~/.claude).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
     },
     /// Remove Barbican hooks + MCP server registration.
     Uninstall {
@@ -48,6 +51,9 @@ enum Command {
         /// Unwire hooks but leave the binary on disk.
         #[arg(long)]
         keep_files: bool,
+        /// Override the Claude Code config directory (default: ~/.claude).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
     },
 }
 
@@ -61,18 +67,42 @@ fn main() -> Result<()> {
         Command::PostMcp => barbican::hooks::post_mcp::run(),
         Command::Audit => barbican::hooks::audit::run(),
         Command::McpServe => barbican::mcp::server::run(),
-        Command::Install { dry_run } => {
-            tracing::info!(dry_run, "install: not yet implemented (feat/install)");
-            anyhow::bail!("`barbican install` lands on `feat/install`");
+        Command::Install { dry_run, home } => {
+            let claude_home = resolve_claude_home(home)?;
+            let binary_source = std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
+            barbican::installer::install(&barbican::installer::InstallOptions {
+                claude_home,
+                binary_source,
+                dry_run,
+            })
         }
         Command::Uninstall {
             dry_run,
             keep_files,
+            home,
         } => {
-            tracing::info!(dry_run, keep_files, "uninstall: not yet implemented");
-            anyhow::bail!("`barbican uninstall` lands on `feat/install`");
+            let claude_home = resolve_claude_home(home)?;
+            barbican::installer::uninstall(&barbican::installer::UninstallOptions {
+                claude_home,
+                dry_run,
+                keep_files,
+            })
         }
     }
+}
+
+/// Resolve `--home`, falling back to `$HOME/.claude`. We read `HOME`
+/// directly instead of pulling a `dirs` crate: the binary already
+/// assumes Unix-y paths, and the hook / installer tests need to be
+/// able to point at a tempdir by setting `HOME` anyway.
+fn resolve_claude_home(explicit: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("HOME not set — pass --home explicitly"))?;
+    Ok(std::path::PathBuf::from(home).join(".claude"))
 }
 
 /// Initialize `tracing-subscriber` once. Logs go to stderr so they
