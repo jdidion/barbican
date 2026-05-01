@@ -48,7 +48,7 @@ mod tables {
     //! entries. Install adds these; uninstall strips them; tests
     //! assert the counts. Keep both in lock-step.
 
-    pub const ALLOW: &[&str] = &[
+    pub(super) const ALLOW: &[&str] = &[
         "mcp__barbican",
         "WebFetch(domain:docs.anthropic.com)",
         "WebFetch(domain:github.com)",
@@ -66,7 +66,7 @@ mod tables {
         "WebFetch(domain:stackoverflow.com)",
     ];
 
-    pub const ASK: &[&str] = &[
+    pub(super) const ASK: &[&str] = &[
         "WebFetch",
         "Bash(curl:*)",
         "Bash(wget:*)",
@@ -84,7 +84,7 @@ mod tables {
     /// Each hook entry is `(event, matcher, subcommand)`. The
     /// installed command is `<binary> <subcommand>`, assembled in
     /// `hook_command()`.
-    pub const HOOKS: &[(&str, &str, &str)] = &[
+    pub(super) const HOOKS: &[(&str, &str, &str)] = &[
         ("PreToolUse", "Bash", "pre-bash"),
         ("PostToolUse", "Bash|WebFetch", "audit"),
         ("PostToolUse", "mcp__.*", "post-mcp"),
@@ -110,7 +110,7 @@ pub fn install(opts: &InstallOptions) -> Result<()> {
     let installed_binary = barbican_dir.join("barbican");
 
     if opts.dry_run {
-        log(&format!("DRY RUN — no filesystem changes"));
+        log("DRY RUN — no filesystem changes");
         log(&format!("would create {}", barbican_dir.display()));
         log(&format!(
             "would copy {} -> {}",
@@ -217,10 +217,10 @@ fn ensure_claude_home(home: &Path) -> Result<()> {
 
 fn claude_json_path(claude_home: &Path) -> PathBuf {
     let parent = claude_home.parent().unwrap_or_else(|| Path::new("/"));
-    let name = claude_home
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| std::ffi::OsString::from(".claude"));
+    let name = claude_home.file_name().map_or_else(
+        || std::ffi::OsString::from(".claude"),
+        std::ffi::OsStr::to_os_string,
+    );
     let mut out = name;
     out.push(".json");
     parent.join(out)
@@ -514,10 +514,7 @@ fn strip_permission_list(cfg: &mut Value, key: &str, owned: &[&str]) -> usize {
         return 0;
     };
     let before = arr.len();
-    arr.retain(|v| {
-        v.as_str()
-            .is_none_or(|s| !owned.iter().any(|owned_rule| s == *owned_rule))
-    });
+    arr.retain(|v| v.as_str().is_none_or(|s| !owned.contains(&s)));
     before - arr.len()
 }
 
