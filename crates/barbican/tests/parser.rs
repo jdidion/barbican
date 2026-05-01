@@ -511,6 +511,72 @@ fn heredoc_delimiter_is_captured() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Adversarial / defense-in-depth inputs.
+//
+// Tracked as below-medium follow-ups from the Phase-1 /crew:review. The
+// parser already hard-denies on oversize stack depth and on malformed
+// trees; these tests pin that behavior so a future optimization can't
+// silently remove the safeguard.
+// ---------------------------------------------------------------------
+
+#[test]
+fn deeply_nested_command_substitutions_are_denied() {
+    // `MAX_DEPTH = 100` in the parser — 200 levels guarantees a Malformed
+    // return instead of blowing the stack.
+    let mut cmd = String::from("ls");
+    for _ in 0..200 {
+        cmd = format!("$({cmd})");
+    }
+    let full = format!("echo {cmd}");
+    match parse(&full) {
+        Err(ParseError::Malformed) => {}
+        other => panic!("expected Malformed from 200-deep subst nesting; got {other:?}"),
+    }
+}
+
+#[test]
+fn very_long_pipeline_parses_without_stack_overflow() {
+    // 500-stage pipeline: `cmd | cmd | cmd | ...`. Pipelines are
+    // left-recursive in the grammar so this exercises iterative
+    // tree-walking rather than recursion. The parser must succeed and
+    // surface every stage so a later `curl | … | bash` fuse can't be
+    // diluted by noise stages.
+    let stage = "cmd";
+    let mut pipeline = String::from(stage);
+    for _ in 0..499 {
+        pipeline.push_str(" | ");
+        pipeline.push_str(stage);
+    }
+    let script = parse(&pipeline).expect("flat 500-stage pipeline must parse");
+    assert_eq!(script.pipelines.len(), 1, "one top-level pipeline expected");
+    assert_eq!(
+        script.pipelines[0].stages.len(),
+        500,
+        "every stage must be surfaced to classifiers"
+    );
+}
+
+#[test]
+fn multi_megabyte_argument_word_parses_in_bounded_time() {
+    // 5 MiB of `a` in a single argv word. Pins that a caller handing a
+    // huge-but-legal bash command into the classifier does not DoS the
+    // hook. Wall-time is not asserted (CI runners vary); 5 MiB locally
+    // finishes in well under a second.
+    const SIZE: usize = 5 * 1024 * 1024;
+    let mut cmd = String::from("echo ");
+    cmd.reserve(SIZE);
+    for _ in 0..SIZE {
+        cmd.push('a');
+    }
+    let script = parse(&cmd).expect("5 MiB argv word must parse (no classifier gate)");
+    assert_eq!(script.pipelines.len(), 1);
+    assert_eq!(script.pipelines[0].stages[0].basename, "echo");
+    let args = &script.pipelines[0].stages[0].args;
+    assert_eq!(args.len(), 1, "one argv word expected");
+    assert_eq!(args[0].len(), SIZE);
+}
+
 #[test]
 fn heredoc_with_trailing_file_redirect_preserves_file_redirect() {
     // The grammar nests `file_redirect` inside `heredoc_redirect` for
