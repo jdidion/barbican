@@ -4,7 +4,7 @@ A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a 
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`PLAN.md`](PLAN.md) for the port plan and [`SECURITY.md`](SECURITY.md) for the threat model.
 
-Status: **pre-release**. The scaffold is in place; feature branches (`feat/pre-bash-h1`, `feat/pre-bash-h2`, …) are landing one audit finding at a time.
+Status: **1.0.0**. All 12 roadmap phases and every audit finding (H1, H2, M1-M4, L1-L3) have shipped, each with a regression test. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
 
 ## Install
 
