@@ -171,9 +171,21 @@ fn scalar_string(v: Option<&Value>) -> Value {
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        // Tighten the dir whether or not we created it — a stale
-        // wider-perm dir from a previous run shouldn't leak.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        // 1.2.0 adversarial review (Claude H-7): set_permissions on a
+        // path follows symlinks. If an attacker pre-planted
+        // `~/.claude/barbican` as a symlink to `/etc/`, a naive chmod
+        // here would tighten `/etc/` to 0o700. Check that the parent
+        // is a real directory (not a symlink) before chmod'ing. If
+        // it IS a symlink, bail cleanly — the log write will then
+        // fail on the O_NOFOLLOW open below.
+        if let Ok(meta) = std::fs::symlink_metadata(parent) {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                let _ = std::fs::set_permissions(
+                    parent,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
+        }
     }
     let mut file: File = OpenOptions::new()
         .create(true)

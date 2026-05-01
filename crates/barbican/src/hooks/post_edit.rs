@@ -38,7 +38,25 @@ pub fn run() -> Result<()> {
     }
 
     let (path, content) = extract_write(tool, &payload);
-    let path_findings = scan_sensitive_path(&path);
+    // 1.2.0 adversarial review (GPT HIGH #12): scan_sensitive_path is
+    // string-only, so a symlink `docs/notes.md -> ~/.zshrc` bypasses
+    // the sensitive-path finding — the write string is `docs/notes.md`
+    // but the actual on-disk target is a shell-startup file. Resolve
+    // the path (symlinks + .. + .) and scan BOTH the requested and
+    // resolved forms. Errors canonicalizing (nonexistent paths for
+    // `Write`, which creates the file) fall back to the requested
+    // path alone — same behavior as pre-1.2.0.
+    let mut path_findings = scan_sensitive_path(&path);
+    if let Ok(resolved) = std::fs::canonicalize(&path) {
+        let resolved_str = resolved.to_string_lossy();
+        if resolved_str != path {
+            for f in scan_sensitive_path(&resolved_str) {
+                if !path_findings.contains(&f) {
+                    path_findings.push(format!("{f} (via symlink resolution)"));
+                }
+            }
+        }
+    }
 
     let cap = scan_cap_from_env();
     let (scan_text, truncated) = truncate_for_scan(&content, cap);
