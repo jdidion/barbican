@@ -199,3 +199,104 @@ fn large_input_handled_without_panic() {
         &out[..out.len().min(200)]
     );
 }
+
+// ---------------------------------------------------------------------
+// Phase-10 adversarial-review regression tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn nfkc_growth_surfaces_as_finding_not_silent() {
+    // MEDIUM: NFKC of U+FDFA decomposes to 18 codepoints / 33 bytes of
+    // Arabic. Previously bytes-after > bytes-in, saturating_sub wrote
+    // "bytes-removed: 0", and no finding fired — caller sees
+    // "findings: none" despite the pipeline rewriting every byte.
+    let out = run("\u{FDFA}");
+    assert!(
+        !out.contains("findings: none"),
+        "NFKC-grown input must surface a finding; got: {out}"
+    );
+    assert!(
+        out.contains("bytes-added") || out.contains("normalized") || out.contains("expanded"),
+        "want an explicit growth finding; got: {out}"
+    );
+}
+
+#[test]
+fn nfkc_rewrite_without_net_growth_surfaces_finding() {
+    // A ligature that stays the same byte length after NFKC
+    // (ﬃ U+FB03 = 3 bytes → ffi = 3 ASCII bytes). Previously reported
+    // "findings: none" with bytes-removed: 0 even though every byte
+    // was rewritten.
+    let out = run("\u{FB03}"); // ﬃ
+    assert!(
+        !out.contains("findings: none"),
+        "NFKC rewrite must surface a finding even when byte count is unchanged; got: {out}"
+    );
+}
+
+#[test]
+fn giant_input_is_truncated_not_oom() {
+    // MEDIUM: inspect must cap input size the way safe_fetch /
+    // safe_read do. 20 MB of ASCII should either be rejected or
+    // truncated with a surfaced note; what MUST NOT happen is silent
+    // ~2 GB allocation or a panic.
+    let big = "A".repeat(20 * 1024 * 1024);
+    let out = run(&big);
+    // Either truncation note OR explicit rejection — both acceptable.
+    assert!(
+        out.contains("truncated") || out.contains("too large") || out.contains("cap"),
+        "giant input must be explicitly capped, not silently processed; got first 300 chars: {}",
+        &out[..out.len().min(300)]
+    );
+}
+
+#[test]
+fn unclosed_script_does_not_falsely_claim_script_removed() {
+    // LOW: `<script>unclosed <!-- real comment -->` — the comment is
+    // stripped but the script is not (no closing tag). Previously
+    // reported "removed HTML <script> blocks" even though no script
+    // bytes were removed. Attribution must be per-pass.
+    let out = run("<script>unclosed <!-- real comment -->");
+    // Comment was actually removed; that finding is fine.
+    assert!(
+        out.contains("comment") || out.contains("HTML"),
+        "comment-removal finding missing: {out}"
+    );
+    // Script was NOT actually removed — must not claim otherwise.
+    assert!(
+        !out.contains("removed HTML <script>"),
+        "false-positive script attribution: {out}"
+    );
+}
+
+#[test]
+fn nbsp_tag_separator_still_attributed_to_script() {
+    // LOW: `<script\u{00A0}>...</script>` — regex `\b` treats NBSP as
+    // a word boundary and strips the block, but the sniff's ASCII-
+    // only whitespace check misses it. Result was silent success:
+    // script removed but no "removed HTML <script>" finding.
+    let out = run("<script\u{00A0}>evil()</script>");
+    assert!(
+        out.contains("removed HTML <script>") || out.contains("script"),
+        "NBSP-separated script tag must still surface: {out}"
+    );
+}
+
+#[test]
+fn deny_unknown_fields_rejects_extras() {
+    // GPT LOW: pin the schema contract so a future refactor can't
+    // silently relax `deny_unknown_fields` on InspectArgs.
+    let json = r#"{"text":"hi","rogue":"x"}"#;
+    let err = serde_json::from_str::<InspectArgs>(json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rogue") || msg.contains("unknown field"),
+        "deny_unknown_fields must reject; got: {msg}"
+    );
+}
+
+#[test]
+fn missing_text_field_fails_to_deserialize() {
+    let json = r#"{}"#;
+    assert!(serde_json::from_str::<InspectArgs>(json).is_err());
+}

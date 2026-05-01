@@ -81,20 +81,56 @@ const fn is_invisible(c: char) -> bool {
 /// next `-->`.
 #[must_use]
 pub fn strip_html_tags(s: &str) -> String {
+    strip_html_tags_attributed(s).0
+}
+
+/// Like [`strip_html_tags`] but also returns a bitset describing which
+/// of the three sub-regexes actually removed bytes. Used by `inspect`
+/// to attribute findings precisely — we only claim "removed <script>"
+/// if the script regex itself removed bytes, not just any of the
+/// three. This is the tight guard that closes the false-positive
+/// attribution case from the Phase-10 adversarial review.
+#[must_use]
+pub fn strip_html_tags_attributed(s: &str) -> (String, HtmlStripHits) {
+    let (script, style, comment) = html_tag_regexes();
+    let mut hits = HtmlStripHits::default();
+
+    let after_script = script.replace_all(s, "");
+    hits.removed_script = after_script.len() != s.len();
+    let after_style = style.replace_all(&after_script, "");
+    hits.removed_style = after_style.len() != after_script.len();
+    let after_comment = comment.replace_all(&after_style, "");
+    hits.removed_comment = after_comment.len() != after_style.len();
+
+    (after_comment.into_owned(), hits)
+}
+
+/// Which HTML sub-strippers actually removed bytes in a given call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HtmlStripHits {
+    pub removed_script: bool,
+    pub removed_style: bool,
+    pub removed_comment: bool,
+}
+
+impl HtmlStripHits {
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.removed_script || self.removed_style || self.removed_comment
+    }
+}
+
+fn html_tag_regexes() -> (&'static Regex, &'static Regex, &'static Regex) {
     static SCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static STYLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static COMMENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-
-    let script = SCRIPT_RE
-        .get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex"));
-    let style = STYLE_RE
-        .get_or_init(|| Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex"));
-    let comment =
-        COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex"));
-
-    let out = script.replace_all(s, "");
-    let out = style.replace_all(&out, "");
-    comment.replace_all(&out, "").into_owned()
+    (
+        SCRIPT_RE
+            .get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex")),
+        STYLE_RE
+            .get_or_init(|| Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex")),
+        COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex")),
+    )
 }
 
 /// NFKC-normalize `s`.
