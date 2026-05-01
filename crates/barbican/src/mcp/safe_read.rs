@@ -576,7 +576,7 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
         loop {
             match (ac.next(), bc.next()) {
                 (None, None) => return true,
-                (Some(x), Some(y)) if eq_component(x.as_os_str(), y.as_os_str()) => continue,
+                (Some(x), Some(y)) if eq_component(x.as_os_str(), y.as_os_str()) => {}
                 _ => return false,
             }
         }
