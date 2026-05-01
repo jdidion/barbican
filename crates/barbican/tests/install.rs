@@ -28,8 +28,8 @@ fn fake_home() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
-    let s = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+    let s = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 fn write_json(path: &Path, value: &serde_json::Value) {
@@ -440,8 +440,7 @@ fn uninstall_keep_files_preserves_binary_dir() {
         pre.iter().all(|entry| {
             entry["hooks"][0]["command"]
                 .as_str()
-                .map(|c| !c.contains("barbican/barbican"))
-                .unwrap_or(true)
+                .is_none_or(|c| !c.contains("barbican/barbican"))
         }),
         "--keep-files must still unwire barbican hooks: {pre:?}"
     );
@@ -628,8 +627,7 @@ fn uninstall_does_not_strip_user_hook_with_barbican_substring_in_path() {
     let preserved = pre.iter().any(|entry| {
         entry["hooks"][0]["command"]
             .as_str()
-            .map(|c| c == user_hook_cmd)
-            .unwrap_or(false)
+            .is_some_and(|c| c == user_hook_cmd)
     });
     assert!(
         preserved,
