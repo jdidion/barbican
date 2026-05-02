@@ -114,6 +114,21 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "podman",
     "runc",
     "crun",
+    // 1.2.0 7th-pass review (Claude+GPT SEVERE 7S2): debugger /
+    // process-control / locking wrappers, and network-transport
+    // wrappers. All follow `WRAPPER [opts] CMD [args]` shape which
+    // transparently execs CMD; missing from the unwrap set means
+    // `strace bash -c 'curl | bash'` etc. bypass H1/M1 entirely.
+    "strace",
+    "ltrace",
+    "valgrind",
+    "catchsegv",
+    "flock",        // NOTE: also has its own `-c CMD` form — handled specially
+    "gosu",
+    "fakeroot",
+    "torify",
+    "proxychains",
+    "proxychains4",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.
