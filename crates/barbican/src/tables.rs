@@ -99,6 +99,10 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "chpst",       // chpst [-u user] [-e ENVDIR] CMD
     "busybox",     // busybox APPLET [args] — applet ~= argv[0] for classify
     "toybox",      // toybox APPLET [args] — same shape as busybox
+    // ssh [opts] HOST CMD... — remote shell sink. CMD classifies as
+    // bash on the remote, but attack shapes (curl|bash, secret exfil)
+    // deny on the local invocation regardless of remote execution.
+    "ssh",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.
