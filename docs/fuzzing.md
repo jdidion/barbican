@@ -24,11 +24,14 @@ cargo test -p barbican --test fuzz_properties
 
 ### Findings from layer 1
 
-The first run of the properties on the 1.3.0 branch caught one real bug; it is pinned in the test file as an `#[ignore]`d case rather than fixed in this PR (fix-scope rule: the fuzzing-infrastructure PR adds the test; a follow-up PR fixes the underlying behavior).
+The first two runs of the properties on the 1.3.0 branch caught two real bugs; they're pinned (one as an `#[ignore]`d test, one behind a `#[cfg(not(target_os = "linux"))]` gate in the file) rather than fixed in this PR. Fix-scope rule: the fuzzing-infrastructure PR adds the test; a follow-up PR fixes the underlying behavior.
 
 | Test | Shrunk input | Bug | Target release |
 | ---- | ------------ | --- | -------------- |
 | `pre_bash_hook_exit_contract_holds` | arbitrary non-UTF-8 bytes on stdin | `pre_bash::run` calls `stdin.read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow bubbles to `main`, exits 1. CLAUDE.md rule #1 (deny-by-default) demands the non-UTF-8 stdin path map to `EXIT_DENY=2` + reason-on-stderr, just like the malformed-JSON path added in 1.2.0 H-3. | 1.3.1 |
+| `parser_never_panics_on_bounded_utf8` (and its classifier-layer siblings, which reach `parse` through `classify_command`) | unknown (see note) | Linux-only: the test binary takes `SIGSEGV` within 180 ms of starting on Ubuntu (macOS passes cleanly). No per-input diagnostics flushed before the crash, so the shrunk reproducer is not yet in hand — only the pre-CI corpus bounds. Likely shape: a stack overflow or invalid memory access in the `tree-sitter-bash` FFI driven with arbitrary generated UTF-8. | 1.3.1 |
+
+Open investigation thread for the Linux-segfault finding: run the generated `proptest` inputs one at a time under `valgrind` / `rr` on an Ubuntu host, log each input before the parser call, and reduce the first crashing case by hand. Once reproduced, the fix lands the same way every other classifier finding has: red-test-first under the minimized input, then the code change.
 
 ## Layer 2 — cargo-fuzz (nightly only, optional)
 
