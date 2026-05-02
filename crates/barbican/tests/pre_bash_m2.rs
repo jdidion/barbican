@@ -663,6 +663,43 @@ fn write_to_etc_profile_d_denies() {
     );
 }
 
+// 1.2.1: `.git/config` + `.git/hooks/` were missing from the
+// persistence-path markers. The explicit finding shape is
+// `echo "[core] pager=!cmd" > /tmp/evil/.git/config` — it plants the
+// config file for the 7H1 `git --git-dir=/tmp/evil` attack, which IS
+// flagged at git-use-time by `git_config_injection`, but the initial
+// plant was unclassified. Defense-in-depth.
+
+#[test]
+fn write_to_attacker_git_config_denies() {
+    // The finding's canonical payload.
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo '[core] pager=!cmd' > /tmp/evil/.git/config"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn write_to_git_hooks_dir_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "echo '#!/bin/sh' > /tmp/evil/.git/hooks/post-checkout"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn cp_to_attacker_git_config_denies() {
+    // file-copy tool shape — cp into a .git/config.
+    assert_eq!(
+        run_pre_bash(&bash_input("cp /tmp/payload.cfg /tmp/evil/.git/config")),
+        2,
+    );
+}
+
 #[test]
 fn regular_txt_write_still_allows() {
     // Writing a normal `.txt` file outside persistence dirs should

@@ -110,6 +110,13 @@ fn sensitive_paths() -> &'static [(Regex, &'static str)] {
     CELL.get_or_init(|| {
         vec![
             (r"(?:^|/)\.git/hooks/", "git hook script"),
+            // 1.2.1: `.git/config` is the setup surface for the 7H1
+            // `git --git-dir=/tmp/evil` attack (config keys like
+            // `core.pager=!cmd` / `core.sshCommand=…` execute on the
+            // next git operation against that dir). Catching the
+            // initial plant gives defense-in-depth alongside the
+            // git-use-time `git_config_injection` classifier.
+            (r"(?:^|/)\.git/config\b", "git config"),
             (
                 r"(?:^|/)\.ssh/(?:config|authorized_keys|known_hosts)\b",
                 "SSH config/keys",
@@ -324,6 +331,15 @@ mod tests {
         let f = scan_sensitive_path("proj/.git/hooks/post-commit");
         assert_eq!(f.len(), 1);
         assert!(f[0].to_lowercase().contains("git hook"));
+    }
+
+    #[test]
+    fn sensitive_path_git_config() {
+        // 1.2.1: writing `.git/config` is the setup for the 7H1
+        // `git --git-dir=/tmp/evil` exploit.
+        let f = scan_sensitive_path("/tmp/evil/.git/config");
+        assert_eq!(f.len(), 1, "expected one finding: {f:?}");
+        assert!(f[0].to_lowercase().contains("git config"));
     }
 
     #[test]

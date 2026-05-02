@@ -1436,6 +1436,16 @@ static SHELL_RC_FILES: phf::Set<&'static str> = phf::phf_set! {
 /// are NOT identifiable by basename alone. Writes containing any of
 /// these as a path component are denied. 1.2.0 adversarial review
 /// (Claude H-4 + GPT HIGH #4): missing these was a persistence hole.
+///
+/// 1.2.1 adversarial review: added `.git/config` and `.git/hooks/`.
+/// Defense-in-depth for the 7H1 `git --git-dir=/tmp/evil git log`
+/// attack — that attack is flagged at git-use-time by
+/// `git_config_injection`, but the INITIAL plant of the
+/// attacker-controlled `.git` directory (writing
+/// `[core] pager=!cmd` to `/tmp/evil/.git/config`, dropping a
+/// `post-checkout` hook, etc.) slipped past every classifier because
+/// the target path looked benign. Catching the plant gives us two
+/// layers: catch the write AND catch the exploit.
 static PERSISTENCE_PATH_MARKERS: &[&str] = &[
     "/etc/profile.d/",        // sourced by every login shell (if writable)
     "/.config/fish/",         // fish config dir
@@ -1444,6 +1454,13 @@ static PERSISTENCE_PATH_MARKERS: &[&str] = &[
     "/.config/autostart/",    // xdg autostart .desktop files
     "/Library/LaunchAgents/", // macOS per-user launch agents
     "/Library/LaunchDaemons/",
+    // 1.2.1: git-based persistence plant surface. `.git/config` and
+    // `.git/hooks/` cover the two shapes — config keys that execute
+    // commands on next `git` use (e.g. `core.pager=!cmd`,
+    // `core.sshCommand=…`) and hook scripts that run on specific git
+    // operations (`post-checkout`, `pre-commit`, `post-update`, …).
+    "/.git/config",
+    "/.git/hooks/",
 ];
 
 // ---------------------------------------------------------------------
