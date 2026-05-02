@@ -31,6 +31,21 @@ cargo build --release --target aarch64-apple-darwin
 
 Requires Rust stable 1.91+ (pinned in `rust-toolchain.toml`). See [`SECURITY.md`](SECURITY.md) for the environment variables Barbican reads.
 
+## Fuzzing
+
+Barbican 1.3.0 ships property tests (stable Rust, runs in CI) and an optional cargo-fuzz scaffold (nightly). See [`docs/fuzzing.md`](docs/fuzzing.md) for the full workflow. Short form:
+
+```sh
+# stable Rust — property tests run under plain cargo test
+cargo test -p barbican --test fuzz_properties
+
+# nightly — long-running libfuzzer targets
+cd crates/barbican
+cargo +nightly fuzz run parse -- -max_total_time=60
+cargo +nightly fuzz run classify -- -max_total_time=60
+cargo +nightly fuzz run validate_url -- -max_total_time=60
+```
+
 ## License & attribution
 
 Barbican is MIT-licensed (see [`LICENSE`](LICENSE)).

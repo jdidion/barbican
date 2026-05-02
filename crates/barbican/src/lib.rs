@@ -13,6 +13,18 @@ pub mod sanitize;
 pub mod scan;
 pub mod tables;
 
+/// Internal, unstable surface exposed only so the 1.3.0 fuzzing
+/// infrastructure (proptest properties in `tests/fuzz_properties.rs`
+/// plus the out-of-workspace `cargo-fuzz` crate under
+/// `crates/barbican/fuzz/`) can drive the classifier and the chmod
+/// attacker-path check without shelling out to the `barbican` binary.
+///
+/// Not a stable API. Every item in here may move or be renamed. The
+/// real public entry points are `hooks::pre_bash::run` (binary-level)
+/// and `parser::parse` (library-level).
+#[doc(hidden)]
+pub use crate::hooks::pre_bash::__fuzz;
+
 /// Uniform boolean-env-var parser: `1` / `true` / `yes` / `on`
 /// (case-insensitive) are true; everything else (including unset) is
 /// false. Use this for every `BARBICAN_*_FLAG`-style knob so users

@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
 members = ["crates/barbican"]
+# `crates/barbican/fuzz/` is the optional layer-2 `cargo-fuzz` crate
+# (1.3.0 fuzzing infrastructure). It depends on `libfuzzer-sys`, which
+# requires the Rust nightly toolchain — the rest of Barbican is pinned
+# to stable 1.91.1 in `rust-toolchain.toml`. Excluding it from the
+# workspace keeps `cargo build` and `cargo test` at the repo root
+# working on stable. Nightly users run it via:
+#     cd crates/barbican && cargo +nightly fuzz run <target>
+# See `docs/fuzzing.md` for the full workflow.
+exclude = ["crates/barbican/fuzz"]
 
 [workspace.package]
 version = "1.2.0"

