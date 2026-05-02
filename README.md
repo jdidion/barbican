@@ -5,7 +5,7 @@
     </td>
     <td valign="middle">
       <h1>Barbican</h1>
-      <em>The fortified gatehouse for your Claude Code session.</em>
+      <em>Pre-execution safety checks for AI-generated shell commands.</em>
     </td>
   </tr>
 </table>
