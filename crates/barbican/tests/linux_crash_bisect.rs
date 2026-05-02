@@ -108,31 +108,14 @@ fn aaa_prefix_bisect_captured_crasher() {
     // size in the 2398-2500 window that crashes is the minimal
     // reproducer modulo UTF-8 char-boundary rounding.
     let targets = [
-        // Fast anchors (expected err-malformed, confirm behavior is
-        // unchanged):
-        1,
-        100,
-        1000,
-        2000,
-        2398,
-        // Dense sweep across the crash window:
-        2400,
-        2410,
-        2420,
-        2430,
-        2440,
-        2450,
-        2460,
-        2470,
-        2480,
-        2490,
-        2500,
-        // Tail anchors in case the crash only fires at longer lengths
-        // (unexpected given prior bisect but cheap to confirm):
-        2510,
-        2520,
-        2600,
-        bytes.len(),
+        // Fast anchors to confirm nothing below the window changed:
+        1, 2000, 2479,
+        // Byte-grained sweep across the narrowed [2479, 2490) window.
+        // Prior bisect (CI run 25262176110) landed the crash strictly
+        // between 2479 (err-malformed) and 2490 (no parse= line), so
+        // this pass finds the exact trigger byte modulo UTF-8
+        // char-boundary rounding.
+        2480, 2481, 2482, 2483, 2484, 2485, 2486, 2487, 2488, 2489, 2490,
     ];
     for &n in &targets {
         let prefix = prefix_at_char_boundary(bytes, n);
