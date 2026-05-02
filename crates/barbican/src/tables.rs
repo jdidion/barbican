@@ -129,6 +129,16 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "torify",
     "proxychains",
     "proxychains4",
+    // 1.2.0 8th-pass review (Claude HIGH 8H2): additional container
+    // fronts. Same shape as docker/podman — handled by
+    // extract_container_run_inner.
+    "buildah",
+    "nerdctl",
+    "ctr",
+    "lxc-attach",
+    "apptainer",
+    "singularity",
+    "kubectl",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.

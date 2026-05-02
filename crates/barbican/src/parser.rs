@@ -94,6 +94,16 @@ pub struct Command {
     /// this command's argv or redirect targets, parsed recursively.
     /// Classifiers walk this to catch nested shell execution.
     pub substitutions: Vec<Script>,
+    /// Leading `VAR=VAL` assignments preceding the command. Bash
+    /// passes these as environment variables to the command only
+    /// (not to the parent shell). e.g. `GIT_DIR=/tmp/evil git log`
+    /// has `assignments = [("GIT_DIR", "/tmp/evil")]`.
+    ///
+    /// 1.2.0 8th-pass adversarial review (Claude SEVERE S1):
+    /// previous IR dropped these, so `git_config_injection` only saw
+    /// argv-based `-c`/`--git-dir` overrides and missed env-var
+    /// smuggling (`GIT_DIR=`, `GIT_SSH_COMMAND=`, etc.).
+    pub assignments: Vec<(String, String)>,
 }
 
 /// A redirect attached to a command.
@@ -427,6 +437,19 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
             collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
             continue;
         }
+        if child.kind() == "variable_assignment" {
+            // `VAR=VAL` prefix on a command — captured separately
+            // from argv so classifiers like `git_config_injection`
+            // can inspect env-var smuggled overrides (`GIT_DIR=`,
+            // `GIT_SSH_COMMAND=`, etc.). Also recurse for any
+            // substitutions on the RHS (matches the existing
+            // statement-level walk for non-prefixed assignments).
+            if let Some((name, value)) = extract_variable_assignment(child, src) {
+                cmd.assignments.push((name, value));
+            }
+            collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
+            continue;
+        }
         if name_id == Some(child.id()) {
             // Already consumed as argv[0].
             continue;
@@ -436,6 +459,24 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
     }
 
     Ok(cmd)
+}
+
+/// Extract `(name, value)` from a `variable_assignment` node. On
+/// tree-sitter-bash the node has `name` and `value` fields (either
+/// may be missing for edge cases); we return `None` if either is
+/// unavailable.
+fn extract_variable_assignment(
+    node: Node<'_>,
+    src: &[u8],
+) -> Option<(String, String)> {
+    let name = node.child_by_field_name("name")?;
+    let value = node.child_by_field_name("value");
+    let name_text = extract_word_text(name, src).ok()?;
+    let value_text = match value {
+        Some(v) => extract_word_text(v, src).ok()?,
+        None => String::new(),
+    };
+    Some((name_text, value_text))
 }
 
 /// Return `true` if the node kind is any of tree-sitter-bash's redirect
