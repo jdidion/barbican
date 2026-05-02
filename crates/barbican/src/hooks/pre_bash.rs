@@ -229,6 +229,12 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         if let Some(reason) = git_config_injection(pipeline) {
             return Decision::Deny { reason };
         }
+        if let Some(reason) = scripting_lang_shellout(pipeline) {
+            return Decision::Deny { reason };
+        }
+        if let Some(reason) = chmod_plus_x_attacker_path(pipeline) {
+            return Decision::Deny { reason };
+        }
         if let Some(reason) = m2_git_hard_deny(pipeline) {
             return Decision::Deny { reason };
         }
@@ -2184,6 +2190,282 @@ fn network_tool_word_regex() -> &'static regex::Regex {
         )
         .expect("network-tool regex compiles")
     })
+}
+
+/// Deny `chmod +x <path>` (or octal mode with the execute bit set)
+/// targeting a path in an attacker-influenceable directory:
+///   /tmp/, /var/tmp/, /dev/shm/, $HOME/Downloads/, $HOME/.cache/
+///
+/// 1.2.0 5th-pass adversarial review (Claude SEVERE S-1). Shape:
+///
+/// ```text
+/// base64 -d < blob > /tmp/p.bin \
+///     && chmod +x /tmp/p.bin \
+///     && /tmp/p.bin
+/// ```
+///
+/// H2 misses the write because `.bin` is not in SCRIPT_EXTS, so the
+/// decoder output is treated as data. But the `chmod +x` + direct
+/// execution is the give-away. We don't need cross-pipeline
+/// correlation: `chmod +x <attacker-path>` issued from an agent is
+/// itself the red flag.
+///
+/// False-positive risk: agents legitimately `chmod +x` a newly-built
+/// helper in the working tree. We restrict to well-known
+/// attacker-writeable directories to minimize impact.
+fn chmod_plus_x_attacker_path(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        if stage_bn_lc(stage) != "chmod" {
+            continue;
+        }
+        let args = &stage.args;
+        // Look for a mode token granting execute, plus a path token.
+        // Modes can be symbolic (`+x`, `u+x`, `a+x`, `ug+x`) or octal
+        // (`755`, `0755`, `+7`). We accept ANY token that either
+        // contains `+x` / `=x` / `u+x` / `a+x` OR is a three/four-
+        // digit octal whose user/group/other bit has the exec (1) bit
+        // set.
+        let mut has_exec_mode = false;
+        let mut targets: Vec<&str> = Vec::new();
+        for a in args {
+            if a.starts_with('-') {
+                continue;
+            }
+            if is_chmod_exec_mode_token(a) {
+                has_exec_mode = true;
+                continue;
+            }
+            targets.push(a);
+        }
+        if !has_exec_mode {
+            continue;
+        }
+        for t in &targets {
+            if path_in_attacker_writable_dir(t) {
+                return Some(format!(
+                    "blocked: `chmod +x {t}` — granting execute to a \
+                     file in an attacker-writeable directory \
+                     (/tmp, /var/tmp, /dev/shm, ~/Downloads, ~/.cache). \
+                     This is the typical download-stage-chmod-run \
+                     amplifier — rewrite the workflow to put the \
+                     binary in a user-owned directory the agent \
+                     didn't write into.",
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Is `tok` a chmod mode argument that grants execute permission?
+/// Handles symbolic (`+x`, `u+x`, `a+x`, `=rwx`) and octal (`755`,
+/// `0755`, etc.) forms. Conservative — unknown shapes return false.
+fn is_chmod_exec_mode_token(tok: &str) -> bool {
+    if tok.contains("+x") || tok.contains("=x") {
+        return true;
+    }
+    // Octal: 3 or 4 digit string, each digit 0-7. The LAST three
+    // digits are user/group/other; the execute bit is 0o1 on each.
+    let digits_only = tok.chars().all(|c| c.is_ascii_digit());
+    if digits_only && (3..=4).contains(&tok.len()) {
+        if let Ok(n) = u32::from_str_radix(tok, 8) {
+            let u = (n >> 6) & 0o7;
+            let g = (n >> 3) & 0o7;
+            let o = n & 0o7;
+            if (u & 0o1) != 0 || (g & 0o1) != 0 || (o & 0o1) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// System-owned attacker-writeable directories where a `chmod +x`
+/// of a staged file is suspicious (see `path_in_attacker_writable_dir`).
+const ATTACKER_WRITEABLE_SYSTEM_DIRS: &[&str] = &[
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/private/tmp/", // macOS canonical /tmp
+    "/private/var/tmp/",
+];
+
+/// Home-relative subdirectories in the attacker-writeable set —
+/// anything an agent-downloaded payload typically lands under.
+const ATTACKER_WRITEABLE_HOME_SUBDIRS: &[&str] = &[
+    "Downloads",
+    ".cache",
+    "Library/Caches",
+];
+
+/// Is `path` in a well-known attacker-writeable directory where a
+/// `chmod +x` is highly suspicious? Expands leading `~` using $HOME.
+fn path_in_attacker_writable_dir(path: &str) -> bool {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    for d in ATTACKER_WRITEABLE_SYSTEM_DIRS {
+        if trimmed.starts_with(d) {
+            return true;
+        }
+    }
+    for sub in ATTACKER_WRITEABLE_HOME_SUBDIRS {
+        let tilde = format!("~/{sub}/");
+        if trimmed.starts_with(&tilde) {
+            return true;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        for sub in ATTACKER_WRITEABLE_HOME_SUBDIRS {
+            let full = format!("{home}/{sub}/");
+            if trimmed.starts_with(&full) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Deny scripting-language stages (python/perl/ruby/node/php/awk
+/// and friends) that carry inline code which, as a string, contains
+/// a curl-to-shell / secret-exfil / reverse-shell shape.
+///
+/// `python -c 'import os; os.system("curl | bash")'` bypasses the
+/// bash-centric H1/M1 stack because the inner code never becomes a
+/// bash pipeline. We can't interpret arbitrary Python — but we CAN
+/// string-scan the inline code for the same markers (network-tool
+/// word + secret path or env-dumper, or `/dev/tcp/`) that already
+/// classify staged-exfil bash payloads.
+///
+/// False-positive risk: a Python script that legitimately calls
+/// `curl` via subprocess is rare from an agent; scripts that
+/// mention both `curl` AND a credential path are rarer still. The
+/// scanner uses the same high-precision filter as M2 rather than a
+/// blunt `has_curl` check.
+///
+/// 1.2.0 5th-pass adversarial review (Claude SEVERE S-2).
+fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
+    for stage in &pipeline.stages {
+        let bn = stage_bn_lc(stage);
+        let bn = bn.as_str();
+        // Scripting languages whose `-c` / `-e` / `-r` / `BEGIN{…}`
+        // form runs inline code that can call a subshell.
+        let inline = match bn {
+            "python" | "python2" | "python3" | "python3.10" | "python3.11"
+            | "python3.12" | "python3.13" | "python3.14" => {
+                extract_after_flag(&stage.args, "-c")
+            }
+            "perl" => {
+                extract_after_flag(&stage.args, "-e")
+                    .or_else(|| extract_after_flag(&stage.args, "-E"))
+            }
+            "ruby" => {
+                extract_after_flag(&stage.args, "-e")
+                    .or_else(|| extract_after_flag(&stage.args, "-rubygems"))
+            }
+            "node" | "nodejs" | "deno" | "bun" => {
+                extract_after_flag(&stage.args, "-e")
+                    .or_else(|| extract_after_flag(&stage.args, "-p"))
+                    .or_else(|| extract_after_flag(&stage.args, "--eval"))
+                    .or_else(|| extract_after_flag(&stage.args, "--print"))
+            }
+            "php" => extract_after_flag(&stage.args, "-r"),
+            "lua" | "lua5.1" | "lua5.2" | "lua5.3" | "lua5.4"
+            | "luajit" | "tclsh" | "rscript" => {
+                extract_after_flag(&stage.args, "-e")
+            }
+            // awk/gawk/mawk: the PROGRAM positional (after all flags)
+            // is the inline code. Detect by scanning for BEGIN/END
+            // action blocks with system() / getline "| sh".
+            "awk" | "gawk" | "mawk" | "nawk" => awk_program_string(&stage.args),
+            _ => None,
+        };
+        let Some(code) = inline else {
+            continue;
+        };
+        // The high-precision multi-signal scanner — same criteria M2
+        // uses for staged-exfil bash payloads.
+        if scan_payload_for_exfil(&code) {
+            return Some(format!(
+                "blocked: `{bn}` inline code contains a curl-to-shell \
+                 / secret-exfil / reverse-shell shape. Scripting \
+                 languages can spawn shells (os.system, subprocess, \
+                 system(), exec(), child_process.execSync) just like \
+                 `bash -c`, so the shape is classified identically.",
+            ));
+        }
+        // Extra: explicit `/bin/sh -c` / `/bin/bash -c` literal in
+        // the inline string is a direct amplifier regardless of
+        // secret/env context.
+        let lower = code.to_ascii_lowercase();
+        if lower.contains("system(\"curl") || lower.contains("system('curl")
+            || lower.contains("execsync(\"curl") || lower.contains("execsync('curl")
+            || lower.contains("system(\"wget") || lower.contains("system('wget")
+        {
+            return Some(format!(
+                "blocked: `{bn}` inline code calls a subprocess \
+                 (`system`/`execSync`) to run curl/wget — \
+                 download-and-execute shape via scripting language.",
+            ));
+        }
+    }
+    None
+}
+
+/// Return the argv element after `flag`, handling both separated
+/// (`-c CODE`) and attached (`-cCODE`, `-c=CODE`) forms.
+fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == flag {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(rest) = a.strip_prefix(&format!("{flag}=")) {
+            return Some(rest.to_string());
+        }
+        // Attached form: `-cSTR` where STR starts immediately.
+        if let Some(rest) = a.strip_prefix(flag) {
+            if !rest.is_empty() && !rest.starts_with('=') {
+                return Some(rest.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// For `awk 'PROGRAM' [file...]`, return the PROGRAM text — it's the
+/// first positional after any flags. Value-taking flags in awk: `-F`
+/// (field separator), `-v` (assignment), `-f` (program file).
+fn awk_program_string(args: &[String]) -> Option<String> {
+    let value_taking = ["-F", "-v", "-f", "--field-separator", "--assign", "--file"];
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if !a.starts_with('-') {
+            return Some(a.clone());
+        }
+        if value_taking.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") && a.contains('=') {
+            i += 1;
+            continue;
+        }
+        // Attached short (`-Fx`, `-vVAR=x`) — no skip.
+        if let Some(rest) = a.strip_prefix("-F").or_else(|| a.strip_prefix("-v")).or_else(|| a.strip_prefix("-f")) {
+            if !rest.is_empty() {
+                i += 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Deny well-known `git -c KEY=VALUE` RCE channels and adjacent
