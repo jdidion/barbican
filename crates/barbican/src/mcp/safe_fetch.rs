@@ -335,8 +335,24 @@ fn wrap(outcome: &FetchOutcome) -> String {
     )
 }
 
+/// Opaque user-visible error message for every DNS / IP / network
+/// target classification. Collapsing the wording across NXDOMAIN,
+/// RFC1918-resolve, loopback-resolve, raw-IP-literal, blocked-range,
+/// and bad-scheme paths closes the network-reachability side channel
+/// flagged as a 1.2.1 MEDIUM: an attacker prompt iterating hostnames
+/// could otherwise read different reachability states from the error
+/// phrasing.
+///
+/// The richer detail still lands in the local audit log (see the
+/// `tracing::warn!` call in [`render_error`]) — the audit log is
+/// local-only, not exposed to the model.
+const OPAQUE_FETCH_ERROR: &str = "target cannot be fetched";
+
 fn render_error(url: &str, err: &FetchError) -> String {
-    wrap_render_error(url, &err.to_string())
+    // Log the specific reason locally (audit-log channel, not exposed
+    // to the model) so operators can still diagnose failures.
+    tracing::warn!(url = url, error = %err, "safe_fetch: refused");
+    wrap_render_error(url, OPAQUE_FETCH_ERROR)
 }
 
 /// Minimum effective body cap regardless of env. Prevents
@@ -427,7 +443,73 @@ mod tests {
         let e = FetchError::Reject(RejectReason::BadScheme);
         let s = render_error("file:///etc/passwd", &e);
         assert!(s.starts_with("<barbican-error "));
-        assert!(s.contains("refused non-http"));
+        // 1.2.1: every fetch error surface the same opaque message to
+        // close the DNS-reachability side channel. See OPAQUE_FETCH_ERROR.
+        assert!(
+            s.contains(OPAQUE_FETCH_ERROR),
+            "error body must be the opaque message; got: {s}"
+        );
+    }
+
+    // --- Regression test for 1.2.1 MEDIUM: DNS-reachability side channel ---
+
+    #[test]
+    fn render_error_is_opaque_across_dns_ip_and_scheme_variants() {
+        // Each of these failure modes used to produce a DIFFERENT
+        // user-visible error string (DNS resolution failed / raw IP
+        // literals rejected / IP address in blocked range / refused
+        // non-http). An attacker prompt could iterate candidate hosts
+        // and read reachability status from the error phrasing. Fix:
+        // collapse all DNS-/IP-/scheme-class errors to one opaque
+        // message.
+        let cases = [
+            // NXDOMAIN-style DNS failure.
+            FetchError::Dns("no A/AAAA records for nope.invalid".to_string()),
+            // Loopback resolves to 127.0.0.1.
+            FetchError::Reject(RejectReason::BlockedIp("loopback (127.0.0.0/8)")),
+            // RFC1918 resolves to 10.x / 192.168.x.
+            FetchError::Reject(RejectReason::BlockedIp("RFC1918 private (10.0.0.0/8)")),
+            // Raw IP literal rejected without env override.
+            FetchError::Reject(RejectReason::RawIpLiteral),
+            // Bad scheme.
+            FetchError::Reject(RejectReason::BadScheme),
+            // No host component.
+            FetchError::Reject(RejectReason::NoHost),
+        ];
+        let mut messages: Vec<String> = Vec::new();
+        for err in &cases {
+            let s = render_error("https://probe.example/", err);
+            assert!(s.starts_with("<barbican-error "));
+            messages.push(s);
+        }
+        let first = messages[0].clone();
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(
+                m, &first,
+                "variant {i} produced a DIFFERENT user-visible error \
+                 string — reachability side channel still open:\n  \
+                 first={first}\n  this ={m}"
+            );
+            assert!(
+                m.contains(OPAQUE_FETCH_ERROR),
+                "variant {i} missing the opaque message: {m}"
+            );
+            // Negative assertions: none of the pre-fix discriminating
+            // phrases may appear in the user-visible output.
+            for forbidden in [
+                "DNS resolution failed",
+                "no A/AAAA records",
+                "IP address in blocked range",
+                "raw IP literals rejected",
+                "refused non-http",
+                "URL has no host",
+            ] {
+                assert!(
+                    !m.contains(forbidden),
+                    "variant {i} leaked detail `{forbidden}`: {m}"
+                );
+            }
+        }
     }
 
     // --- Regression tests for M4 adversarial review ------------------

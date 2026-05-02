@@ -1912,6 +1912,33 @@ fn ssh_dash_f_dev_stdin_denies() {
     assert_eq!(run_pre_bash(&bash_input("ssh -F /dev/stdin host")), 2,);
 }
 
+// 1.2.1 adversarial-review follow-up: `/dev/fd/<N>` is another way
+// to feed an attacker-controlled config via a redirect. The 8th-pass
+// fix already matches `starts_with("/dev/fd/")`; pin the branch with
+// explicit red tests so a future regression can't silently narrow it.
+
+#[test]
+fn ssh_dash_f_dev_fd_3_denies() {
+    // The explicit 1.2.1 follow-up shape: `ssh -F /dev/fd/3` uses a
+    // bash `exec 3<<EOF …` redirect to feed an attacker-controlled
+    // config. `/dev/fd/0` is equivalent to /dev/stdin which is
+    // already covered above; /dev/fd/3+ is the non-stdin branch
+    // that this test pins.
+    assert_eq!(run_pre_bash(&bash_input("ssh -F /dev/fd/3 host")), 2,);
+}
+
+#[test]
+fn ssh_dash_f_dev_fd_0_denies() {
+    // /dev/fd/0 is a common stdin alias.
+    assert_eq!(run_pre_bash(&bash_input("ssh -F /dev/fd/0 host")), 2,);
+}
+
+#[test]
+fn ssh_dash_f_dev_fd_9_denies() {
+    // Higher-numbered FDs (bash allows up to 9 for user redirects).
+    assert_eq!(run_pre_bash(&bash_input("ssh -F /dev/fd/9 host")), 2,);
+}
+
 #[test]
 fn ssh_dash_f_system_config_still_allows() {
     assert_eq!(

@@ -65,72 +65,173 @@ const fn is_invisible(c: char) -> bool {
     )
 }
 
-/// Strip `<script>` / `<style>` / HTML-comment blocks from `s`.
+/// Strip executable / loader HTML tags (`<script>`, `<style>`,
+/// `<iframe>`, `<object>`, `<embed>`, `<noscript>`, `<template>`,
+/// `<svg>` with `onload=`, `<meta http-equiv="refresh">`) + HTML
+/// comments from `s`.
 ///
 /// `safe_fetch` returns HTML bodies wrapped in `<untrusted-content>`
 /// sentinels; before wrapping we drop the tag bodies that are most
-/// likely to carry injection payloads or obfuscated code. This is not
-/// a real HTML parser — it uses non-greedy regexes with the `(?s)` dot-
-/// matches-newline flag. That is enough for the threat model: an
-/// attacker can still leave plain `<p>` text to talk to the model, but
-/// can't hide code inside a `<script>` block or an HTML comment.
+/// likely to carry injection payloads, obfuscated code, or loader
+/// pivots (iframes/objects fetch more content; `<meta refresh>`
+/// redirects; `<svg onload=>` executes on parse in many renderers;
+/// `<template>`/`<noscript>` are common places to stash HTML that
+/// the model might try to "render"). This is not a real HTML parser
+/// — it uses non-greedy regexes with the `(?s)` dot-matches-newline
+/// flag. That is enough for the threat model: the model still sees
+/// plain text inside `<untrusted-content>` (as data, not
+/// instructions), but the visual surface is cleaner.
 ///
-/// The regex is intentionally loose around the tag — `<script` with
+/// The regexes are intentionally loose around the tag — `<name` with
 /// any attributes up to the closing `>`, then the shortest match to
-/// `</script>`. Same for `<style>`. HTML comments match `<!--` to the
-/// next `-->`.
+/// `</name>`. Self-closing / void forms (`<meta …>`, `<embed …/>`)
+/// match a single tag without a closing pair. HTML comments match
+/// `<!--` to the next `-->`.
+///
+/// 1.2.1 L-6 adversarial review: pre-1.2.1 only `<script>`, `<style>`,
+/// and HTML comments were stripped; the rest leaked through.
 #[must_use]
 pub fn strip_html_tags(s: &str) -> String {
     strip_html_tags_attributed(s).0
 }
 
 /// Like [`strip_html_tags`] but also returns a bitset describing which
-/// of the three sub-regexes actually removed bytes. Used by `inspect`
-/// to attribute findings precisely — we only claim "removed <script>"
-/// if the script regex itself removed bytes, not just any of the
-/// three. This is the tight guard that closes the false-positive
-/// attribution case from the Phase-10 adversarial review.
+/// of the sub-regexes actually removed bytes. Used by `inspect` to
+/// attribute findings precisely — we only claim "removed <script>"
+/// if the script regex itself removed bytes. This is the tight guard
+/// that closes the false-positive attribution case from the Phase-10
+/// adversarial review.
+///
+/// 1.2.1 L-6 adversarial review: widened the removal set to iframe,
+/// object, embed, noscript, template, svg (whole tree — includes
+/// `<svg onload=>`), and `<meta http-equiv="refresh">`. These all
+/// collapse into the single `removed_executable` bit since the
+/// `inspect` surface doesn't need to distinguish which kind fired.
 #[must_use]
 pub fn strip_html_tags_attributed(s: &str) -> (String, HtmlStripHits) {
-    let (script, style, comment) = html_tag_regexes();
+    let res = html_tag_regexes();
     let mut hits = HtmlStripHits::default();
 
-    let after_script = script.replace_all(s, "");
+    let after_script = res.script.replace_all(s, "");
     hits.removed_script = after_script.len() != s.len();
-    let after_style = style.replace_all(&after_script, "");
+    let after_style = res.style.replace_all(&after_script, "");
     hits.removed_style = after_style.len() != after_script.len();
-    let after_comment = comment.replace_all(&after_style, "");
-    hits.removed_comment = after_comment.len() != after_style.len();
+
+    // Widened set: fires on any of the loader / pivot / executable
+    // tags listed above. Attributed as a single bit because the inspect
+    // surface only cares that "an executable-class tag was removed",
+    // not which one.
+    let mut after_executable = after_style;
+    let mut executable_fired = false;
+    for re in &res.executable {
+        let next = re.replace_all(&after_executable, "");
+        if next.len() != after_executable.len() {
+            executable_fired = true;
+        }
+        after_executable = std::borrow::Cow::Owned(next.into_owned());
+    }
+    hits.removed_executable = executable_fired;
+
+    let after_comment = res.comment.replace_all(&after_executable, "");
+    hits.removed_comment = after_comment.len() != after_executable.len();
 
     (after_comment.into_owned(), hits)
 }
 
 /// Which HTML sub-strippers actually removed bytes in a given call.
+///
+/// Each field is an independent attribution signal for `inspect` —
+/// they're not mutually exclusive (a document can have both a script
+/// block and an iframe) and they're not orderable. A four-variant
+/// enum + a `set()` helper would be strictly worse ergonomically,
+/// so we lint-allow the "too many bools" suggestion.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent attribution signal for the inspect tool"
+)]
 pub struct HtmlStripHits {
     pub removed_script: bool,
     pub removed_style: bool,
     pub removed_comment: bool,
+    /// True if any of the 1.2.1-widened loader/pivot/executable tags
+    /// (`<iframe>`, `<object>`, `<embed>`, `<noscript>`, `<template>`,
+    /// `<svg …>`, `<meta http-equiv="refresh" …>`) was removed.
+    pub removed_executable: bool,
 }
 
 impl HtmlStripHits {
     #[must_use]
     pub fn any(&self) -> bool {
-        self.removed_script || self.removed_style || self.removed_comment
+        self.removed_script || self.removed_style || self.removed_comment || self.removed_executable
     }
 }
 
-fn html_tag_regexes() -> (&'static Regex, &'static Regex, &'static Regex) {
+/// Compiled regexes for [`strip_html_tags_attributed`]. Each regex is
+/// loose around attributes — `<name` with anything up to the closing
+/// `>`, then shortest-match to the closing tag.
+struct HtmlTagRegexes {
+    script: &'static Regex,
+    style: &'static Regex,
+    comment: &'static Regex,
+    /// Loader / pivot / executable-class tags. Attributed as a single
+    /// bit; ordered by rough likelihood-of-appearance so the early
+    /// patterns short-circuit on most inputs.
+    executable: Vec<&'static Regex>,
+}
+
+fn html_tag_regexes() -> HtmlTagRegexes {
     static SCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static STYLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static COMMENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    (
-        SCRIPT_RE
+    // 1.2.1 L-6: loader/pivot/executable-class tags.
+    static IFRAME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static OBJECT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static EMBED_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static NOSCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static TEMPLATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static SVG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static META_REFRESH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let executable = vec![
+        IFRAME_RE
+            .get_or_init(|| Regex::new(r"(?si)<iframe\b[^>]*>.*?</iframe>").expect("iframe regex")),
+        OBJECT_RE
+            .get_or_init(|| Regex::new(r"(?si)<object\b[^>]*>.*?</object>").expect("object regex")),
+        // <embed …> and <embed …/> are void elements with no close tag.
+        EMBED_RE.get_or_init(|| Regex::new(r"(?si)<embed\b[^>]*/?\s*>").expect("embed regex")),
+        NOSCRIPT_RE.get_or_init(|| {
+            Regex::new(r"(?si)<noscript\b[^>]*>.*?</noscript>").expect("noscript regex")
+        }),
+        TEMPLATE_RE.get_or_init(|| {
+            Regex::new(r"(?si)<template\b[^>]*>.*?</template>").expect("template regex")
+        }),
+        // <svg …>…</svg> covers `<svg onload=…>` and friends by
+        // removing the whole SVG subtree. Narrower-than-parsing but
+        // safer than trying to pick individual event-handler
+        // attributes out of live markup.
+        SVG_RE.get_or_init(|| Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").expect("svg regex")),
+        // <meta http-equiv="refresh" …> is void. Match any `<meta …>`
+        // that carries an http-equiv attribute with "refresh" (case
+        // insensitive). Other meta tags (charset, description,
+        // og:…) pass through unchanged.
+        META_REFRESH_RE.get_or_init(|| {
+            Regex::new(
+                r#"(?si)<meta\b[^>]*\bhttp-equiv\s*=\s*(?:"refresh"|'refresh'|refresh)[^>]*>"#,
+            )
+            .expect("meta refresh regex")
+        }),
+    ];
+
+    HtmlTagRegexes {
+        script: SCRIPT_RE
             .get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex")),
-        STYLE_RE
+        style: STYLE_RE
             .get_or_init(|| Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex")),
-        COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex")),
-    )
+        comment: COMMENT_RE
+            .get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex")),
+        executable,
+    }
 }
 
 /// NFKC-normalize `s`.
@@ -324,5 +425,113 @@ mod tests {
     fn strip_html_multiple_scripts() {
         let s = "<script>a</script>B<script>c</script>D";
         assert_eq!(strip_html_tags(s), "BD");
+    }
+
+    // --- 1.2.1 L-6: widened loader/pivot-tag stripping -------------------
+
+    #[test]
+    fn strip_html_removes_iframe() {
+        // The explicit finding shape from the 5th-pass Claude review.
+        let s = "<p>ok</p><iframe src=evil></iframe>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<iframe"), "iframe not stripped: {out}");
+        assert!(out.contains("<p>ok</p>"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn strip_html_removes_iframe_with_attrs_and_body() {
+        let s = "<iframe src=\"https://evil/x\" sandbox=\"allow-scripts\">fallback</iframe>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<iframe"));
+        assert!(!out.contains("fallback"));
+        assert_eq!(out, "after");
+    }
+
+    #[test]
+    fn strip_html_removes_object_tag() {
+        let s = "<object data=\"evil.swf\">alt</object>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<object"));
+        assert_eq!(out, "after");
+    }
+
+    #[test]
+    fn strip_html_removes_embed_void_tag() {
+        let s = "<p>ok</p><embed src=\"evil.swf\" type=\"application/x-shockwave-flash\">after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<embed"));
+        assert!(out.contains("ok"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn strip_html_removes_noscript() {
+        let s = "<noscript><iframe src=evil></iframe></noscript>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<noscript"));
+        assert_eq!(out, "after");
+    }
+
+    #[test]
+    fn strip_html_removes_template() {
+        let s = "<template id=\"t\"><script>evil()</script></template>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<template"));
+        assert!(!out.contains("<script"));
+        assert_eq!(out, "after");
+    }
+
+    #[test]
+    fn strip_html_removes_svg_with_onload() {
+        let s = "<p>ok</p><svg onload=\"alert(1)\"><circle/></svg>after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<svg"));
+        assert!(!out.contains("onload"));
+        assert!(out.contains("ok"));
+        assert!(out.contains("after"));
+    }
+
+    #[test]
+    fn strip_html_removes_meta_refresh() {
+        let s = "<meta http-equiv=\"refresh\" content=\"0;url=https://evil/\">after";
+        let out = strip_html_tags(s);
+        assert!(!out.contains("<meta"));
+        assert_eq!(out, "after");
+    }
+
+    #[test]
+    fn strip_html_preserves_benign_meta_tags() {
+        // `<meta charset>`, `<meta name=description>`, etc. must NOT
+        // be flagged — only `<meta http-equiv="refresh">` is the pivot.
+        let s = "<meta charset=\"utf-8\"><meta name=\"description\" content=\"x\">ok";
+        let out = strip_html_tags(s);
+        assert!(
+            out.contains("<meta charset") && out.contains("<meta name"),
+            "benign meta tags must be preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_html_attribution_sets_executable_bit() {
+        let s = "<iframe src=evil></iframe>";
+        let (_, hits) = strip_html_tags_attributed(s);
+        assert!(
+            hits.removed_executable,
+            "removed_executable must fire for iframe: {hits:?}"
+        );
+        assert!(!hits.removed_script);
+        assert!(!hits.removed_style);
+    }
+
+    #[test]
+    fn strip_html_attribution_is_per_pass_not_collective() {
+        // Removing an iframe must NOT set removed_script — the
+        // per-pass attribution was the whole point of the Phase-10
+        // refactor; widening the set shouldn't break that invariant.
+        let s = "<iframe src=evil></iframe>";
+        let (_, hits) = strip_html_tags_attributed(s);
+        assert!(!hits.removed_script);
+        assert!(hits.removed_executable);
     }
 }

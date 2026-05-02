@@ -199,14 +199,22 @@ pub static EXEC_TARGETS: Set<&'static str> = phf_set! {
 /// Commands that dump the user's environment (which typically contains
 /// secrets: API keys, access tokens, passwords). Piping these into a
 /// network tool is the env-exfil shape (Narthex parity).
+///
+/// 1.2.1 M-3 adversarial review: added `compgen` (`compgen -v` /
+/// `compgen -e`) and `typeset` (bash builtin alias of `declare`). Keep
+/// in lock-step with `env_dumper_word_regex` in `hooks/pre_bash.rs`.
 pub static ENV_DUMPERS: Set<&'static str> = phf_set! {
-    "env", "printenv", "export", "declare", "set",
+    "env", "printenv", "export", "declare", "set", "compgen", "typeset",
 };
 
 /// Broader network/exfil-channel set for M2. Wider than
 /// `NETWORK_TOOLS_HARD` (which is H1's tight curl|wget|nc|socat|ssh
 /// set) — M2 also cares about upload-style tools that write a local
 /// file directly to a remote host.
+///
+/// 1.2.1 M-2 adversarial review: added `aria2c`, `lftp`, `rclone`,
+/// `gsutil`, `aws`, `az`, `gcloud`. Keep in lock-step with
+/// `network_tool_word_regex` in `hooks/pre_bash.rs`.
 pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     // Direct transfer
     "curl", "wget", "nc", "ncat", "netcat", "socat",
@@ -214,6 +222,13 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     "dig", "host", "nslookup", "drill", "resolvectl",
     // Remote copy / sync
     "scp", "rsync", "sftp", "ftp", "tftp",
+    // Multi-protocol download/upload clients
+    "aria2c", "lftp",
+    // Cloud-storage movers — file upload to S3/GCS/Azure/Dropbox/etc.
+    "rclone", "gsutil",
+    // Cloud-provider CLIs with file-upload subcommands
+    // (`aws s3 cp -`, `az storage blob upload`, `gcloud storage cp`).
+    "aws", "az", "gcloud",
     // HTTP clients
     "http", "https", "httpie", "xh",
     // Mail clients (can be used for exfil)
