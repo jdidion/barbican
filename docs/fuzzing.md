@@ -24,12 +24,12 @@ cargo test -p barbican --test fuzz_properties
 
 ### Findings from layer 1
 
-The first two runs of the properties on the 1.3.0 branch caught two real bugs; they're pinned (one as an `#[ignore]`d test, one behind a `#[cfg(not(target_os = "linux"))]` gate in the file) rather than fixed in this PR. Fix-scope rule: the fuzzing-infrastructure PR adds the test; a follow-up PR fixes the underlying behavior.
+Two real bugs surfaced on the first runs of the 1.3.0 properties. One is now fixed; one remains pinned pending a reproducer.
 
-| Test | Shrunk input | Bug | Target release |
-| ---- | ------------ | --- | -------------- |
-| `pre_bash_hook_exit_contract_holds` | arbitrary non-UTF-8 bytes on stdin | `pre_bash::run` calls `stdin.read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow bubbles to `main`, exits 1. CLAUDE.md rule #1 (deny-by-default) demands the non-UTF-8 stdin path map to `EXIT_DENY=2` + reason-on-stderr, just like the malformed-JSON path added in 1.2.0 H-3. | 1.3.1 |
-| `parser_never_panics_on_bounded_utf8` (and its classifier-layer siblings, which reach `parse` through `classify_command`) | unknown (see note) | Linux-only: the test binary takes `SIGSEGV` within 180 ms of starting on Ubuntu (macOS passes cleanly). No per-input diagnostics flushed before the crash, so the shrunk reproducer is not yet in hand — only the pre-CI corpus bounds. Likely shape: a stack overflow or invalid memory access in the `tree-sitter-bash` FFI driven with arbitrary generated UTF-8. | 1.3.1 |
+| Test | Shrunk input | Bug | Status |
+| ---- | ------------ | --- | ------ |
+| `pre_bash_hook_exit_contract_holds` | arbitrary non-UTF-8 bytes on stdin | `pre_bash::run` called `stdin.read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow bubbled the error to `main` → exit 1. CLAUDE.md rule #1 demands the non-UTF-8 stdin path map to `EXIT_DENY=2` + reason-on-stderr, like the malformed-JSON path from 1.2.0 H-3. | **Fixed in 1.3.0**: read raw bytes, decode via `str::from_utf8`, mirror the JSON deny branch. Pinned by `non_utf8_stdin_denies_by_default` + `non_utf8_stdin_escape_hatch_allows_when_env_set` in `tests/pre_bash_h1.rs`; proptest property is now active. |
+| `parser_never_panics_on_bounded_utf8` (and its classifier-layer siblings, which reach `parse` through `classify_command`) | unknown (see note) | Linux-only: the test binary takes `SIGSEGV` within 180 ms of starting on Ubuntu (macOS passes cleanly). No per-input diagnostics flushed before the crash, so the shrunk reproducer is not yet in hand — only the pre-CI corpus bounds. Likely shape: a stack overflow or invalid memory access in the `tree-sitter-bash` FFI driven with arbitrary generated UTF-8. | **Pinned pending repro**: properties that reach `parse` are gated behind `#[cfg(not(target_os = "linux"))]`; `validate_url` and `path_in_attacker_writable_dir` run on every platform. |
 
 Open investigation thread for the Linux-segfault finding: run the generated `proptest` inputs one at a time under `valgrind` / `rr` on an Ubuntu host, log each input before the parser call, and reduce the first crashing case by hand. Once reproduced, the fix lands the same way every other classifier finding has: red-test-first under the minimized input, then the code change.
 

@@ -175,18 +175,14 @@ proptest! {
     /// 8 MiB on 32 proptest cases would balloon CI runtime for no
     /// additional coverage on the exit-code contract.
     ///
-    /// Ignored pending a fix for the bug this property caught on
-    /// 1.3.0 branch (see `docs/fuzzing.md` "Findings from layer 1").
-    /// When the proptest is first added (2026-05-01) it shrunk to a
-    /// minimal failing case of ~4 KiB of arbitrary bytes on stdin.
-    /// `pre_bash::run` calls `stdin.read_to_string(&mut buf)`, which
-    /// propagates an anyhow error on non-UTF-8 input — anyhow's
-    /// `Result<()>` return bubbles to `main` and exits with code 1,
-    /// violating CLAUDE.md rule #1 (deny-by-default: non-UTF-8 stdin
-    /// should map to EXIT_DENY=2 with a reason written to stderr,
-    /// just like the malformed-JSON path added in 1.2.0 H-3).
-    /// Filed as follow-up for 1.3.1 or a successor fix PR.
-    #[ignore = "finds real bug: non-UTF-8 stdin → exit 1 instead of deny-by-default 2"]
+    /// Red-test-first: on the 1.3.0 branch this property shrunk to
+    /// ~4 KiB of arbitrary bytes on stdin, which fed into
+    /// `stdin.read_to_string(&mut buf)` bubbled a UTF-8 error out of
+    /// `main` as exit code 1 — violating CLAUDE.md rule #1
+    /// (non-UTF-8 stdin should map to `EXIT_DENY=2` with a reason on
+    /// stderr, like the malformed-JSON path from 1.2.0 H-3). Fixed
+    /// by reading raw bytes and decoding through `str::from_utf8`
+    /// with an explicit deny branch mirroring the JSON path.
     #[test]
     fn pre_bash_hook_exit_contract_holds(
         input in prop::collection::vec(any::<u8>(), 0..8192)

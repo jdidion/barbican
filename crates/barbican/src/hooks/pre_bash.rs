@@ -83,10 +83,38 @@ pub(crate) enum Decision {
 /// DoS on the user's session. The real deny-by-default fires at the
 /// `parse()` layer once we have a command to inspect.
 pub fn run() -> Result<()> {
-    let mut buf = String::new();
+    // Read raw bytes, not a `String`, so non-UTF-8 stdin doesn't
+    // bubble a read-error out of `main` as exit code 1. Discovered
+    // by the 1.3.0 proptest layer: arbitrary bytes on stdin would
+    // hit `read_to_string`'s UTF-8 validation, return `Err`, and the
+    // anyhow `?` would exit 1 — violating CLAUDE.md rule #1
+    // (deny-by-default should map to EXIT_DENY=2 with a reason on
+    // stderr, mirroring the malformed-JSON path below).
+    let mut raw = Vec::new();
     std::io::stdin()
-        .read_to_string(&mut buf)
+        .read_to_end(&mut raw)
         .context("reading pre-bash hook JSON from stdin")?;
+
+    let buf = match std::str::from_utf8(&raw) {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            if env_flag("BARBICAN_ALLOW_MALFORMED_HOOK_JSON") {
+                tracing::warn!(
+                    error = %e,
+                    "pre-bash: non-UTF-8 stdin — allowing \
+                     (BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1)"
+                );
+                std::process::exit(EXIT_ALLOW);
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican: non-UTF-8 stdin ({e}) — denying. \
+                 Set BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1 to revert \
+                 to allow-on-fail while you investigate."
+            );
+            std::process::exit(EXIT_DENY);
+        }
+    };
 
     let parsed: HookInput = if buf.trim().is_empty() {
         HookInput {
