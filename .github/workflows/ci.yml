@@ -84,6 +84,7 @@ jobs:
     env:
       BARBICAN_LINUX_REPRO: "1"
       BARBICAN_REPRO_LOG: ${{ github.workspace }}/barbican-repro.txt
+      BARBICAN_BISECT_LOG: ${{ github.workspace }}/barbican-bisect.txt
       # Widen proptest's per-test case count so a single job has a
       # realistic chance of tripping the crash. Default is 256.
       PROPTEST_CASES: "8192"
@@ -92,6 +93,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-fuzz-repro
+      - name: Bisect the captured crasher (if one is pinned)
+        # The bisect harness is in `tests/linux_crash_bisect.rs`. Tests
+        # run serially (`--test-threads=1`) so the bisect log is
+        # strictly-ordered and the last line of the log is the last
+        # prefix length attempted before any crash.
+        #
+        # `|| true` so a crash here doesn't mask the subsequent
+        # proptest repro step — we want both artifacts from the same
+        # CI run.
+        run: |
+          cargo test --test linux_crash_bisect --release -- \
+            --nocapture --test-threads=1 || true
       - name: Run the repro harness
         # The harness is in `tests/linux_repro.rs`. It's a normal
         # `#[test]` so regular `cargo test` picks it up, but the
@@ -102,15 +115,29 @@ jobs:
       - name: Report run outcome
         if: always()
         run: |
-          echo "Repro log size: $(wc -c < barbican-repro.txt 2>/dev/null || echo 0) bytes"
-          echo "Last 3 entries:"
+          echo "=== repro log ==="
+          echo "size: $(wc -c < barbican-repro.txt 2>/dev/null || echo 0) bytes"
+          echo "last 3 entries:"
           tail -n 3 barbican-repro.txt 2>/dev/null || echo "(log empty or missing)"
+          echo ""
+          echo "=== bisect log ==="
+          echo "size: $(wc -c < barbican-bisect.txt 2>/dev/null || echo 0) bytes"
+          echo "full contents:"
+          cat barbican-bisect.txt 2>/dev/null || echo "(log empty or missing)"
       - name: Upload repro log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-fuzz-repro-log
           path: barbican-repro.txt
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload bisect log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-fuzz-bisect-log
+          path: barbican-bisect.txt
           if-no-files-found: warn
           retention-days: 14
 
