@@ -199,8 +199,12 @@ pub static EXEC_TARGETS: Set<&'static str> = phf_set! {
 /// Commands that dump the user's environment (which typically contains
 /// secrets: API keys, access tokens, passwords). Piping these into a
 /// network tool is the env-exfil shape (Narthex parity).
+///
+/// 1.2.1 M-3 adversarial review: added `compgen` (`compgen -v` /
+/// `compgen -e`) and `typeset` (bash builtin alias of `declare`). Keep
+/// in lock-step with `env_dumper_word_regex` in `hooks/pre_bash.rs`.
 pub static ENV_DUMPERS: Set<&'static str> = phf_set! {
-    "env", "printenv", "export", "declare", "set",
+    "env", "printenv", "export", "declare", "set", "compgen", "typeset",
 };
 
 /// Broader network/exfil-channel set for M2. Wider than

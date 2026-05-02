@@ -1490,6 +1490,10 @@ fn secret_path_regex() -> &'static regex::Regex {
                 | /etc/shadow\b
                 | ~/Library/Keychains\b
                 | \.pgpass\b
+                # 1.2.1 M-3: the live-process environment on Linux.
+                # Same exfil surface as `env | curl`, but accessed via
+                # a file read so the env-dumper regex missed it.
+                | /proc/self/environ\b
               )",
         )
         .case_insensitive(true)
@@ -2899,21 +2903,34 @@ fn is_persistence_target(path: &str) -> bool {
 /// - credential path AND network tool appear together
 /// - env-dump tool AND network tool appear together
 /// - `/dev/tcp` or `/dev/udp` reverse-shell marker appears
+/// - `/proc/self/environ` (the live-environment bytes file on Linux)
+///   appears alongside a network tool — pairing it with curl / wget /
+///   nc is the same env-exfil shape as `env | curl`, just via a file-
+///   read path that misses the whole-word dumper regex. 1.2.1 M-3
+///   adversarial review.
 fn scan_payload_for_exfil(payload: &str) -> bool {
     let has_secret = secret_path_regex().is_match(payload);
     let has_net = network_tool_word_regex().is_match(payload);
     let has_env = env_dumper_word_regex().is_match(payload);
-    if has_net && (has_secret || has_env) {
+    let has_environ_file = payload.contains("/proc/self/environ");
+    if has_net && (has_secret || has_env || has_environ_file) {
         return true;
     }
     payload.contains("/dev/tcp/") || payload.contains("/dev/udp/")
 }
 
 /// Whole-word env-dumper regex (lock-step with `ENV_DUMPERS`).
+///
+/// 1.2.1 M-3 adversarial review: added `compgen`, `typeset`. Both are
+/// bash builtins that dump variable state equivalent to `declare -p`
+/// / `set`. Without them, `compgen -v | curl -X POST …` (a clean
+/// env-exfil shape) slips past the env-dump-to-network classifier.
+/// `/proc/self/environ` is handled separately in scan_payload_for_exfil
+/// because it's a path substring, not a word boundary.
 fn env_dumper_word_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(?:env|printenv|export|declare|set)\b")
+        regex::Regex::new(r"(?i)\b(?:env|printenv|export|declare|set|compgen|typeset)\b")
             .expect("env-dumper regex compiles")
     })
 }
