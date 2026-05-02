@@ -417,6 +417,15 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
             | "command"
             | "builtin"
             | "exec"
+            // 1.2.0 5th-pass review (GPT SEVERE #2):
+            // re-exec / sandbox fronts.
+            | "unshare"
+            | "systemd-run"
+            | "chpst"
+            // Applet multiplexers — `busybox APPLET args` invokes the
+            // bundled applet, so the rest of argv is the inner command.
+            | "busybox"
+            | "toybox"
     ) {
         return extract_prefix_runner_command(basename, &stage.args);
     }
@@ -676,6 +685,20 @@ fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
             // `time -p`, `-o FILE`, `-f FORMAT` are `/usr/bin/time` flags
             // (the builtin accepts no flags). `-o` / `-f` take values.
             | ("time", "-o" | "--output" | "-f" | "--format")
+            // 1.2.0 5th-pass review value-taking flags:
+            // `unshare`: `-S UID`, `-G GID`, `--setgroups all|deny`,
+            // `-C bitmap`, `--propagation shared|private|slave|unchanged`.
+            | ("unshare", "-S" | "-G" | "--setgroups" | "-C" | "--propagation")
+            // `systemd-run`: `-u UNIT`, `-p PROP=VAL`, `-E VAR=VAL`,
+            // `--on-active=T`, `--on-boot=T`, etc. — the long forms use
+            // `=` so they're handled elsewhere; short standalones are
+            // covered here.
+            | ("systemd-run", "-u" | "-p" | "-E")
+            // `chpst`: value-taking short flags.
+            | (
+                "chpst",
+                "-u" | "-U" | "-e" | "-n" | "-o" | "-m" | "-l" | "-L" | "-/"
+            )
     )
 }
 

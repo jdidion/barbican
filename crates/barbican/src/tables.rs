@@ -88,6 +88,17 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "command", // command [-pVv] <cmd>  (bypasses function shadowing)
     "builtin", // builtin <cmd>
     "exec",    // exec [-cl] [-a NAME] <cmd>
+    // 1.2.0 5th-pass review (GPT SEVERE #2): sandboxing / re-exec
+    // fronts. All four take a prefix-runner shape (`unshare -r bash`,
+    // `systemd-run --pipe bash`, `chpst -u nobody bash`). busybox /
+    // toybox are also APPLET MULTIPLEXERS: `busybox sh`, `busybox
+    // wget -qO- URL` invoke their bundled applet. Handled as both a
+    // wrapper and in the applet-aware extractor.
+    "unshare",     // unshare [-r] [-m] [--user] CMD
+    "systemd-run", // systemd-run [--pipe] [--wait] [--scope] CMD
+    "chpst",       // chpst [-u user] [-e ENVDIR] CMD
+    "busybox",     // busybox APPLET [args] — applet ~= argv[0] for classify
+    "toybox",      // toybox APPLET [args] — same shape as busybox
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.
