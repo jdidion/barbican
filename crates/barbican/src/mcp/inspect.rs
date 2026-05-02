@@ -99,6 +99,16 @@ pub fn inspect(text: &str) -> (String, Vec<String>) {
     if hits.removed_comment {
         findings.push("removed HTML comment blocks".to_string());
     }
+    if hits.removed_executable {
+        // 1.2.1 L-6: iframe / object / embed / noscript / template /
+        // svg / meta refresh — loader and pivot tags that shouldn't be
+        // interpreted as instructions even inside `<untrusted-content>`.
+        findings.push(
+            "removed HTML loader/pivot tags \
+             (<iframe>/<object>/<embed>/<noscript>/<template>/<svg>/<meta refresh>)"
+                .to_string(),
+        );
+    }
 
     // NFKC + confusables fold — catches `іgnore` / `ｉｇｎｏｒｅ`.
     let normalized = normalize_for_scan(&stripped_html);
