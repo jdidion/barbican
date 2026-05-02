@@ -65,3 +65,8 @@ tempfile = "3.13"
 # Local HTTP mock server for safe_fetch integration tests. Dev-only —
 # does not affect release build size or runtime.
 wiremock = "0.6"
+# Property-based testing for the 1.3.0 fuzzing infrastructure. Dev-only;
+# runs under `cargo test` on stable Rust. Cargo-fuzz (nightly) lives in
+# `crates/barbican/fuzz/` and is workspace-excluded so stable users
+# building the main tree never touch it.
+proptest = "1.5"

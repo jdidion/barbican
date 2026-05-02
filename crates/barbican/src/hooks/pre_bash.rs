@@ -64,8 +64,11 @@ struct ToolInput {
 
 /// The classifier's output. A `Deny` carries a short human-readable
 /// reason surfaced on stderr so the user sees why the call was blocked.
+///
+/// `pub(crate)` so the `__fuzz` module can re-export it to property
+/// tests and fuzz targets without widening the module's main surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Decision {
+pub(crate) enum Decision {
     Allow,
     Deny { reason: String },
 }
@@ -147,9 +150,62 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Internal, unstable surface exposed via `barbican::__fuzz` so the
+/// 1.3.0 proptest properties and `cargo-fuzz` targets can drive the
+/// classifier and the chmod attacker-path check directly, without
+/// shelling out to the `barbican` binary.
+///
+/// Not a stable API. Do not use from application code. The items
+/// inside are thin wrappers over the private classifier so the main
+/// module's visibility stays unchanged.
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Surface mirror of the internal classifier decision. Kept in
+    /// sync with `super::Decision` by the wrapper below — the original
+    /// stays `pub(crate)` because it leaks the classifier's full shape
+    /// and we don't want consumers matching on its variants as a
+    /// stable API.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Decision {
+        /// The command passed every shipped classifier.
+        Allow,
+        /// At least one classifier denied; `reason` is the human-
+        /// readable string the real hook writes to stderr.
+        Deny {
+            /// Short reason string surfaced on `barbican: {reason}`.
+            reason: String,
+        },
+    }
+
+    /// Run the shipping classifier on `command` and return a mirror of
+    /// the hook's decision. Used by the proptest properties in
+    /// `tests/fuzz_properties.rs` and by the `cargo-fuzz` target at
+    /// `fuzz/fuzz_targets/classify.rs`.
+    #[must_use]
+    pub fn classify_command(command: &str) -> Decision {
+        match super::classify_command(command) {
+            super::Decision::Allow => Decision::Allow,
+            super::Decision::Deny { reason } => Decision::Deny { reason },
+        }
+    }
+
+    /// Run the chmod attacker-writable-directory check on `path`.
+    /// Exposed so fuzz targets can assert the function never panics on
+    /// arbitrary Unicode input (task invariant #5).
+    #[must_use]
+    pub fn path_in_attacker_writable_dir(path: &str) -> bool {
+        super::path_in_attacker_writable_dir(path)
+    }
+}
+
 /// Classify a raw bash command string. Deny on parse failure; otherwise
 /// apply each policy in turn.
-fn classify_command(command: &str) -> Decision {
+///
+/// `pub(crate)` so the `__fuzz` re-export in this module can surface it
+/// via `barbican::__fuzz::classify_command` for property tests and
+/// `cargo-fuzz` targets. The module stays private; only the hidden
+/// shim widens it further.
+pub(crate) fn classify_command(command: &str) -> Decision {
     match parser::parse(command) {
         Err(ParseError::Malformed) => Decision::Deny {
             reason: "command could not be parsed safely (deny by default)".to_string(),
@@ -2894,7 +2950,7 @@ const ATTACKER_WRITEABLE_HOME_SUBDIRS: &[&str] = &["Downloads", ".cache", "Libra
 /// case-insensitive filesystems (macOS APFS default, Windows) before
 /// the prefix match. A `.` / `..` segment is also collapsed so
 /// `/tmp/../tmp/payload` doesn't route around the check.
-fn path_in_attacker_writable_dir(path: &str) -> bool {
+pub(crate) fn path_in_attacker_writable_dir(path: &str) -> bool {
     let normalized = lex_normalize_chmod_path(path);
     if normalized.is_empty() {
         return false;
