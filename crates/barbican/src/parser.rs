@@ -203,9 +203,7 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
     // minimal reproducer on Linux. Filed upstream as well, but the
     // deny-by-default rule demands we close the path locally — a
     // classifier that can't parse its input must deny, not panic.
-    if let Err(e) = preflight_known_crashers(input) {
-        return Err(e);
-    }
+    preflight_known_crashers(input)?;
 
     let mut parser = Parser::new();
     parser
