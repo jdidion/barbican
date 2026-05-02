@@ -785,3 +785,58 @@ fn expansion_argv0_without_secret_still_allows() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------
+// 1.2.0 FOURTH-PASS adversarial review (GPT SEVERE S-1, S-2):
+// GNU bundled short-flag forms. `-t` and `-i` can appear at the tail
+// of a short-flag bundle (`-vt`, `-fvt`, `-mvt`, `-ni`, `-Ei`), which
+// the third-pass `a == "-t"` / `a.starts_with("-i")` checks missed.
+// ---------------------------------------------------------------------
+
+#[test]
+fn cp_bundled_vt_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("cp -vt /etc/profile.d /tmp/attack.sh")),
+        2,
+    );
+}
+
+#[test]
+fn cp_bundled_fvt_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "cp -fvt /etc/profile.d /tmp/attack.sh"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn install_bundled_mvt_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "install -mvt /etc/profile.d /tmp/attack.sh"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn sed_bundled_ni_on_bashrc_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "sed -ni 's/x/y/' /home/u/.bashrc"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn sed_bundled_Ei_on_zshrc_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "sed -Ei 's/x/y/' /home/u/.zshrc"
+        )),
+        2,
+    );
+}

@@ -1560,11 +1560,14 @@ fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
         // the `starts_with("-i")` check (starts with `--`, not
         // `-i`).
         "sed" => {
+            // GNU sed: `-i` participates in short-flag bundles (e.g.
+            // `-ni`, `-Ei`, `-rne… -i`) and may carry an optional
+            // SUFFIX glued to it (`-i.bak`). The long form is
+            // `--in-place[=SUFFIX]`. 1.2.0 4th-pass review (GPT
+            // SEVERE S-2): the previous `starts_with("-i")` check
+            // missed bundles where `-i` wasn't the first letter.
             let has_inplace = stage.args.iter().any(|a| {
-                a == "-i"
-                    || a.starts_with("-i")
-                    || a == "--in-place"
-                    || a.starts_with("--in-place")
+                a == "--in-place" || a.starts_with("--in-place") || short_flag_contains(a, 'i')
             });
             if has_inplace {
                 last_positional_arg(&stage.args, 1)
@@ -1597,9 +1600,33 @@ fn target_directory_flag(args: &[String]) -> Option<String> {
         if a == "-t" {
             return args.get(i + 1).cloned();
         }
+        // GNU bundled short-flag form: `-vt DIR`, `-fvt DIR`, `-mvt DIR`.
+        // 1.2.0 4th-pass review (GPT SEVERE S-1): when `t` appears as the
+        // LAST letter of a short-flag bundle, the next argv is the
+        // target-directory value. Only the tail letter can take a value
+        // — earlier letters in the bundle are flag-only (`v`, `f`, `m`).
+        if a.starts_with('-') && !a.starts_with("--") && a.len() >= 2 && a.ends_with('t') {
+            return args.get(i + 1).cloned();
+        }
         i += 1;
     }
     None
+}
+
+/// Does `arg` contain short-flag `letter` in a GNU short-flag bundle?
+/// Matches `-i`, `-ni`, `-Ei`, `-rni`, etc. — a single leading dash
+/// followed by one or more flag letters. Does NOT match `--i`, `--in…`
+/// (long form), or bare `-` (stdin marker).
+///
+/// Used by the sed `-i` inplace-edit detector to catch bundled forms
+/// like `sed -ni 's/x/y/' ~/.bashrc`.
+fn short_flag_contains(arg: &str, letter: char) -> bool {
+    if let Some(rest) = arg.strip_prefix('-') {
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.chars().any(|c| c == letter);
+        }
+    }
+    false
 }
 
 /// Return the last non-flag positional in `args` IF there are at
