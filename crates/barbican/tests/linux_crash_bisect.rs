@@ -140,31 +140,109 @@ fn ccc_prefix_bisect_captured_crasher() {
 /// sitter error state built up over the preceding 2000+ bytes is
 /// load-bearing.
 #[test]
-fn aaa_suffix_probes_narrowing_from_byte_2490() {
+fn aaa_classifier_probes() {
     if !enabled() {
         return;
     }
-    // Smallest → largest. Named by the start-byte offset in the
-    // original file. The 4-byte file is the single codepoint alone.
+    // Prior run (CI 25264060820) pinned the minimal crasher to
+    // 5 bytes: `{` + U+31860 (CJK Ext G, 4-byte UTF-8). `𱡀` alone
+    // parses cleanly (`parse=ok` on 4 bytes). So a `{` followed by
+    // an astral-plane codepoint seems to trip the crash.
+    //
+    // Each probe is run in a FORKED subprocess (the `barbican
+    // pre-bash` binary) so a crash in one probe doesn't kill the
+    // rest of the sweep. The subprocess exit code classifies the
+    // outcome:
+    //   - 0: parser accepted the input (classifier decided allow)
+    //   - 2: parser denied (err-malformed → deny-by-default path)
+    //   - 1 or signal: crashed (SIGSEGV = 139 in shell, here shows
+    //     as exit_status.code() = None + signal number)
     let probes: &[(&str, &[u8])] = &[
-        ("probe-2486_4B_only", include_bytes!("data/probe-2486.bin")),
-        ("probe-2485_5B", include_bytes!("data/probe-2485.bin")),
-        ("probe-2480_10B", include_bytes!("data/probe-2480.bin")),
-        ("probe-2470_20B", include_bytes!("data/probe-2470.bin")),
-        ("probe-2400_90B", include_bytes!("data/probe-2400.bin")),
-        ("probe-2000_490B", include_bytes!("data/probe-2000.bin")),
+        // Positive controls (expected to crash, from prior CI):
+        (
+            "openbrace_plus_31860",
+            include_bytes!("data/probe-openbrace_31860.bin"),
+        ),
+        // Codepoint variation, brace constant:
+        (
+            "openbrace_plus_10000",
+            include_bytes!("data/probe-openbrace_10000.bin"),
+        ),
+        (
+            "openbrace_plus_1F600",
+            include_bytes!("data/probe-openbrace_1F600.bin"),
+        ),
+        (
+            "openbrace_plus_FFFD_BMP",
+            include_bytes!("data/probe-openbrace_FFFD.bin"),
+        ),
+        (
+            "openbrace_plus_cjk_BMP",
+            include_bytes!("data/probe-openbrace_cjk_BMP.bin"),
+        ),
+        // Prefix variation, codepoint constant (U+31860):
+        (
+            "paren_plus_31860",
+            include_bytes!("data/probe-parenopen_31860.bin"),
+        ),
+        (
+            "bracket_plus_31860",
+            include_bytes!("data/probe-bracket_31860.bin"),
+        ),
+        (
+            "dquote_plus_31860",
+            include_bytes!("data/probe-dquote_31860.bin"),
+        ),
+        (
+            "space_plus_31860",
+            include_bytes!("data/probe-space_31860.bin"),
+        ),
+        (
+            "letter_plus_31860",
+            include_bytes!("data/probe-letter_31860.bin"),
+        ),
+        // Negative control (prior CI confirmed ok):
+        (
+            "solo_31860_no_prefix",
+            include_bytes!("data/probe-solo_31860.bin"),
+        ),
     ];
+    let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
-        log(&format!("probe={name} about-to-parse len={}", bytes.len()));
-        let status = match std::str::from_utf8(bytes) {
-            Ok(s) => match parse(s) {
-                Ok(_) => "ok",
-                Err(ParseError::Malformed) => "err-malformed",
-                Err(ParseError::ParserInit) => "err-init",
-            },
-            Err(_) => "non-utf8",
+        let Ok(s) = std::str::from_utf8(bytes) else {
+            log(&format!("probe={name} non-utf8 len={}", bytes.len()));
+            continue;
         };
-        log(&format!("probe={name} parse={status} len={}", bytes.len()));
+        // Build a well-formed hook-JSON envelope wrapping this probe
+        // as a Bash command. serde_json handles the escape dance.
+        let envelope = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": s },
+        })
+        .to_string();
+        log(&format!("probe={name} about-to-spawn len={}", bytes.len()));
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(bin)
+            .arg("pre-bash")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pre-bash");
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(envelope.as_bytes());
+        }
+        let status = child.wait().expect("wait pre-bash");
+        let outcome = match status.code() {
+            Some(0) => "exit-0-allow".to_string(),
+            Some(2) => "exit-2-deny".to_string(),
+            Some(n) => format!("exit-{n}"),
+            None => format!("signal-{:?}", status),
+        };
+        log(&format!(
+            "probe={name} outcome={outcome} len={}",
+            bytes.len()
+        ));
     }
 }
 
