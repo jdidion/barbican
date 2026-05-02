@@ -2,6 +2,14 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# cargo-fuzz (layer-2, nightly-only) artifacts. The fuzz crate is
+# workspace-excluded so it has its own `target/` plus libfuzzer
+# outputs that must never land in git.
+crates/barbican/fuzz/target/
+crates/barbican/fuzz/Cargo.lock
+crates/barbican/fuzz/artifacts/
+crates/barbican/fuzz/coverage/
+
 # macOS
 .DS_Store
 

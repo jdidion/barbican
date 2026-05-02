@@ -1,0 +1,1 @@
+echo hi > /tmp/out 2> /tmp/err

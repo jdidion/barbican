@@ -1,0 +1,45 @@
+[package]
+# Out-of-workspace `cargo-fuzz` crate for Barbican's layer-2 fuzzing
+# infrastructure. Requires nightly. See `docs/fuzzing.md`.
+name = "barbican-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.barbican]
+path = ".."
+
+# Every fuzz target must be declared here so cargo-fuzz picks it up.
+# The `test = false` / `doc = false` stanzas keep the targets out of
+# cargo's test and doc machinery — they're binary-only libfuzzer entry
+# points.
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_url"
+path = "fuzz_targets/validate_url.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

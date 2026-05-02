@@ -1,0 +1,1 @@
+base64 -d /tmp/payload.b64 > /tmp/payload.sh
