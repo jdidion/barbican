@@ -97,28 +97,41 @@ fn aaa_prefix_bisect_captured_crasher() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_01.bin");
-    // Dense prefix sweep biased toward small sizes — we want to
-    // discover the minimal crasher quickly. If none of these crash
-    // but the full input does, that itself narrows to the tail.
+    // Prior bisect (CI run 25261881247) narrowed the crasher window:
+    // every prefix ≤ 2398 bytes returned `Err(Malformed)` cleanly, but
+    // the 2500-byte prefix never returned a `parse=…` line — i.e. the
+    // crash fires somewhere in the [2398, 2500) byte window.
+    //
+    // This pass does a dense 10-byte-grained sweep across that window
+    // plus a couple of fast anchors at small sizes so we still catch
+    // any regression that would bring the crash earlier. The smallest
+    // size in the 2398-2500 window that crashes is the minimal
+    // reproducer modulo UTF-8 char-boundary rounding.
     let targets = [
+        // Fast anchors (expected err-malformed, confirm behavior is
+        // unchanged):
         1,
-        10,
-        50,
         100,
-        200,
-        400,
-        800,
-        1200,
-        1600,
+        1000,
         2000,
-        2200,
+        2398,
+        // Dense sweep across the crash window:
         2400,
+        2410,
+        2420,
+        2430,
+        2440,
+        2450,
+        2460,
+        2470,
+        2480,
+        2490,
         2500,
+        // Tail anchors in case the crash only fires at longer lengths
+        // (unexpected given prior bisect but cheap to confirm):
+        2510,
+        2520,
         2600,
-        2700,
-        2750,
-        2800,
-        2850,
         bytes.len(),
     ];
     for &n in &targets {
