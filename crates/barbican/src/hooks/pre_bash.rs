@@ -1531,23 +1531,42 @@ fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
         // `mv` and `install` have the same shape. The destination is
         // the last non-flag positional arg. If argv has only one
         // positional, there is no dest (copying to cwd) — skip.
-        // cp/mv/install/ln/rsync: destination is the last non-flag
-        // positional. `ln -s[f] TARGET LINK_NAME` — LINK_NAME is the
-        // NEW file that gets created; that's the persistence write.
-        "cp" | "mv" | "install" | "ln" | "rsync" => last_positional_arg(&stage.args, 2),
+        // cp/mv/install/ln/rsync: destination is either the GNU
+        // `--target-directory=DIR` / `-t DIR` flag value, or (if no
+        // -t) the last non-flag positional. 1.2.0 3rd-pass review
+        // (SEVERE S1): `cp -t /etc/profile.d /tmp/attack.sh` had the
+        // destination as the flag value, and last_positional_arg
+        // returned the SOURCE instead — full persistence-write
+        // bypass.
+        //
+        // NOTE: GNU `--long-flag[=VAL]` forms must be parsed
+        // explicitly; `starts_with('-')` is necessary but not
+        // sufficient for flag-value extraction. This trap is what
+        // let S2 ship. The next contributor adding a tool here
+        // must remember it.
+        "cp" | "mv" | "install" | "ln" | "rsync" => {
+            target_directory_flag(&stage.args)
+                .or_else(|| last_positional_arg(&stage.args, 2))
+        }
         // `dd if=SRC of=DEST [...]`.
         "dd" => stage
             .args
             .iter()
             .find_map(|a| a.strip_prefix("of=").map(str::to_string)),
-        // `sed -i [suffix] [-e ...] FILE ...` — every non-flag
-        // positional is modified in place. Return the first one we
-        // see that is_persistence_target cares about. For simplicity
-        // return the LAST positional; if there are multiple files
-        // targeted, per-stage re-checking catches each on its own
-        // call (there is only one `sed -i` stage per invocation).
+        // `sed -i[SUFFIX] [-e ...] FILE ...` — every non-flag
+        // positional is modified in place. 1.2.0 3rd-pass review
+        // (SEVERE S2): the short form `-i` was covered but the GNU
+        // long form `--in-place` / `--in-place=SUFFIX` slipped past
+        // the `starts_with("-i")` check (starts with `--`, not
+        // `-i`).
         "sed" => {
-            if stage.args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
+            let has_inplace = stage.args.iter().any(|a| {
+                a == "-i"
+                    || a.starts_with("-i")
+                    || a == "--in-place"
+                    || a.starts_with("--in-place")
+            });
+            if has_inplace {
                 last_positional_arg(&stage.args, 1)
             } else {
                 None
@@ -1555,6 +1574,32 @@ fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Extract the value of GNU's `-t DIR` / `--target-directory=DIR` /
+/// `--target-directory DIR` flag. This is the canonical way to
+/// specify a destination directory for `cp`/`mv`/`install`/`ln -t`/
+/// `rsync`, and the basename / last-positional-based detection misses
+/// it entirely.
+fn target_directory_flag(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        // `--target-directory=DIR`
+        if let Some(val) = a.strip_prefix("--target-directory=") {
+            return Some(val.to_string());
+        }
+        // `--target-directory DIR`
+        if a == "--target-directory" {
+            return args.get(i + 1).cloned();
+        }
+        // `-t DIR` (short form, single-letter value-taking flag).
+        if a == "-t" {
+            return args.get(i + 1).cloned();
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Return the last non-flag positional in `args` IF there are at
@@ -1587,8 +1632,15 @@ fn is_persistence_target(path: &str) -> bool {
     // Substring match for dir-based persistence markers. Case-sensitive
     // — macOS paths like `/Library/LaunchAgents/` retain their case;
     // a lowercase variant would be a different path.
+    //
+    // 1.2.0 3rd-pass review: we also need to match when the path IS
+    // the persistence dir itself (no trailing content), since
+    // `cp -t /etc/profile.d ...` writes INTO that dir. Compare with
+    // a synthesized trailing slash so both `/etc/profile.d` and
+    // `/etc/profile.d/a.sh` fire the marker.
+    let with_trailing = format!("{trimmed}/");
     for marker in PERSISTENCE_PATH_MARKERS {
-        if trimmed.contains(marker) {
+        if trimmed.contains(marker) || with_trailing.contains(marker) {
             return true;
         }
     }

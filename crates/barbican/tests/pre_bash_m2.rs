@@ -644,6 +644,79 @@ fn cp_to_benign_path_still_allows() {
 }
 
 // ---------------------------------------------------------------------
+// 1.2.0 THIRD-PASS adversarial review: GNU -t / --target-directory
+// flag form for cp/mv/install/ln/rsync, and --in-place for sed.
+// last_positional_arg alone missed these because the destination was
+// a flag value, not a positional.
+// ---------------------------------------------------------------------
+
+#[test]
+fn cp_dash_t_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("cp -t /etc/profile.d /tmp/attack.sh")),
+        2,
+    );
+}
+
+#[test]
+fn cp_long_target_directory_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "cp --target-directory=/etc/profile.d /tmp/attack.sh"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn mv_dash_t_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input("mv -t /etc/profile.d/ /tmp/evil.sh")),
+        2,
+    );
+}
+
+#[test]
+fn install_dash_t_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "install -m 755 /tmp/x -t /etc/profile.d"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn ln_dash_t_to_persistence_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "ln -sf -t /etc/profile.d/ /tmp/evil.sh"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn sed_long_in_place_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "sed --in-place 's/x/y/' /home/u/.bashrc"
+        )),
+        2,
+    );
+}
+
+#[test]
+fn sed_long_in_place_with_suffix_denies() {
+    assert_eq!(
+        run_pre_bash(&bash_input(
+            "sed --in-place=.bak 's/x/y/' /home/u/.bashrc"
+        )),
+        2,
+    );
+}
+
+// ---------------------------------------------------------------------
 // 1.2.0 SECOND-PASS: expansion-argv[0] + env dump (HIGH #2 extension).
 // ---------------------------------------------------------------------
 
