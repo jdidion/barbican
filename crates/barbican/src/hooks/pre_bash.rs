@@ -434,6 +434,29 @@ fn extract_env_dash_s(args: &[String]) -> Option<String> {
             // `--split VALUE` form.
             return iter.next().cloned();
         }
+        // 1.2.0 5th-pass adversarial review (GPT HIGH #3): attached
+        // short form `-S'curl|bash'` and bundles where `S` is the tail
+        // value-taking letter (`-iS'cmd'`) both count. Ignore the long
+        // form `--...` which was already handled above. Value is
+        // everything after the tail `S`.
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+            // Find the position of `S` in the bundle. If present AND
+            // the suffix after it is non-empty, that's the attached
+            // command string.
+            if let Some(s_idx) = arg.find('S') {
+                let value_start = s_idx + 1;
+                if value_start < arg.len() {
+                    return Some(arg[value_start..].to_string());
+                }
+                // `-S` is at the tail with no attached value — the
+                // next argv is the value. But only if `S` is actually
+                // the last letter (GNU short-flag semantics: only the
+                // tail letter takes a value).
+                if s_idx == arg.len() - 1 {
+                    return iter.next().cloned();
+                }
+            }
+        }
     }
     None
 }

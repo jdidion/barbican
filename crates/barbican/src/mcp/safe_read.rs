@@ -325,6 +325,21 @@ fn lex_normalize(path: &Path) -> PathBuf {
 // --- Policy ---------------------------------------------------------
 
 fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
+    // 1.2.0 5th-pass adversarial review (Claude H-7): symlink-walk
+    // must run FIRST, before any override short-circuit. A user who
+    // sets BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1 to read their own
+    // credentials is NOT implicitly accepting attacker-planted
+    // symlinks under $HOME that launder reads to arbitrary sensitive
+    // targets (e.g. `~/notes/safe.md -> /etc/shadow`). The override
+    // bypasses the deny-list only; the laundering defense stays on.
+    if path_contains_symlink(original) {
+        return Err(ReadError::PolicyDenied(
+            "symlink in path or an ancestor under $HOME — refusing \
+             to traverse. Use BARBICAN_SAFE_READ_ALLOW to whitelist \
+             a resolved target directly."
+                .to_string(),
+        ));
+    }
     if allow_sensitive_override() {
         return Ok(());
     }
@@ -422,7 +437,15 @@ fn path_contains_symlink(path: &Path) -> bool {
     // isn't under HOME (e.g. a `/etc/…` allow entry) we skip the walk
     // — system-level symlinks aren't attacker-plantable under the
     // accepted 1.2.0 threat model.
+    //
+    // If HOME is unresolvable, skip the walk — the anti-laundering
+    // rule only applies to paths that can be reasoned about relative
+    // to the user's home. A bare `$HOME`-less process is already
+    // outside the documented threat model (we read $HOME per-call).
     let home = home_dir();
+    if home.as_os_str().is_empty() || home == std::path::Path::new("/") {
+        return false;
+    }
     if !path.starts_with(&home) {
         return false;
     }

@@ -832,7 +832,7 @@ fn sed_bundled_ni_on_bashrc_denies() {
 }
 
 #[test]
-fn sed_bundled_Ei_on_zshrc_denies() {
+fn sed_bundled_ei_on_zshrc_denies() {
     assert_eq!(
         run_pre_bash(&bash_input(
             "sed -Ei 's/x/y/' /home/u/.zshrc"

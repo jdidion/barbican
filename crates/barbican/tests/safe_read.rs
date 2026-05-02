@@ -511,3 +511,74 @@ fn mixed_case_html_in_non_markup_extension_gets_script_stripped() {
         "mixed-case markup must be stripped: {out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// 1.2.0 5th-pass adversarial review (Claude H-7): ALLOW_SENSITIVE=1
+// must not bypass the symlink-walk defense. A user who wants to read
+// their OWN credentials is not implicitly accepting attacker-planted
+// symlinks that launder reads to arbitrary sensitive targets.
+// ---------------------------------------------------------------------
+
+#[test]
+fn override_does_not_bypass_symlink_under_home() {
+    #[cfg(unix)]
+    {
+        let _g = env_guard();
+        // Attacker plants ~/notes/safe.md -> /etc/shadow (or any
+        // canonical target outside $HOME). User has set
+        // ALLOW_SENSITIVE=1 to read their OWN creds — that should
+        // NOT let the attacker-planted symlink through.
+        let home = tempfile::tempdir().unwrap();
+        let notes = home.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let sensitive = home.path().join("real-secret");
+        std::fs::write(&sensitive, "p@ssword\n").unwrap();
+        let bait = notes.join("safe.md");
+        std::os::unix::fs::symlink(&sensitive, &bait).unwrap();
+
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE", "1");
+        let out = run(bait.to_str().unwrap());
+        std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+        std::env::remove_var("HOME");
+        assert!(
+            out.contains("<barbican-error"),
+            "override must not launder symlinks under $HOME: {out}"
+        );
+        assert!(
+            !out.contains("p@ssword"),
+            "file contents leaked through laundered symlink: {out}"
+        );
+    }
+}
+
+#[test]
+fn override_does_not_bypass_ancestor_symlink_under_home() {
+    #[cfg(unix)]
+    {
+        let _g = env_guard();
+        // Attacker plants ~/shared -> /etc (ancestor symlink).
+        // ALLOW_SENSITIVE override must NOT let `~/shared/passwd`
+        // resolve past that ancestor symlink.
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let victim = other.path().join("passwd");
+        std::fs::write(&victim, "root:x:0:0\n").unwrap();
+        let bait_dir = home.path().join("shared");
+        std::os::unix::fs::symlink(other.path(), &bait_dir).unwrap();
+
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE", "1");
+        let out = run(bait_dir.join("passwd").to_str().unwrap());
+        std::env::remove_var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE");
+        std::env::remove_var("HOME");
+        assert!(
+            out.contains("<barbican-error"),
+            "override must not launder ancestor symlink under $HOME: {out}"
+        );
+        assert!(
+            !out.contains("root:x:0:0"),
+            "contents leaked through ancestor symlink: {out}"
+        );
+    }
+}
