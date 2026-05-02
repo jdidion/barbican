@@ -231,6 +231,21 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve the current user's home directory. Intentionally reads
+/// `$HOME` / `$USERPROFILE` each call.
+///
+/// 1.2.0 adversarial review (GPT HIGH #15) flagged that an attacker
+/// who can set `HOME` before Barbican starts relocates both the
+/// deny-list base and the audit log destination. This is accepted as
+/// out-of-scope and documented in SECURITY.md §Untrusted-launch
+/// environment: any attacker who controls the Barbican process's
+/// launch environment is already able to set `$PATH`, `$LD_PRELOAD`,
+/// or `$BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1` and game over.
+///
+/// Process-lifetime caching was considered but rejected — it breaks
+/// the safe_read integration tests that cycle `$HOME` across tempdirs
+/// to exercise different policy shapes, and it doesn't close the real
+/// attacker path (launch-env control).
 fn home_dir() -> PathBuf {
     if let Ok(h) = std::env::var("HOME") {
         if !h.is_empty() {
@@ -310,6 +325,21 @@ fn lex_normalize(path: &Path) -> PathBuf {
 // --- Policy ---------------------------------------------------------
 
 fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
+    // 1.2.0 5th-pass adversarial review (Claude H-7): symlink-walk
+    // must run FIRST, before any override short-circuit. A user who
+    // sets BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1 to read their own
+    // credentials is NOT implicitly accepting attacker-planted
+    // symlinks under $HOME that launder reads to arbitrary sensitive
+    // targets (e.g. `~/notes/safe.md -> /etc/shadow`). The override
+    // bypasses the deny-list only; the laundering defense stays on.
+    if path_contains_symlink(original) {
+        return Err(ReadError::PolicyDenied(
+            "symlink in path or an ancestor under $HOME — refusing \
+             to traverse. Use BARBICAN_SAFE_READ_ALLOW to whitelist \
+             a resolved target directly."
+                .to_string(),
+        ));
+    }
     if allow_sensitive_override() {
         return Ok(());
     }
@@ -389,15 +419,56 @@ fn allow_rule_permits(original: &Path, canonical: &Path, _denies: &[PathBuf]) ->
 /// A path that doesn't exist returns `false` — the subsequent open
 /// will fail anyway, and we don't want to refuse to allow a
 /// not-yet-created file.
+///
+/// 1.2.0 adversarial review (Claude H-8) widened this to walk
+/// ancestors UNDER the user's home directory — an attacker who can
+/// only write under `$HOME` can still swap `~/shared/` for a symlink
+/// to `/etc/`. System-level ancestor symlinks (those above HOME) stay
+/// exempt to avoid false-positives on macOS's `/var` → `/private/var`
+/// and similar platform fixtures.
 fn path_contains_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|md| md.file_type().is_symlink())
-        .unwrap_or(false)
+    // Leaf check — the most common attack shape.
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return true;
+        }
+    }
+    // Ancestor walk, but only components under $HOME. If the path
+    // isn't under HOME (e.g. a `/etc/…` allow entry) we skip the walk
+    // — system-level symlinks aren't attacker-plantable under the
+    // accepted 1.2.0 threat model.
+    //
+    // If HOME is unresolvable, skip the walk — the anti-laundering
+    // rule only applies to paths that can be reasoned about relative
+    // to the user's home. A bare `$HOME`-less process is already
+    // outside the documented threat model (we read $HOME per-call).
+    let home = home_dir();
+    if home.as_os_str().is_empty() || home == std::path::Path::new("/") {
+        return false;
+    }
+    if !path.starts_with(&home) {
+        return false;
+    }
+    let mut cur = path.parent();
+    while let Some(p) = cur {
+        // Stop climbing once we exit HOME — the ancestors above HOME
+        // are platform fixtures (/, /Users, /home) and their symlink
+        // status is not in the user's attacker model.
+        if !p.starts_with(&home) {
+            break;
+        }
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if md.file_type().is_symlink() {
+                return true;
+            }
+        }
+        cur = p.parent();
+    }
+    false
 }
 
 fn allow_sensitive_override() -> bool {
-    std::env::var("BARBICAN_SAFE_READ_ALLOW_SENSITIVE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::env_flag("BARBICAN_SAFE_READ_ALLOW_SENSITIVE")
 }
 
 /// Parse a colon-separated path list from an env var. Every entry
@@ -594,11 +665,19 @@ fn policy_reason(rule: &Path) -> String {
     )
 }
 
+/// Minimum effective read cap regardless of env. Prevents
+/// `BARBICAN_SAFE_READ_MAX_BYTES=0` from silently making every
+/// `safe_read` return zero bytes — useless-but-silent degradation that
+/// the 1.2.0 adversarial review called out. Any caller that actually
+/// wants a small cap can still pass one via the per-call `max_bytes`.
+pub const MIN_MAX_BYTES: usize = 4096;
+
 fn cap_from_env() -> usize {
-    std::env::var("BARBICAN_SAFE_READ_MAX_BYTES")
+    let raw = std::env::var("BARBICAN_SAFE_READ_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_BYTES)
+        .unwrap_or(DEFAULT_MAX_BYTES);
+    raw.max(MIN_MAX_BYTES)
 }
 
 /// Error taxonomy. The string form is what the model sees inside

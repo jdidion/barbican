@@ -171,9 +171,26 @@ fn scalar_string(v: Option<&Value>) -> Value {
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        // Tighten the dir whether or not we created it — a stale
-        // wider-perm dir from a previous run shouldn't leak.
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        // 1.2.0 second-pass adversarial review (HIGH #1): if the
+        // parent dir is itself a symlink (planted by a prior
+        // compromise), writing the log file would leak hook payloads
+        // (command strings, session ids) into the attacker's target
+        // directory. Skip the chmod AND short-circuit the whole
+        // write — the O_NOFOLLOW on the leaf below would only catch
+        // a symlinked leaf, not a symlinked parent.
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "barbican audit: refusing to write under \
+                     symlinked parent `{}`",
+                    parent.display()
+                )));
+            }
+            Ok(meta) if meta.file_type().is_dir() => {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+            _ => {}
+        }
     }
     let mut file: File = OpenOptions::new()
         .create(true)

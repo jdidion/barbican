@@ -80,6 +80,65 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "setsid",  // setsid <cmd>
     "stdbuf",  // stdbuf <cmd>
     "unbuffer", // unbuffer <cmd>
+    // 1.2.0 adversarial-review additions — shell builtins that
+    // transparently run the remainder of argv as an inner command.
+    // Without these in the unwrap set, `time curl | bash` and
+    // `command bash -c '...'` route around H1/M1 entirely.
+    "time",    // time <cmd>  (also the `time` keyword form)
+    "command", // command [-pVv] <cmd>  (bypasses function shadowing)
+    "builtin", // builtin <cmd>
+    "exec",    // exec [-cl] [-a NAME] <cmd>
+    // 1.2.0 5th-pass review (GPT SEVERE #2): sandboxing / re-exec
+    // fronts. All four take a prefix-runner shape (`unshare -r bash`,
+    // `systemd-run --pipe bash`, `chpst -u nobody bash`). busybox /
+    // toybox are also APPLET MULTIPLEXERS: `busybox sh`, `busybox
+    // wget -qO- URL` invoke their bundled applet. Handled as both a
+    // wrapper and in the applet-aware extractor.
+    "unshare",     // unshare [-r] [-m] [--user] CMD
+    "systemd-run", // systemd-run [--pipe] [--wait] [--scope] CMD
+    "chpst",       // chpst [-u user] [-e ENVDIR] CMD
+    "busybox",     // busybox APPLET [args] — applet ~= argv[0] for classify
+    "toybox",      // toybox APPLET [args] — same shape as busybox
+    // ssh [opts] HOST CMD... — remote shell sink. CMD classifies as
+    // bash on the remote, but attack shapes (curl|bash, secret exfil)
+    // deny on the local invocation regardless of remote execution.
+    "ssh",
+    // 1.2.0 6th-pass review (GPT SEVERE G-S2): sandbox / container
+    // fronts whose argv shape is `CMD [cmd args]` or `[opts] [--] CMD`.
+    "firejail", // firejail [--profile=X] CMD
+    "bwrap",    // bwrap [opts] -- CMD
+    // `docker run`/`podman run` have a more complex shape (flags,
+    // image, CMD). Special-cased in the extractor to scan argv for
+    // `bash -c` / `sh -c` inline-code forms after the image.
+    "docker",
+    "podman",
+    "runc",
+    "crun",
+    // 1.2.0 7th-pass review (Claude+GPT SEVERE 7S2): debugger /
+    // process-control / locking wrappers, and network-transport
+    // wrappers. All follow `WRAPPER [opts] CMD [args]` shape which
+    // transparently execs CMD; missing from the unwrap set means
+    // `strace bash -c 'curl | bash'` etc. bypass H1/M1 entirely.
+    "strace",
+    "ltrace",
+    "valgrind",
+    "catchsegv",
+    "flock",        // NOTE: also has its own `-c CMD` form — handled specially
+    "gosu",
+    "fakeroot",
+    "torify",
+    "proxychains",
+    "proxychains4",
+    // 1.2.0 8th-pass review (Claude HIGH 8H2): additional container
+    // fronts. Same shape as docker/podman — handled by
+    // extract_container_run_inner.
+    "buildah",
+    "nerdctl",
+    "ctr",
+    "lxc-attach",
+    "apptainer",
+    "singularity",
+    "kubectl",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.

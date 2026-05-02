@@ -64,14 +64,27 @@ fn walk_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
 /// `BARBICAN_SCAN_MAX_BYTES`.
 pub const DEFAULT_SCAN_MAX_BYTES: usize = 5 * 1024 * 1024;
 
+/// Minimum effective scan cap regardless of env override. If a caller
+/// sets `BARBICAN_SCAN_MAX_BYTES=0` (or any value below this floor),
+/// we silently raise to this minimum and still scan. The 1.2.0
+/// adversarial review flagged an attacker-influenced env with
+/// `MAX_BYTES=0` as a full scanner-disable vector.
+///
+/// 4 KiB is enough to catch every documented prompt-injection phrase
+/// and leaves the scan meaningful even under hostile configuration.
+pub const MIN_SCAN_MAX_BYTES: usize = 4096;
+
 /// Resolve the scan cap from `BARBICAN_SCAN_MAX_BYTES` (if set and
-/// parseable) or fall back to [`DEFAULT_SCAN_MAX_BYTES`].
+/// parseable) or fall back to [`DEFAULT_SCAN_MAX_BYTES`]. Clamped
+/// upward to [`MIN_SCAN_MAX_BYTES`] regardless of what the env says —
+/// a scanner that reads 0 bytes is a disabled scanner.
 #[must_use]
 pub fn scan_cap_from_env() -> usize {
-    std::env::var("BARBICAN_SCAN_MAX_BYTES")
+    let raw = std::env::var("BARBICAN_SCAN_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SCAN_MAX_BYTES)
+        .unwrap_or(DEFAULT_SCAN_MAX_BYTES);
+    raw.max(MIN_SCAN_MAX_BYTES)
 }
 
 /// Truncate `text` to `cap` bytes on a UTF-8 boundary. Returns
@@ -395,11 +408,44 @@ mod tests {
         assert!(f.is_empty(), "benign text got flagged: {f:?}");
     }
 
+    /// Serialize env-var mutation across the scan tests that touch
+    /// `BARBICAN_SCAN_MAX_BYTES`. Cargo runs tests in parallel
+    /// threads of one process — without this the two tests below race
+    /// and the second assertion flips (same class of bug 1.1.0
+    /// adversarial review caught in net::tests).
+    fn scan_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock, PoisonError};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     #[test]
     fn scan_cap_env_override() {
-        std::env::set_var("BARBICAN_SCAN_MAX_BYTES", "2048");
-        assert_eq!(scan_cap_from_env(), 2048);
+        let _g = scan_env_guard();
+        // 8192 is above the MIN floor so it should round-trip.
+        std::env::set_var("BARBICAN_SCAN_MAX_BYTES", "8192");
+        assert_eq!(scan_cap_from_env(), 8192);
         std::env::remove_var("BARBICAN_SCAN_MAX_BYTES");
         assert_eq!(scan_cap_from_env(), DEFAULT_SCAN_MAX_BYTES);
+    }
+
+    #[test]
+    fn scan_cap_env_clamps_to_min() {
+        // 1.2.0 adversarial review: an attacker-influenced env with
+        // MAX_BYTES=0 must NOT disable the scanner. We clamp upward to
+        // MIN_SCAN_MAX_BYTES (4 KiB) — enough to catch every
+        // documented jailbreak phrase.
+        let _g = scan_env_guard();
+        for bad in ["0", "1", "2048", "4095"] {
+            std::env::set_var("BARBICAN_SCAN_MAX_BYTES", bad);
+            assert_eq!(
+                scan_cap_from_env(),
+                MIN_SCAN_MAX_BYTES,
+                "env={bad} must be clamped up to MIN_SCAN_MAX_BYTES"
+            );
+        }
+        std::env::remove_var("BARBICAN_SCAN_MAX_BYTES");
     }
 }

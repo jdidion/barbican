@@ -227,14 +227,17 @@ fn claude_json_path(claude_home: &Path) -> PathBuf {
 }
 
 fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
-    fs::copy(src, dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(dst)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(dst, perms)?;
-    }
+    // 1.2.0 adversarial review (GPT HIGH #16): `fs::copy(src, dst)`
+    // follows symlinks at dst. An attacker who pre-plants
+    // `~/.claude/barbican/barbican` as a symlink to (e.g.)
+    // `~/.bashrc` gets that file overwritten with the Barbican
+    // binary on the next install. Route binary staging through the
+    // same O_NOFOLLOW + O_EXCL + fsync + rename discipline the JSON
+    // writers use; set mode 0o755 on open rather than chmod-after.
+    let bytes = fs::read(src).with_context(|| format!("read source binary {}", src.display()))?;
+    let tmp = tmp_path(dst);
+    write_bytes_atomic_with_mode(&tmp, dst, &bytes, 0o755)
+        .with_context(|| format!("install binary to {}", dst.display()))?;
     log(&format!("installed binary to {}", dst.display()));
     Ok(())
 }
@@ -299,14 +302,28 @@ fn backup_once(path: &Path, dry_run: bool) -> Result<()> {
 /// error asking the user to remove it — better than silently
 /// following a potentially-hostile symlink.
 fn write_bytes_atomic(tmp: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
+    write_bytes_atomic_with_mode(tmp, final_path, bytes, 0o600)
+}
+
+/// Like [`write_bytes_atomic`] but with a caller-supplied permission
+/// mode. Used by [`copy_binary`] to stage the executable with `0o755`
+/// under the same O_NOFOLLOW + O_EXCL + fsync + rename discipline.
+fn write_bytes_atomic_with_mode(
+    tmp: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(mode);
         opts.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
 
     let mut f = match opts.open(tmp) {
         Ok(f) => f,

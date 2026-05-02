@@ -339,18 +339,31 @@ fn render_error(url: &str, err: &FetchError) -> String {
     wrap_render_error(url, &err.to_string())
 }
 
+/// Minimum effective body cap regardless of env. Prevents
+/// `BARBICAN_SAFE_FETCH_MAX_BYTES=0` from silently truncating every
+/// response to zero while still reporting success — a scanner-disable
+/// adjacent vector flagged by the 1.2.0 adversarial review.
+pub const MIN_MAX_BYTES: usize = 4096;
+
+/// Minimum effective per-request timeout. Prevents
+/// `BARBICAN_SAFE_FETCH_TIMEOUT_SECS=0` from turning every fetch into
+/// an instant-timeout DoS against the tool surface.
+pub const MIN_TIMEOUT_SECS: u64 = 1;
+
 fn cap_from_env() -> usize {
-    std::env::var("BARBICAN_SAFE_FETCH_MAX_BYTES")
+    let raw = std::env::var("BARBICAN_SAFE_FETCH_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_BYTES)
+        .unwrap_or(DEFAULT_MAX_BYTES);
+    raw.max(MIN_MAX_BYTES)
 }
 
 fn timeout_from_env() -> u64 {
-    std::env::var("BARBICAN_SAFE_FETCH_TIMEOUT_SECS")
+    let raw = std::env::var("BARBICAN_SAFE_FETCH_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    raw.max(MIN_TIMEOUT_SECS)
 }
 
 /// Rich error type so tests can pattern-match specific rejection
