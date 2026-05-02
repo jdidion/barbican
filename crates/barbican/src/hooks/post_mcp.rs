@@ -47,9 +47,7 @@ pub fn run() -> Result<()> {
     // to double-scan them.
     if matches!(
         tool,
-        "mcp__barbican__safe_fetch"
-            | "mcp__barbican__safe_read"
-            | "mcp__barbican__inspect"
+        "mcp__barbican__safe_fetch" | "mcp__barbican__safe_read" | "mcp__barbican__inspect"
     ) {
         return Ok(());
     }

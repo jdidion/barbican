@@ -234,8 +234,7 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     // binary on the next install. Route binary staging through the
     // same O_NOFOLLOW + O_EXCL + fsync + rename discipline the JSON
     // writers use; set mode 0o755 on open rather than chmod-after.
-    let bytes = fs::read(src)
-        .with_context(|| format!("read source binary {}", src.display()))?;
+    let bytes = fs::read(src).with_context(|| format!("read source binary {}", src.display()))?;
     let tmp = tmp_path(dst);
     write_bytes_atomic_with_mode(&tmp, dst, &bytes, 0o755)
         .with_context(|| format!("install binary to {}", dst.display()))?;

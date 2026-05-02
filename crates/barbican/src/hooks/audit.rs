@@ -187,10 +187,7 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
                 )));
             }
             Ok(meta) if meta.file_type().is_dir() => {
-                let _ = std::fs::set_permissions(
-                    parent,
-                    std::fs::Permissions::from_mode(0o700),
-                );
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
             _ => {}
         }

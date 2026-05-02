@@ -664,8 +664,8 @@ fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
     // missing. Keep the set complete so the host positional is
     // identified correctly.
     const VALUE_TAKING: &[&str] = &[
-        "-i", "-I", "-p", "-o", "-l", "-L", "-R", "-D", "-J", "-F", "-b",
-        "-c", "-m", "-O", "-Q", "-S", "-W", "-w", "-E", "-B", "-e",
+        "-i", "-I", "-p", "-o", "-l", "-L", "-R", "-D", "-J", "-F", "-b", "-c", "-m", "-O", "-Q",
+        "-S", "-W", "-w", "-E", "-B", "-e",
     ];
     let mut i = 0;
     let mut host_index: Option<usize> = None;
@@ -718,9 +718,7 @@ fn ssh_uses_attacker_config(args: &[String]) -> bool {
     // Standard user and system ssh config paths. Includes literal
     // `~/.ssh/config` for unexpanded tilde, and the suffix `/.ssh/
     // config` which matches any home path (bash-expanded or not).
-    let allowed_exact: &[&str] = &[
-        "~/.ssh/config",
-    ];
+    let allowed_exact: &[&str] = &["~/.ssh/config"];
     let allowed_suffixes: &[&str] = &[
         "/.ssh/config",
         "/etc/ssh/ssh_config",
@@ -748,10 +746,7 @@ fn ssh_uses_attacker_config(args: &[String]) -> bool {
             }
             // `-F -` / `-F /dev/stdin` / `-F /dev/fd/N` are
             // attacker-fed via redirect.
-            if trimmed == "-"
-                || trimmed == "/dev/stdin"
-                || trimmed.starts_with("/dev/fd/")
-            {
+            if trimmed == "-" || trimmed == "/dev/stdin" || trimmed.starts_with("/dev/fd/") {
                 return true;
             }
             // Otherwise, require the path to match one of the
@@ -783,11 +778,7 @@ fn ssh_uses_attacker_config(args: &[String]) -> bool {
 ///
 /// 1.2.0 6th-pass adversarial review (GPT SEVERE G-S3).
 fn extract_ssh_dangerous_option(args: &[String]) -> Option<String> {
-    const DANGEROUS_SSH_OPTS: &[&str] = &[
-        "proxycommand",
-        "localcommand",
-        "knownhostscommand",
-    ];
+    const DANGEROUS_SSH_OPTS: &[&str] = &["proxycommand", "localcommand", "knownhostscommand"];
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -1080,10 +1071,9 @@ fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
             // `flock`: -c / -E / -w / --timeout take values.
             // (Note: `-c` is specifically handled upstream as a shell-
             // command form before the prefix-runner path.)
-            | ("flock", "-E" | "-w" | "--timeout")
-            // `gosu`: first positional is USER, second is the inner
-            // command. Positional handling is caller-level (the
-            // prefix-runner helper's positional_skip counter).
+            | ("flock", "-E" | "-w" | "--timeout") // `gosu`: first positional is USER, second is the inner
+                                                   // command. Positional handling is caller-level (the
+                                                   // prefix-runner helper's positional_skip counter).
     )
 }
 
@@ -1598,11 +1588,8 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
     // though `$NET` doesn't match EXFIL_NETWORK_TOOLS. An env dump
     // is high-signal-on-its-own; any downstream network-tool-ish
     // stage (known tool OR expansion-valued argv[0]) qualifies.
-    let net_stage = pipeline
-        .stages
-        .iter()
-        .skip(env_idx + 1)
-        .find(|s| {
+    let net_stage =
+        pipeline.stages.iter().skip(env_idx + 1).find(|s| {
             EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
         })?;
     Some(format!(
@@ -1627,9 +1614,7 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
     if has_secret {
         if let Some(net_stage) = pipeline.stages.iter().find(|s| {
             let bn = stage_bn_lc(s);
-            EXFIL_NETWORK_TOOLS.contains(bn.as_str())
-                || bn == "git"
-                || is_expansion_argv0(s)
+            EXFIL_NETWORK_TOOLS.contains(bn.as_str()) || bn == "git" || is_expansion_argv0(s)
         }) {
             return Some(format!(
                 "blocked: secret-path reference alongside network tool \
@@ -1658,11 +1643,8 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
         .stages
         .iter()
         .position(|s| stage_bn_lc(s).as_str() == "base64" && !is_decode_stage(s))?;
-    let net_stage = pipeline
-        .stages
-        .iter()
-        .skip(base64_idx + 1)
-        .find(|s| {
+    let net_stage =
+        pipeline.stages.iter().skip(base64_idx + 1).find(|s| {
             EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
         })?;
     Some(format!(
@@ -2017,9 +1999,23 @@ fn xargs_arbitrary_amplifier(pipeline: &Pipeline) -> Option<String> {
 /// arg and falls back to `{}`).
 fn xargs_inner_argv(args: &[String]) -> Option<Vec<String>> {
     let value_taking_standalone = [
-        "-I", "-L", "-n", "-P", "-d", "-E", "-s", "-a", "--arg-file", "-r",
-        "--max-args", "--max-procs", "--max-chars", "--delimiter", "--eof",
-        "--max-lines", "--process-slot-var",
+        "-I",
+        "-L",
+        "-n",
+        "-P",
+        "-d",
+        "-E",
+        "-s",
+        "-a",
+        "--arg-file",
+        "-r",
+        "--max-args",
+        "--max-procs",
+        "--max-chars",
+        "--delimiter",
+        "--eof",
+        "--max-lines",
+        "--process-slot-var",
     ];
     let mut i = 0;
     while i < args.len() {
@@ -2167,12 +2163,10 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
                 // `crontab FILE` writes FILE. Only exception: plain
                 // `crontab -l` (list) is read-only — allow it.
                 let args = &stage.args;
-                let is_list_only = args
-                    .iter()
-                    .any(|a| a == "-l" || a == "--list")
-                    && !args.iter().any(|a| {
-                        a == "-" || a == "-r" || a == "-e" || a == "--remove"
-                    });
+                let is_list_only = args.iter().any(|a| a == "-l" || a == "--list")
+                    && !args
+                        .iter()
+                        .any(|a| a == "-" || a == "-r" || a == "-e" || a == "--remove");
                 if !is_list_only {
                     return Some(
                         "blocked: `crontab` invocation writes / edits / \
@@ -2215,10 +2209,7 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
 fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
-        if !matches!(
-            bn.as_str(),
-            "pip" | "pip3" | "pipx" | "uv" | "poetry"
-        ) {
+        if !matches!(bn.as_str(), "pip" | "pip3" | "pipx" | "uv" | "poetry") {
             continue;
         }
         // First non-flag positional must be `install`; bail otherwise.
@@ -2242,8 +2233,7 @@ fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
                 || lower.starts_with("hg+")
                 || lower.starts_with("svn+")
                 || lower.starts_with("bzr+");
-            let is_url = lower.starts_with("http://")
-                || lower.starts_with("https://");
+            let is_url = lower.starts_with("http://") || lower.starts_with("https://");
             // Direct git+... / hg+... / svn+... install.
             if is_vcs {
                 return Some(format!(
@@ -2268,10 +2258,7 @@ fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
                 ));
             }
             // `pip install "foo @ git+…"` — PEP 508 direct URL syntax.
-            if lower.contains("@ git+")
-                || lower.contains("@git+")
-                || lower.contains("@ http")
-            {
+            if lower.contains("@ git+") || lower.contains("@git+") || lower.contains("@ http") {
                 return Some(format!(
                     "blocked: `{bn} install {a}` uses PEP 508 direct-URL \
                      syntax to fetch a VCS or URL package; install-time \
@@ -2306,10 +2293,9 @@ fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<String> {
                 } else if tar_is_to_command_prefix(a) {
                     (Some("--to-command"), args.get(i + 1).map(String::as_str))
                 } else if let Some(val) = tar_strip_checkpoint_action_prefix_eq(a) {
-                    val.strip_prefix("exec=")
-                        .map_or((None, None), |cmd| {
-                            (Some("--checkpoint-action=exec"), Some(cmd))
-                        })
+                    val.strip_prefix("exec=").map_or((None, None), |cmd| {
+                        (Some("--checkpoint-action=exec"), Some(cmd))
+                    })
                 } else if tar_is_checkpoint_action_prefix(a) {
                     args.get(i + 1)
                         .and_then(|v| v.strip_prefix("exec="))
@@ -2369,9 +2355,7 @@ fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason } =
-                classify_script_with_depth(&inner, depth + 1)
-            {
+            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: tar `{flag}={stripped}` executes as a \
                      shell command — inner: {reason}",
@@ -2630,8 +2614,7 @@ fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
         // let S2 ship. The next contributor adding a tool here
         // must remember it.
         "cp" | "mv" | "install" | "ln" | "rsync" => {
-            target_directory_flag(&stage.args)
-                .or_else(|| last_positional_arg(&stage.args, 2))
+            target_directory_flag(&stage.args).or_else(|| last_positional_arg(&stage.args, 2))
         }
         // `dd if=SRC of=DEST [...]`.
         "dd" => stage
@@ -2720,10 +2703,7 @@ fn short_flag_contains(arg: &str, letter: char) -> bool {
 /// "no destination specified" for most tools (cp/mv treat it as
 /// "copy to cwd") so we don't flag it.
 fn last_positional_arg(args: &[String], min_positional: usize) -> Option<String> {
-    let positionals: Vec<&String> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .collect();
+    let positionals: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     if positionals.len() < min_positional {
         return None;
     }
@@ -2904,11 +2884,7 @@ const ATTACKER_WRITEABLE_SYSTEM_DIRS: &[&str] = &[
 
 /// Home-relative subdirectories in the attacker-writeable set —
 /// anything an agent-downloaded payload typically lands under.
-const ATTACKER_WRITEABLE_HOME_SUBDIRS: &[&str] = &[
-    "Downloads",
-    ".cache",
-    "Library/Caches",
-];
+const ATTACKER_WRITEABLE_HOME_SUBDIRS: &[&str] = &["Downloads", ".cache", "Library/Caches"];
 
 /// Is `path` in a well-known attacker-writeable directory where a
 /// `chmod +x` is highly suspicious? Expands leading `~` using $HOME.
@@ -3031,39 +3007,28 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         // Scripting languages whose `-c` / `-e` / `-r` / `BEGIN{…}`
         // form runs inline code that can call a subshell.
         let inline = match bn {
-            "python" | "python2" | "python3" | "python3.10" | "python3.11"
-            | "python3.12" | "python3.13" | "python3.14" => {
-                extract_after_flag(&stage.args, "-c")
-            }
-            "perl" => {
-                extract_after_flag(&stage.args, "-e")
-                    .or_else(|| extract_after_flag(&stage.args, "-E"))
-            }
-            "ruby" => {
-                extract_after_flag(&stage.args, "-e")
-                    .or_else(|| extract_after_flag(&stage.args, "-rubygems"))
-            }
-            "node" | "nodejs" | "deno" | "bun" => {
-                extract_after_flag(&stage.args, "-e")
-                    .or_else(|| extract_after_flag(&stage.args, "-p"))
-                    .or_else(|| extract_after_flag(&stage.args, "--eval"))
-                    .or_else(|| extract_after_flag(&stage.args, "--print"))
-            }
+            // `-c CODE` family: python family + guile.
+            "python" | "python2" | "python3" | "python3.10" | "python3.11" | "python3.12"
+            | "python3.13" | "python3.14" | "guile" => extract_after_flag(&stage.args, "-c"),
+            "perl" => extract_after_flag(&stage.args, "-e")
+                .or_else(|| extract_after_flag(&stage.args, "-E")),
+            "ruby" => extract_after_flag(&stage.args, "-e")
+                .or_else(|| extract_after_flag(&stage.args, "-rubygems")),
+            "node" | "nodejs" | "deno" | "bun" => extract_after_flag(&stage.args, "-e")
+                .or_else(|| extract_after_flag(&stage.args, "-p"))
+                .or_else(|| extract_after_flag(&stage.args, "--eval"))
+                .or_else(|| extract_after_flag(&stage.args, "--print")),
             "php" => extract_after_flag(&stage.args, "-r"),
-            "lua" | "lua5.1" | "lua5.2" | "lua5.3" | "lua5.4"
-            | "luajit" | "tclsh" | "rscript" => {
-                extract_after_flag(&stage.args, "-e")
-            }
+            // `-e CODE` family: lua / tclsh / rscript / swift / racket.
+            "lua" | "lua5.1" | "lua5.2" | "lua5.3" | "lua5.4" | "luajit" | "tclsh" | "rscript"
+            | "swift" | "racket" => extract_after_flag(&stage.args, "-e"),
             // awk/gawk/mawk: the PROGRAM positional (after all flags)
             // is the inline code. Detect by scanning for BEGIN/END
             // action blocks with system() / getline "| sh".
             "awk" | "gawk" | "mawk" | "nawk" => awk_program_string(&stage.args),
-            // 1.2.0 6th-pass review (GPT SEVERE G-S5): additional
-            // scripting languages with a documented `-e` inline form.
+            // julia accepts `-e` AND `-E` (uppercase = eval + print).
             "julia" => extract_after_flag(&stage.args, "-e")
                 .or_else(|| extract_after_flag(&stage.args, "-E")),
-            "swift" | "racket" => extract_after_flag(&stage.args, "-e"),
-            "guile" => extract_after_flag(&stage.args, "-c"),
             "sbcl" => extract_after_flag(&stage.args, "--eval"),
             _ => None,
         };
@@ -3089,9 +3054,7 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         //     network-tool name alone (without secret/env) would
         //     miss `scan_payload_for_exfil`, but when paired with a
         //     subprocess spawn API it's unambiguous.
-        if code_calls_subprocess(&code)
-            && network_tool_word_regex().is_match(&code)
-        {
+        if code_calls_subprocess(&code) && network_tool_word_regex().is_match(&code) {
             return Some(format!(
                 "blocked: `{bn}` inline code invokes a \
                  subprocess-spawning API (`os.system` / \
@@ -3118,9 +3081,12 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         // in the inline string is a direct amplifier regardless of
         // secret/env context.
         let lower = code.to_ascii_lowercase();
-        if lower.contains("system(\"curl") || lower.contains("system('curl")
-            || lower.contains("execsync(\"curl") || lower.contains("execsync('curl")
-            || lower.contains("system(\"wget") || lower.contains("system('wget")
+        if lower.contains("system(\"curl")
+            || lower.contains("system('curl")
+            || lower.contains("execsync(\"curl")
+            || lower.contains("execsync('curl")
+            || lower.contains("system(\"wget")
+            || lower.contains("system('wget")
         {
             return Some(format!(
                 "blocked: `{bn}` inline code calls a subprocess \
@@ -3170,8 +3136,7 @@ fn count_octal_ascii_escapes(code: &str) -> usize {
             && (b'0'..=b'7').contains(&bytes[i + 2])
         {
             // Consume a 2-3 digit octal escape.
-            let has_third = i + 3 < bytes.len()
-                && (b'0'..=b'7').contains(&bytes[i + 3]);
+            let has_third = i + 3 < bytes.len() && (b'0'..=b'7').contains(&bytes[i + 3]);
             count += 1;
             i += 3 + usize::from(has_third);
             continue;
@@ -3219,11 +3184,22 @@ fn code_calls_subprocess(code: &str) -> bool {
     // s-expression forms (`(system `, `(exec `) used by racket /
     // guile / scheme.
     let needles: &[&str] = &[
-        "os.system", "subprocess.", "os.popen", "os.execv", "os.exec",
-        "popen(", "system(", "exec(", "execsync(", "execfilesync(",
-        "spawn(", "spawnsync(",
-        "ccall(:system", "runtime.getruntime().exec",
-        "processbuilder", "process.start",
+        "os.system",
+        "subprocess.",
+        "os.popen",
+        "os.execv",
+        "os.exec",
+        "popen(",
+        "system(",
+        "exec(",
+        "execsync(",
+        "execfilesync(",
+        "spawn(",
+        "spawnsync(",
+        "ccall(:system",
+        "runtime.getruntime().exec",
+        "processbuilder",
+        "process.start",
         "backtick(",
         // Perl `qx{}` / `qx//` / `qx()` and Ruby `%x{}` / `%x//` /
         // `%x()` — the non-bare-backtick forms. Narrowed from a bare
@@ -3231,8 +3207,21 @@ fn code_calls_subprocess(code: &str) -> bool {
         // a docstring / comment / string literal) to these explicit
         // delimited forms. 1.2.0 8th-pass adversarial review
         // (Claude HIGH 8H3).
-        "%x{", "%x(", "%x[", "%x<", "%x/", "%x|", "%x!",
-        "qx{", "qx(", "qx[", "qx<", "qx/", "qx|", "qx!", "qx\"",
+        "%x{",
+        "%x(",
+        "%x[",
+        "%x<",
+        "%x/",
+        "%x|",
+        "%x!",
+        "qx{",
+        "qx(",
+        "qx[",
+        "qx<",
+        "qx/",
+        "qx|",
+        "qx!",
+        "qx\"",
         // Bare-backtick shell-out: require the backtick to be
         // followed by a known dangerous command NAME AND A SPACE
         // (argv[0] + at least one argv[1]) — this catches the
@@ -3240,19 +3229,30 @@ fn code_calls_subprocess(code: &str) -> bool {
         // ignoring backticks in docstrings like `\`curl\`` and
         // code-fence markers like `\`\`\`bash` which have no
         // trailing space-then-arg.
-        "`curl ", "`wget ", "`bash ", "`sh ", "`nc ",
-        "io.popen", "io.spawn",
-        "start-process",        // PowerShell (covered elsewhere, defensive)
+        "`curl ",
+        "`wget ",
+        "`bash ",
+        "`sh ",
+        "`nc ",
+        "io.popen",
+        "io.spawn",
+        "start-process", // PowerShell (covered elsewhere, defensive)
         // S-expression / Lisp-family: `(system "…")`, `(exec "…")`,
         // `(process "…")`.
-        "(system ", "(system\t", "(system\"",
-        "(exec ", "(exec\t",
-        "(process ", "(subprocess ",
+        "(system ",
+        "(system\t",
+        "(system\"",
+        "(exec ",
+        "(exec\t",
+        "(process ",
+        "(subprocess ",
         // Ruby/Perl command-style call WITHOUT parens:
         // `system "..."`, `exec "..."`. The trailing space-then-quote
         // keeps the false-positive rate low vs a bare `system`.
-        "system \"", "system '",
-        "exec \"", "exec '",
+        "system \"",
+        "system '",
+        "exec \"",
+        "exec '",
     ];
     needles.iter().any(|n| lower.contains(n))
 }
@@ -3266,7 +3266,8 @@ fn code_has_obfuscation_marker(code: &str) -> bool {
     if lower.contains("b64decode") || lower.contains("base64.decode")
         || lower.contains("base64_decode") || lower.contains("atob(")
         || lower.contains("buffer.from(")   // Node: Buffer.from(x, 'base64')
-        || lower.contains("from_base64")    // Rust/Julia variants
+        || lower.contains("from_base64")
+    // Rust/Julia variants
     {
         return true;
     }
@@ -3304,8 +3305,15 @@ fn code_has_obfuscation_marker(code: &str) -> bool {
     //
     // Heuristic: any quoted fragment that's a non-trivial prefix of
     // one of the danger words, adjacent to a concat marker.
-    let concat_markers: &[&str] =
-        &["+", "string-append", ".concat(", " . ", "..", "<>", "concat("];
+    let concat_markers: &[&str] = &[
+        "+",
+        "string-append",
+        ".concat(",
+        " . ",
+        "..",
+        "<>",
+        "concat(",
+    ];
     let has_concat = concat_markers.iter().any(|m| lower.contains(m));
     if !has_concat {
         return false;
@@ -3361,10 +3369,7 @@ fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
         // of `" ' ( ; =` so this is a safe heuristic.
         if flag.len() == 2 {
             if let Some(rest) = a.strip_prefix(flag) {
-                if !rest.is_empty()
-                    && !rest.starts_with('=')
-                    && is_plausible_attached_code(rest)
-                {
+                if !rest.is_empty() && !rest.starts_with('=') && is_plausible_attached_code(rest) {
                     return Some(rest.to_string());
                 }
                 // Else fall through — this looks like another long flag
@@ -3383,9 +3388,8 @@ fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
 /// alpha-continuation like `xperimental-vm-modules` is a distinct
 /// flag, not our value.
 fn is_plausible_attached_code(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(c, '"' | '\'' | '(' | ';' | '$' | '=' | '{' | '[')
-    })
+    s.chars()
+        .any(|c| matches!(c, '"' | '\'' | '(' | ';' | '$' | '=' | '{' | '['))
 }
 
 /// For `awk 'PROGRAM' [file...]`, return ALL positionals as a joined
@@ -3491,10 +3495,7 @@ fn awk_looks_like_assignment(s: &str) -> bool {
     // `VAR=VALUE` shape: at least one `=`, and the part before `=`
     // is a plain identifier (no quotes, no parens, no spaces).
     if let Some((name, _)) = s.split_once('=') {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     } else {
         false
     }
@@ -3506,7 +3507,8 @@ fn awk_looks_like_field_sep(s: &str) -> bool {
     if s.len() > 16 {
         return false;
     }
-    !s.chars().any(|c| matches!(c, '(' | ';' | '{' | '$' | '"' | '\''))
+    !s.chars()
+        .any(|c| matches!(c, '(' | ';' | '{' | '$' | '"' | '\''))
 }
 
 fn awk_looks_like_filename(s: &str) -> bool {
@@ -3569,9 +3571,9 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
     // `submodule.*.update=!cmd` — ran on `git submodule update`.
     // `includeif.*.path=/path` — same risk as `include.path`.
     const DANGEROUS_PREFIX_CLASSES: &[(&str, &str)] = &[
-        ("alias.", ""),                // alias.ANY_NAME
-        ("submodule.", ".update"),     // submodule.X.update
-        ("includeif.", ".path"),       // includeif.X.path
+        ("alias.", ""),            // alias.ANY_NAME
+        ("submodule.", ".update"), // submodule.X.update
+        ("includeif.", ".path"),   // includeif.X.path
     ];
 
     // 1.2.0 8th-pass adversarial review (Claude SEVERE S1): git env

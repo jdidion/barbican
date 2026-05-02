@@ -465,10 +465,7 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
 /// tree-sitter-bash the node has `name` and `value` fields (either
 /// may be missing for edge cases); we return `None` if either is
 /// unavailable.
-fn extract_variable_assignment(
-    node: Node<'_>,
-    src: &[u8],
-) -> Option<(String, String)> {
+fn extract_variable_assignment(node: Node<'_>, src: &[u8]) -> Option<(String, String)> {
     let name = node.child_by_field_name("name")?;
     let value = node.child_by_field_name("value");
     let name_text = extract_word_text(name, src).ok()?;
