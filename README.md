@@ -1,4 +1,6 @@
-<img src="docs/assets/barbican-logo.png" alt="Barbican logo" align="right" width="160" height="160">
+<p align="center">
+  <img src="docs/assets/barbican-logo.png" alt="Barbican logo" width="220" height="220">
+</p>
 
 # Barbican
 
