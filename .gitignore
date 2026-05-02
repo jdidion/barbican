@@ -9,6 +9,17 @@ crates/barbican/fuzz/target/
 crates/barbican/fuzz/Cargo.lock
 crates/barbican/fuzz/artifacts/
 crates/barbican/fuzz/coverage/
+# Libfuzzer-discovered inputs are named by their SHA-1 hash: exactly
+# 40 lowercase-hex characters with no extension. Our hand-picked seed
+# files have descriptive names that always contain at least one `_`
+# (`h1_curl_pipe_bash`, `allow_ls`, `ansi_c`, …). Ignoring corpus
+# files without an underscore catches libfuzzer-generated entries
+# without touching the committed seeds. A future seed file must
+# include an underscore to stay tracked.
+crates/barbican/fuzz/corpus/**/*
+!crates/barbican/fuzz/corpus/
+!crates/barbican/fuzz/corpus/*/
+!crates/barbican/fuzz/corpus/**/*_*
 
 # macOS
 .DS_Store
