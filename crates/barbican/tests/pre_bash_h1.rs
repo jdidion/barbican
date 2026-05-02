@@ -642,6 +642,66 @@ fn malformed_hook_json_denies_by_default() {
     assert_eq!(run_pre_bash(r#"{"tool_name":"Bash","tool_input":42}"#), 2);
 }
 
+// 1.3.0 fuzzing finding: `pre_bash::run` read stdin via
+// `read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow's
+// `?` bubbled that out of `main` as exit code 1 — violating
+// CLAUDE.md rule #1. Fixed by reading raw bytes and mapping the
+// UTF-8 error to `EXIT_DENY=2` with a reason on stderr, mirroring
+// the malformed-JSON path above. Pinned here so a future refactor
+// can't reintroduce the fail-open shape.
+
+#[test]
+fn non_utf8_stdin_denies_by_default() {
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = std::process::Command::new(bin)
+        .arg("pre-bash")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    // Raw 0xFF / 0xFE / 0xFD bytes are invalid as start bytes for any
+    // UTF-8 code point. Would have crashed read_to_string before the
+    // 1.3.0 fix.
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&[0xFF, 0xFE, 0xFD, 0x00, 0xC0, 0xC1])
+        .unwrap();
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "non-UTF-8 stdin must deny by default, not error out as exit 1"
+    );
+}
+
+#[test]
+fn non_utf8_stdin_escape_hatch_allows_when_env_set() {
+    let bin = env!("CARGO_BIN_EXE_barbican");
+    let mut child = std::process::Command::new(bin)
+        .arg("pre-bash")
+        .env("BARBICAN_ALLOW_MALFORMED_HOOK_JSON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&[0xFF, 0xFE, 0xFD])
+        .unwrap();
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "escape hatch must cover non-UTF-8 stdin in parity with malformed JSON"
+    );
+}
+
 #[test]
 fn malformed_hook_json_escape_hatch_allows_when_env_set() {
     // The escape hatch is for a scenario where Claude Code's own hook
