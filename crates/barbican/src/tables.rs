@@ -211,6 +211,10 @@ pub static ENV_DUMPERS: Set<&'static str> = phf_set! {
 /// `NETWORK_TOOLS_HARD` (which is H1's tight curl|wget|nc|socat|ssh
 /// set) — M2 also cares about upload-style tools that write a local
 /// file directly to a remote host.
+///
+/// 1.2.1 M-2 adversarial review: added `aria2c`, `lftp`, `rclone`,
+/// `gsutil`, `aws`, `az`, `gcloud`. Keep in lock-step with
+/// `network_tool_word_regex` in `hooks/pre_bash.rs`.
 pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     // Direct transfer
     "curl", "wget", "nc", "ncat", "netcat", "socat",
@@ -218,6 +222,13 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     "dig", "host", "nslookup", "drill", "resolvectl",
     // Remote copy / sync
     "scp", "rsync", "sftp", "ftp", "tftp",
+    // Multi-protocol download/upload clients
+    "aria2c", "lftp",
+    // Cloud-storage movers — file upload to S3/GCS/Azure/Dropbox/etc.
+    "rclone", "gsutil",
+    // Cloud-provider CLIs with file-upload subcommands
+    // (`aws s3 cp -`, `az storage blob upload`, `gcloud storage cp`).
+    "aws", "az", "gcloud",
     // HTTP clients
     "http", "https", "httpie", "xh",
     // Mail clients (can be used for exfil)

