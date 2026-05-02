@@ -63,6 +63,57 @@ jobs:
         # isn't compiled into Barbican. Documented in SECURITY.md.
         run: cargo audit --deny warnings --ignore RUSTSEC-2026-0118
 
+  linux-fuzz-repro:
+    # Reproducer job for the Linux-only tree-sitter-bash SIGSEGV
+    # finding from the 1.3.0 proptest layer. The parser-touching
+    # properties in `tests/fuzz_properties.rs` are gated
+    # `#[cfg(not(target_os = "linux"))]` because the first CI run
+    # crashed with no diagnostics. This job runs a dedicated
+    # Linux-only test file (`tests/linux_repro.rs`) that writes each
+    # generated input to a log file + fsyncs BEFORE the parse call,
+    # so a SIGSEGV leaves the triggering input on disk. The log is
+    # uploaded as a workflow artifact; once we have the minimized
+    # crasher, the fix lands red-test-first on a normal branch.
+    #
+    # `continue-on-error: true` — the whole point of this job is to
+    # crash. A non-crash doesn't mean no bug; it just means this
+    # run didn't hit the offending seed.
+    name: linux fuzz repro (best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      BARBICAN_LINUX_REPRO: "1"
+      BARBICAN_REPRO_LOG: ${{ github.workspace }}/barbican-repro.txt
+      # Widen proptest's per-test case count so a single job has a
+      # realistic chance of tripping the crash. Default is 256.
+      PROPTEST_CASES: "8192"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-fuzz-repro
+      - name: Run the repro harness
+        # The harness is in `tests/linux_repro.rs`. It's a normal
+        # `#[test]` so regular `cargo test` picks it up, but the
+        # file is `#![cfg(target_os = "linux")]` and each property
+        # early-returns unless BARBICAN_LINUX_REPRO is lit, so this
+        # never runs outside this job.
+        run: cargo test --test linux_repro --release -- --nocapture
+      - name: Report run outcome
+        if: always()
+        run: |
+          echo "Repro log size: $(wc -c < barbican-repro.txt 2>/dev/null || echo 0) bytes"
+          echo "Last 3 entries:"
+          tail -n 3 barbican-repro.txt 2>/dev/null || echo "(log empty or missing)"
+      - name: Upload repro log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-fuzz-repro-log
+          path: barbican-repro.txt
+          if-no-files-found: warn
+          retention-days: 14
+
   release-build:
     name: release build (aarch64-apple-darwin)
     runs-on: macos-latest
