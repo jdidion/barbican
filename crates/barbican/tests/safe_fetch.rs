@@ -50,6 +50,11 @@ fn run(url: &str) -> String {
 // Scheme restrictions.
 // ---------------------------------------------------------------------
 
+/// The opaque user-visible error message. Must match the constant in
+/// `mcp::safe_fetch` — collapsed in 1.2.1 to close the DNS-reachability
+/// side channel (every fetch error looks identical).
+const OPAQUE_FETCH_ERROR: &str = "target cannot be fetched";
+
 #[test]
 fn rejects_file_scheme() {
     let out = run("file:///etc/passwd");
@@ -58,8 +63,8 @@ fn rejects_file_scheme() {
         "want error tag; got: {out}"
     );
     assert!(
-        out.contains("non-http"),
-        "want non-http scheme reason; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -67,7 +72,7 @@ fn rejects_file_scheme() {
 fn rejects_gopher_scheme() {
     let out = run("gopher://example.com/");
     assert!(out.contains("<barbican-error"));
-    assert!(out.contains("non-http"));
+    assert!(out.contains(OPAQUE_FETCH_ERROR));
 }
 
 #[test]
@@ -87,8 +92,8 @@ fn rejects_raw_ipv4_literal_by_default() {
     let out = run("http://1.1.1.1/");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("raw IP literals rejected"),
-        "want raw-IP reason; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -103,15 +108,17 @@ fn rejects_raw_ipv6_literal_by_default() {
 #[test]
 fn rejects_loopback_literal_even_with_override() {
     // Override lets public IP literals through, but the SSRF filter
-    // still blocks loopback / RFC1918.
+    // still blocks loopback / RFC1918. The user-visible error is opaque
+    // (detail stays in the audit log) but the error envelope must still
+    // be present.
     let _g = env_guard();
     std::env::set_var("BARBICAN_ALLOW_IP_LITERALS", "1");
     let out = run("http://127.0.0.1/");
     std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("loopback") || out.contains("blocked"),
-        "want loopback-blocked reason; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -123,8 +130,8 @@ fn rejects_imds_literal_even_with_override() {
     std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("link-local") || out.contains("blocked"),
-        "want link-local/IMDS reason; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -136,8 +143,8 @@ fn rejects_rfc1918_literal_even_with_override() {
     std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("RFC1918") || out.contains("blocked"),
-        "want RFC1918 reason; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -152,8 +159,8 @@ fn rejects_localhost_hostname() {
     let out = run("http://localhost/");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("loopback") || out.contains("blocked"),
-        "want loopback-blocked; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
     );
 }
 
@@ -167,8 +174,8 @@ fn rejects_localhost_with_trailing_dot() {
     let out = run("http://localhost./");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("loopback") || out.contains("blocked"),
-        "want loopback-blocked for trailing-dot host; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error for trailing-dot host; got: {out}"
     );
 }
 
@@ -178,16 +185,61 @@ fn rejects_ipv6_loopback_literal_via_ssrf_filter() {
     // brackets; the previous code passed that string straight to
     // hickory, which failed with DNS error. After the fix the IPv6
     // literal should route through the IP-literal short-circuit and
-    // hit the SSRF filter with a named loopback reason.
+    // hit the SSRF filter with a named loopback reason (in the audit
+    // log — the user-visible error stays opaque).
     let _g = env_guard();
     std::env::set_var("BARBICAN_ALLOW_IP_LITERALS", "1");
     let out = run("http://[::1]/");
     std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
     assert!(out.contains("<barbican-error"));
     assert!(
-        out.contains("loopback") || out.contains("blocked"),
-        "want loopback-blocked, not DNS error; got: {out}"
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error (NOT DNS leak); got: {out}"
     );
+}
+
+// ---------------------------------------------------------------------
+// 1.2.1 MEDIUM: DNS-reachability side channel.
+// ---------------------------------------------------------------------
+
+#[test]
+fn user_visible_error_is_identical_across_nxdomain_rfc1918_and_loopback() {
+    // An attacker prompt that iterates hostnames and reads the error
+    // phrasing used to be able to learn reachability state (NXDOMAIN
+    // vs resolved-to-RFC1918 vs resolved-to-loopback). After 1.2.1 the
+    // user-visible error body must be IDENTICAL across these cases —
+    // the richer detail stays in the audit log.
+    let _g = env_guard();
+    std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
+    // NXDOMAIN-style: `.invalid` TLD never resolves.
+    let nx = run("http://barbican-no-such-host.invalid/");
+    // Resolves to loopback.
+    let lo = run("http://localhost/");
+    // Raw RFC1918 literal (gated by the raw-IP check, not DNS).
+    let rfc = run("http://10.0.0.1/");
+    for out in [&nx, &lo, &rfc] {
+        assert!(
+            out.contains("<barbican-error"),
+            "want error tag; got: {out}"
+        );
+        assert!(
+            out.contains(OPAQUE_FETCH_ERROR),
+            "want opaque message; got: {out}"
+        );
+        // Negative: none of the discriminating phrases may appear.
+        for leaky in [
+            "DNS resolution failed",
+            "no A/AAAA records",
+            "IP address in blocked range",
+            "raw IP literals rejected",
+            "loopback",
+            "RFC1918",
+            "link-local",
+            "refused non-http",
+        ] {
+            assert!(!out.contains(leaky), "error leaked detail `{leaky}`: {out}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -235,7 +287,10 @@ async fn wiremock_loopback_source_is_ssrf_rejected() {
     std::env::remove_var("BARBICAN_ALLOW_IP_LITERALS");
 
     assert!(out.contains("<barbican-error"));
-    assert!(out.contains("loopback") || out.contains("blocked"));
+    assert!(
+        out.contains(OPAQUE_FETCH_ERROR),
+        "want opaque fetch error; got: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------
