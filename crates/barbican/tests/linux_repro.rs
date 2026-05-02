@@ -42,8 +42,7 @@ fn repro_log_path() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         std::env::var_os("BARBICAN_REPRO_LOG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp/barbican-repro.txt"))
+            .map_or_else(|| PathBuf::from("/tmp/barbican-repro.txt"), PathBuf::from)
     })
 }
 
@@ -51,6 +50,14 @@ fn repro_log_path() -> &'static PathBuf {
 /// reach disk before the potentially-crashing parse call. Returns
 /// `true` on success; errors are logged but not propagated — we don't
 /// want the logger itself to mask a real finding.
+///
+/// Format: each entry is one line, starting with `len=NNN hex=` and
+/// followed by the raw bytes of the input as lowercase hex. Hex
+/// avoids every escape-reconstruction ambiguity that a Debug-printed
+/// `&str` introduces (mismatched lone replacement chars, `\u{…}`
+/// ranges vs. literal emoji, embedded `\"` vs. `"`). The last entry
+/// in the log is the crashing input — `xxd -r -p` turns it back into
+/// the exact bytes.
 fn log_input(input: &str) -> bool {
     let Ok(mut f) = OpenOptions::new()
         .create(true)
@@ -59,7 +66,13 @@ fn log_input(input: &str) -> bool {
     else {
         return false;
     };
-    let _ = writeln!(f, "len={} utf8={:?}", input.len(), input);
+    let bytes = input.as_bytes();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    let _ = writeln!(f, "len={} hex={hex}", bytes.len());
     let _ = f.flush();
     let _ = f.sync_all();
     true
