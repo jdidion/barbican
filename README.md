@@ -1,3 +1,5 @@
+<img src="docs/assets/barbican-logo.png" alt="Barbican logo" align="right" width="160" height="160">
+
 # Barbican
 
 A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a single static Rust binary. Barbican runs as a `PreToolUse` / `PostToolUse` hook and as an MCP server that exposes sanitized fetch / read / inspect tools, blocking a concrete list of known-dangerous bash compositions and prompt-injection patterns before they reach the model.
