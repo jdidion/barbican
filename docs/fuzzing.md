@@ -29,9 +29,25 @@ Two real bugs surfaced on the first runs of the 1.3.0 properties. One is now fix
 | Test | Shrunk input | Bug | Status |
 | ---- | ------------ | --- | ------ |
 | `pre_bash_hook_exit_contract_holds` | arbitrary non-UTF-8 bytes on stdin | `pre_bash::run` called `stdin.read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow bubbled the error to `main` → exit 1. CLAUDE.md rule #1 demands the non-UTF-8 stdin path map to `EXIT_DENY=2` + reason-on-stderr, like the malformed-JSON path from 1.2.0 H-3. | **Fixed in 1.3.0**: read raw bytes, decode via `str::from_utf8`, mirror the JSON deny branch. Pinned by `non_utf8_stdin_denies_by_default` + `non_utf8_stdin_escape_hatch_allows_when_env_set` in `tests/pre_bash_h1.rs`; proptest property is now active. |
-| `parser_never_panics_on_bounded_utf8` (and its classifier-layer siblings, which reach `parse` through `classify_command`) | unknown (see note) | Linux-only: the test binary takes `SIGSEGV` within 180 ms of starting on Ubuntu (macOS passes cleanly). No per-input diagnostics flushed before the crash, so the shrunk reproducer is not yet in hand — only the pre-CI corpus bounds. Likely shape: a stack overflow or invalid memory access in the `tree-sitter-bash` FFI driven with arbitrary generated UTF-8. | **Pinned pending repro**: properties that reach `parse` are gated behind `#[cfg(not(target_os = "linux"))]`; `validate_url` and `path_in_attacker_writable_dir` run on every platform. |
+| `parser_never_panics_on_bounded_utf8` (and its classifier-layer siblings, which reach `parse` through `classify_command`) | 2863-byte UTF-8 string, mixed emoji + bidi + bash metacharacters, balanced {} depth 19, balanced () depth 6 (see `linux-fuzz-repro-log` CI artifact for exact bytes) | Linux-only: `SIGSEGV` inside the `tree-sitter-bash` FFI within 200 ms of starting. macOS parses the same input cleanly as `Err(Malformed)`. Likely a stack overflow in tree-sitter's C-level error recovery on inputs with deep brace nesting + many unbalanced quotes/backticks. | **Reproducer captured; fix pending**: the `linux-fuzz-repro` CI job (best-effort, `continue-on-error: true`) logs each proptest input as hex before calling `parse`, so crashes leave the triggering bytes on disk. The last `len=… hex=…` line of the uploaded `linux-fuzz-repro-log` artifact is the current crasher; `xxd -r -p` decodes it. Properties that reach `parse` remain `#[cfg(not(target_os = "linux"))]`-gated until the fix lands. |
 
-Open investigation thread for the Linux-segfault finding: run the generated `proptest` inputs one at a time under `valgrind` / `rr` on an Ubuntu host, log each input before the parser call, and reduce the first crashing case by hand. Once reproduced, the fix lands the same way every other classifier finding has: red-test-first under the minimized input, then the code change.
+#### Working with a captured Linux crasher
+
+Every run of the `linux-fuzz-repro` CI job uploads a `linux-fuzz-repro-log` artifact (retained 14 days). On a run that crashed, the last line is the exact input that tripped the segfault. Workflow:
+
+```sh
+gh run download <run-id> -R jdidion/barbican --name linux-fuzz-repro-log --dir /tmp/repro
+tail -n 1 /tmp/repro/barbican-repro.txt \
+  | sed 's/^len=[0-9]* hex=//' \
+  | xxd -r -p > /tmp/crash-input.bin
+```
+
+`/tmp/crash-input.bin` is the exact byte sequence that crashed the tree-sitter-bash FFI in that run. From there, the path to a fix is:
+
+1. **Bisect the input**: binary-search on input prefix length + selective byte deletion to find the minimal crasher. Run on Linux — macOS parsing is not a reliable signal.
+2. **Pin a red-test-first PoC**: `tests/pre_bash_parser.rs` (new file or extension) containing `#[test] fn linux_crash_<shape>_denies_cleanly()`, loading the minimized bytes via `include_bytes!`.
+3. **Close the bug**: either an input-length / depth cap at `parser::parse`'s entrance, a patched tree-sitter-bash upstream, or a wrapper that catches the signal and returns `Err(Malformed)`.
+4. **Drop the gates**: once the test passes on Linux, remove the `#[cfg(not(target_os = "linux"))]` attributes in `tests/fuzz_properties.rs`.
 
 ## Layer 2 — cargo-fuzz (nightly only, optional)
 
