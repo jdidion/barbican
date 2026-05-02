@@ -197,6 +197,16 @@ impl std::error::Error for ParseError {}
 
 /// Parse `input` as a bash script.
 pub fn parse(input: &str) -> Result<Script, ParseError> {
+    // 1.3.1 defense: reject inputs that trip the tree-sitter-bash
+    // SIGSEGV in the `{` + U+31860 shape before they reach the FFI.
+    // Discovered via the 1.3.0 fuzzing layer; bisected to a 5-byte
+    // minimal reproducer on Linux. Filed upstream as well, but the
+    // deny-by-default rule demands we close the path locally — a
+    // classifier that can't parse its input must deny, not panic.
+    if let Err(e) = preflight_known_crashers(input) {
+        return Err(e);
+    }
+
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -209,6 +219,41 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 
     let src = input.as_bytes();
     walk_program(&tree, src)
+}
+
+/// Deny-by-default for inputs known to crash the `tree-sitter-bash`
+/// FFI on Linux.
+///
+/// Currently catches: any `{` followed by the 4-byte UTF-8 encoding
+/// of U+31860 (CJK Unified Ideograph Extension G, bytes F0 B1 A1
+/// 80). Found by the 1.3.0 proptest fuzzer and bisected to a 5-byte
+/// minimal reproducer. Not a generic codepoint-range filter — other
+/// astral-plane codepoints in the same position parse cleanly (deny
+/// as `Err(Malformed)`); only this specific pairing crashes.
+///
+/// The check is a single linear scan over the input bytes. If more
+/// crashers surface over time the scan grows into a small list of
+/// dangerous byte patterns; that stays cheap. If the list grows
+/// past a handful, we escalate to a fork-based signal-catching
+/// wrapper.
+fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
+    // U+31860 as UTF-8: 0xF0 0xB1 0xA1 0x80
+    const U31860: &[u8] = &[0xF0, 0xB1, 0xA1, 0x80];
+    let bytes = input.as_bytes();
+    if bytes.len() < 5 {
+        return Ok(());
+    }
+    // Scan for `{` followed (possibly with intervening bytes? No —
+    // the bisect showed IMMEDIATE adjacency is the trigger; space
+    // or letter between the brace and the codepoint reverted to a
+    // clean parse). So we only need to match `{<U+31860>` as
+    // adjacent bytes.
+    for i in 0..bytes.len() - 4 {
+        if bytes[i] == b'{' && &bytes[i + 1..i + 5] == U31860 {
+            return Err(ParseError::Malformed);
+        }
+    }
+    Ok(())
 }
 
 /// Walk the `program` root and collect every pipeline.

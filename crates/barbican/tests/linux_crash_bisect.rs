@@ -221,7 +221,6 @@ fn aaa_classifier_probes() {
         })
         .to_string();
         log(&format!("probe={name} about-to-spawn len={}", bytes.len()));
-        use std::io::Write as _;
         let mut child = std::process::Command::new(bin)
             .arg("pre-bash")
             .stdin(std::process::Stdio::piped())
@@ -237,7 +236,7 @@ fn aaa_classifier_probes() {
             Some(0) => "exit-0-allow".to_string(),
             Some(2) => "exit-2-deny".to_string(),
             Some(n) => format!("exit-{n}"),
-            None => format!("signal-{:?}", status),
+            None => format!("signal-{status:?}"),
         };
         log(&format!(
             "probe={name} outcome={outcome} len={}",

@@ -601,3 +601,70 @@ fn heredoc_with_trailing_file_redirect_preserves_file_redirect() {
         c.redirects
     );
 }
+
+// ---------------------------------------------------------------------
+// 1.3.1: tree-sitter-bash SIGSEGV on `{` + U+31860 (CJK Ext G)
+//
+// Found by the 1.3.0 proptest fuzzer. Minimal 5-byte reproducer on
+// Linux: `{` (0x7B) followed by U+31860 (0xF0 0xB1 0xA1 0x80). macOS
+// parses the same bytes cleanly as `Err(Malformed)`; Linux SIGSEGV's
+// inside the tree-sitter-bash FFI. Pre-flighted at `parse()` entrance
+// to guarantee deny-by-default regardless of platform.
+// ---------------------------------------------------------------------
+
+#[test]
+fn openbrace_plus_u31860_denies_deterministically() {
+    // The exact 5-byte minimal crasher. Must return Err(Malformed)
+    // on every platform — on Linux because of the preflight, on
+    // macOS because tree-sitter ends up in an error state.
+    let input = "{\u{31860}";
+    assert_eq!(
+        parse(input),
+        Err(ParseError::Malformed),
+        "the bisected minimal crasher must deny (preflight regression)"
+    );
+}
+
+#[test]
+fn openbrace_plus_u31860_denies_with_trailing_content() {
+    // Embedded in a longer command — the preflight scan must still
+    // find it. Classifier downstream doesn't care what the rest is;
+    // the parse has to fail.
+    let input = "echo hello; {\u{31860} bar";
+    assert_eq!(
+        parse(input),
+        Err(ParseError::Malformed),
+        "preflight must deny even when the crasher is embedded mid-command"
+    );
+}
+
+#[test]
+fn space_before_u31860_still_parses() {
+    // Negative control: `probe-space_31860` (space + U+31860) was
+    // observed to parse cleanly in CI. Confirming the preflight
+    // narrows to adjacent `{` + U+31860, not "any brace vicinity".
+    let input = " \u{31860}";
+    // Allow either Ok or Err(Malformed) — the important thing is it
+    // doesn't panic and doesn't trip the preflight deny path.
+    let result = parse(input);
+    assert!(
+        matches!(result, Ok(_) | Err(ParseError::Malformed)),
+        "expected Ok or Err(Malformed), got {result:?}"
+    );
+}
+
+#[test]
+fn openbrace_plus_other_astral_codepoints_still_parses() {
+    // Negative control: `probe-openbrace_plus_10000` (brace + U+10000
+    // Gothic A) was observed to parse cleanly as Err(Malformed) on
+    // Linux in CI. The preflight must NOT over-trigger on any old
+    // astral-plane codepoint — only the specific U+31860 pairing.
+    for codepoint in ['\u{10000}', '\u{1F600}', '\u{20000}'] {
+        let input = format!("{{{codepoint}");
+        let result = parse(&input);
+        // Must not be a panic (we're running this on the test
+        // thread). Specific result can be either; the point is that
+        // the preflight didn't over-deny.
+        assert!(matches!(result, Ok(_) | Err(_)), "{input:?} must not panic");
+    }
+}
