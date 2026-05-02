@@ -123,6 +123,44 @@ fn aaa_prefix_bisect_captured_crasher() {
     }
 }
 
+/// Runs SECOND (alphabetical, between aaa_ and zzz_). Suffix probes
+/// growing leftward from the identified crash point (byte 2490 in
+/// the full input). The 4-byte suffix ending at byte 2490 is the
+/// single codepoint `U+31860` (𱡀, CJK Unified Ideograph Ext G) —
+/// the candidate trigger. Each larger probe adds more preceding
+/// context. If one of the shorter probes crashes, the crash is
+/// context-independent; if only the larger ones crash, the tree-
+/// sitter error state built up over the preceding 2000+ bytes is
+/// load-bearing.
+#[test]
+fn bbb_suffix_probes_narrowing_from_byte_2490() {
+    if !enabled() {
+        return;
+    }
+    // Smallest → largest. Named by the start-byte offset in the
+    // original file. The 4-byte file is the single codepoint alone.
+    let probes: &[(&str, &[u8])] = &[
+        ("probe-2486_4B_only", include_bytes!("data/probe-2486.bin")),
+        ("probe-2485_5B", include_bytes!("data/probe-2485.bin")),
+        ("probe-2480_10B", include_bytes!("data/probe-2480.bin")),
+        ("probe-2470_20B", include_bytes!("data/probe-2470.bin")),
+        ("probe-2400_90B", include_bytes!("data/probe-2400.bin")),
+        ("probe-2000_490B", include_bytes!("data/probe-2000.bin")),
+    ];
+    for (name, bytes) in probes {
+        log(&format!("probe={name} about-to-parse len={}", bytes.len()));
+        let status = match std::str::from_utf8(bytes) {
+            Ok(s) => match parse(s) {
+                Ok(_) => "ok",
+                Err(ParseError::Malformed) => "err-malformed",
+                Err(ParseError::ParserInit) => "err-init",
+            },
+            Err(_) => "non-utf8",
+        };
+        log(&format!("probe={name} parse={status} len={}", bytes.len()));
+    }
+}
+
 /// Runs LAST. Confirms the full captured input crashes on Linux.
 /// If the prefix bisect above already narrowed a smaller crasher,
 /// this test is redundant but harmless.
