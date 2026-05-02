@@ -103,6 +103,17 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     // bash on the remote, but attack shapes (curl|bash, secret exfil)
     // deny on the local invocation regardless of remote execution.
     "ssh",
+    // 1.2.0 6th-pass review (GPT SEVERE G-S2): sandbox / container
+    // fronts whose argv shape is `CMD [cmd args]` or `[opts] [--] CMD`.
+    "firejail", // firejail [--profile=X] CMD
+    "bwrap",    // bwrap [opts] -- CMD
+    // `docker run`/`podman run` have a more complex shape (flags,
+    // image, CMD). Special-cased in the extractor to scan argv for
+    // `bash -c` / `sh -c` inline-code forms after the image.
+    "docker",
+    "podman",
+    "runc",
+    "crun",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.

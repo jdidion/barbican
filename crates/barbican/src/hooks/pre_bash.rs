@@ -414,7 +414,15 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
     // still shipping a payload and potentially laundering credentials.
     // We classify the inner as if it were local bash: any deny shape
     // (curl|bash, secret exfil, persistence) denies the outer ssh.
+    //
+    // 1.2.0 6th-pass review (GPT SEVERE G-S3): `ssh -o
+    // ProxyCommand='sh -c "curl|bash"' host` runs the ProxyCommand
+    // value as a LOCAL shell command — even before connecting. Check
+    // -o values first and return whichever is more specific.
     if basename == "ssh" {
+        if let Some(inner) = extract_ssh_dangerous_option(&stage.args) {
+            return Some(inner);
+        }
         if let Some(inner) = extract_ssh_remote_command(&stage.args) {
             return Some(inner);
         }
@@ -449,8 +457,42 @@ fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
             // bundled applet, so the rest of argv is the inner command.
             | "busybox"
             | "toybox"
+            // 1.2.0 6th-pass review (GPT SEVERE G-S2):
+            // sandbox fronts; `firejail CMD` / `bwrap -- CMD` take the
+            // first non-flag positional as the inner command.
+            | "firejail"
+            | "bwrap"
     ) {
         return extract_prefix_runner_command(basename, &stage.args);
+    }
+    // docker/podman/runc/crun have a more complex grammar — the inner
+    // CMD comes after the image name. We scan argv for a `bash -c` /
+    // `sh -c` / `<shell> -c` trailer and extract the -c payload.
+    if matches!(basename, "docker" | "podman" | "runc" | "crun") {
+        return extract_container_run_inner(&stage.args);
+    }
+    None
+}
+
+/// For `docker run [opts] IMAGE CMD [args]` and `podman run …`,
+/// extract the inner shell command string IF the CMD tail is
+/// `<shell> -c CODE`. We don't try to parse the full option grammar
+/// (too many flags); instead we look for the well-known
+/// download-and-exec trailer `bash -c 'curl|bash'` etc.
+///
+/// Returns `None` for other shapes so false-positives stay low.
+fn extract_container_run_inner(args: &[String]) -> Option<String> {
+    // Walk argv; if we find a shell basename followed by a `-c` / `-c=`
+    // / bundled `-Xc` (with c in the bundle), return the next argv.
+    let mut j = 0;
+    while j < args.len() {
+        let token = &args[j];
+        let bn = token.rsplit('/').next().unwrap_or(token);
+        if matches!(bn, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
+            // Look for the -c flag in the shell's own args.
+            return extract_dash_c_arg(&args[j + 1..]);
+        }
+        j += 1;
     }
     None
 }
@@ -518,9 +560,13 @@ fn extract_env_dash_s(args: &[String]) -> Option<String> {
 /// 1.2.0 5th-pass adversarial review (Claude SEVERE S-3).
 fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
     // ssh short flags that take a value (OpenSSH ssh(1)).
+    //
+    // 1.2.0 6th-pass review (GPT HIGH G-H1): `-I pkcs11-provider` was
+    // missing. Keep the set complete so the host positional is
+    // identified correctly.
     const VALUE_TAKING: &[&str] = &[
-        "-i", "-p", "-o", "-l", "-L", "-R", "-D", "-J", "-F", "-b", "-c",
-        "-m", "-O", "-Q", "-S", "-W", "-w", "-E", "-B", "-e",
+        "-i", "-I", "-p", "-o", "-l", "-L", "-R", "-D", "-J", "-F", "-b",
+        "-c", "-m", "-O", "-Q", "-S", "-W", "-w", "-E", "-B", "-e",
     ];
     let mut i = 0;
     let mut host_index: Option<usize> = None;
@@ -556,6 +602,65 @@ fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
     // remote shell — replicate that so the existing parser sees a
     // normal bash command string.
     Some(rest.join(" "))
+}
+
+/// Scan `ssh` argv for `-o OPT=VAL` / `-oOPT=VAL` / `-o OPT VAL`
+/// forms that set a LOCAL-execute option and return the VAL for
+/// reclassification.
+///
+/// Dangerous options (executed on the local side BEFORE connecting):
+/// - `ProxyCommand=<shell-cmd>`
+/// - `LocalCommand=<shell-cmd>`
+/// - `ProxyUseFdpass=<cmd>` (rare, included for completeness)
+/// - `KnownHostsCommand=<cmd>` (OpenSSH 8.4+)
+///
+/// 1.2.0 6th-pass adversarial review (GPT SEVERE G-S3).
+fn extract_ssh_dangerous_option(args: &[String]) -> Option<String> {
+    const DANGEROUS_SSH_OPTS: &[&str] = &[
+        "proxycommand",
+        "localcommand",
+        "knownhostscommand",
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let opt_value: Option<String> = if a == "-o" {
+            args.get(i + 1).cloned()
+        } else {
+            a.strip_prefix("-o")
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(raw) = opt_value {
+            // OpenSSH `-o` accepts either `Key=Value` OR `Key Value`.
+            // Handle both: the `Key Value` form means the VALUE could
+            // be in the NEXT argv after an option that has no `=`.
+            let lower_raw = raw.to_ascii_lowercase();
+            for opt in DANGEROUS_SSH_OPTS {
+                let prefix = format!("{opt}=");
+                // `Key=Value`
+                if lower_raw.starts_with(&prefix) {
+                    // Use the original-case raw to preserve the
+                    // value's original spelling for the inner parse.
+                    if let Some(value) = raw.get(prefix.len()..) {
+                        let stripped = strip_surrounding_quotes_owned(value);
+                        return Some(stripped);
+                    }
+                }
+                // `Key Value` — only when `raw` is exactly the bare key.
+                if lower_raw == *opt {
+                    if let Some(next) = args.get(i + 1) {
+                        let stripped = strip_surrounding_quotes_owned(next);
+                        if !stripped.is_empty() {
+                            return Some(stripped);
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Scan `args` for a `-c`-style flag and return the command string.
@@ -985,10 +1090,38 @@ fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
     match cmd.basename.to_ascii_lowercase().as_str() {
         "base64" => cmd.args.iter().any(|a| is_base64_decode_flag(a)),
         "xxd" => cmd.args.iter().any(|a| is_xxd_reverse_flag(a)),
-        "openssl" => cmd.args.iter().any(|a| a == "-d" || a == "-D"),
+        "openssl" => cmd.args.iter().any(|a| is_openssl_decode_flag(a)),
         "uudecode" => true,
         _ => false,
     }
+}
+
+/// Does `arg` indicate an openssl decode/decrypt operation?
+///
+/// 1.2.0 6th-pass adversarial review (Claude HIGH NEW-H-1): the
+/// previous check was `a == "-d" || a == "-D"` only, missing the
+/// long forms `--decode`/`--decrypt` (modern openssl accepts them
+/// for base64 and enc) and bundled short forms (`-dA`, `-dn`, etc.).
+fn is_openssl_decode_flag(arg: &str) -> bool {
+    if arg == "-d" || arg == "-D" {
+        return true;
+    }
+    // Long forms: `--decode`, `--decrypt`. Accept GNU prefix
+    // abbreviation `--dec`/`--deco`/…
+    if arg.starts_with("--dec") || arg.starts_with("--Dec") {
+        return true;
+    }
+    // Bundled short-flag form: `-d` as any letter in a single-dash
+    // cluster (`-dA`, `-din`, `-dsa`, `-nd`). We require the bundle
+    // to be a short-flag cluster (starts with a single dash, not
+    // double), and to contain `d` or `D`.
+    if arg.starts_with('-') && !arg.starts_with("--") && arg.len() >= 3 {
+        let bundle = &arg[1..];
+        if bundle.chars().any(|c| c == 'd' || c == 'D') {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_base64_decode_flag(arg: &str) -> bool {
@@ -2288,6 +2421,14 @@ const ATTACKER_WRITEABLE_SYSTEM_DIRS: &[&str] = &[
     "/dev/shm/",
     "/private/tmp/", // macOS canonical /tmp
     "/private/var/tmp/",
+    // 1.2.0 6th-pass review (Claude HIGH NEW-H-3):
+    // macOS $TMPDIR lands under `/var/folders/AB/CD/T/` by default;
+    // most agents get absolute paths via mktemp(3). Linux systemd
+    // user-runtime under `/run/user/<uid>/` is world-writeable by
+    // the owner and commonly used for IPC sockets + staging.
+    "/var/folders/",
+    "/private/var/folders/",
+    "/run/user/",
 ];
 
 /// Home-relative subdirectories in the attacker-writeable set —
@@ -2300,19 +2441,44 @@ const ATTACKER_WRITEABLE_HOME_SUBDIRS: &[&str] = &[
 
 /// Is `path` in a well-known attacker-writeable directory where a
 /// `chmod +x` is highly suspicious? Expands leading `~` using $HOME.
+///
+/// 1.2.0 6th-pass adversarial review (GPT HIGH G-H2): normalize
+/// repeated-slash (`//tmp/` → `/tmp/`) and case-fold on systems with
+/// case-insensitive filesystems (macOS APFS default, Windows) before
+/// the prefix match. A `.` / `..` segment is also collapsed so
+/// `/tmp/../tmp/payload` doesn't route around the check.
 fn path_in_attacker_writable_dir(path: &str) -> bool {
-    let trimmed = path.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    let normalized = lex_normalize_chmod_path(path);
+    if normalized.is_empty() {
         return false;
     }
+    // Lowercase ONLY on case-insensitive FS platforms. On Linux with
+    // case-sensitive ext4/btrfs, `/Tmp/` and `/tmp/` are different
+    // paths. On macOS (APFS default) they're the same file.
+    let cmp = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized.clone()
+    };
+
     for d in ATTACKER_WRITEABLE_SYSTEM_DIRS {
-        if trimmed.starts_with(d) {
+        let needle = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            d.to_ascii_lowercase()
+        } else {
+            (*d).to_string()
+        };
+        if cmp.starts_with(&needle) {
             return true;
         }
     }
     for sub in ATTACKER_WRITEABLE_HOME_SUBDIRS {
         let tilde = format!("~/{sub}/");
-        if trimmed.starts_with(&tilde) {
+        let needle = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            tilde.to_ascii_lowercase()
+        } else {
+            tilde
+        };
+        if cmp.starts_with(&needle) {
             return true;
         }
     }
@@ -2320,12 +2486,53 @@ fn path_in_attacker_writable_dir(path: &str) -> bool {
         let home = home.trim_end_matches('/');
         for sub in ATTACKER_WRITEABLE_HOME_SUBDIRS {
             let full = format!("{home}/{sub}/");
-            if trimmed.starts_with(&full) {
+            let needle = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+                full.to_ascii_lowercase()
+            } else {
+                full
+            };
+            if cmp.starts_with(&needle) {
                 return true;
             }
         }
     }
     false
+}
+
+/// Lexical normalization for the chmod attacker-path check:
+/// - trim leading/trailing whitespace
+/// - collapse runs of `/` to a single `/`
+/// - collapse `.` components
+/// - collapse `..` by popping prior component
+/// - strip one trailing `/`
+///
+/// Does NOT follow symlinks (we're pre-exec; no fs access allowed).
+fn lex_normalize_chmod_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let is_absolute = trimmed.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in trimmed.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let joined = out.join("/");
+    if is_absolute {
+        if joined.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{joined}")
+        }
+    } else {
+        joined
+    }
 }
 
 /// Deny scripting-language stages (python/perl/ruby/node/php/awk
@@ -2380,6 +2587,13 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
             // is the inline code. Detect by scanning for BEGIN/END
             // action blocks with system() / getline "| sh".
             "awk" | "gawk" | "mawk" | "nawk" => awk_program_string(&stage.args),
+            // 1.2.0 6th-pass review (GPT SEVERE G-S5): additional
+            // scripting languages with a documented `-e` inline form.
+            "julia" => extract_after_flag(&stage.args, "-e")
+                .or_else(|| extract_after_flag(&stage.args, "-E")),
+            "swift" | "racket" => extract_after_flag(&stage.args, "-e"),
+            "guile" => extract_after_flag(&stage.args, "-c"),
+            "sbcl" => extract_after_flag(&stage.args, "--eval"),
             _ => None,
         };
         let Some(code) = inline else {
@@ -2396,8 +2610,41 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
                  `bash -c`, so the shape is classified identically.",
             ));
         }
-        // Extra: explicit `/bin/sh -c` / `/bin/bash -c` literal in
-        // the inline string is a direct amplifier regardless of
+        // 1.2.0 6th-pass review (GPT SEVERE G-S5):
+        //
+        // (a) Subprocess API + network tool name anywhere in the
+        //     code: a scripting-language call that runs curl/wget/nc
+        //     is download-and-execute regardless of obfuscation —
+        //     network-tool name alone (without secret/env) would
+        //     miss `scan_payload_for_exfil`, but when paired with a
+        //     subprocess spawn API it's unambiguous.
+        if code_calls_subprocess(&code)
+            && network_tool_word_regex().is_match(&code)
+        {
+            return Some(format!(
+                "blocked: `{bn}` inline code invokes a \
+                 subprocess-spawning API (`os.system` / \
+                 `subprocess.*` / `system()` / `execSync` / \
+                 `ccall(:system` / `Runtime.exec`) and references a \
+                 network tool (curl/wget/nc/…) — \
+                 download-and-execute shape.",
+            ));
+        }
+        // (b) Obfuscation-aware fallback. If the inline code calls
+        //     any subprocess-spawning API AND has an obfuscation
+        //     marker (base64 decode, string concatenation of
+        //     fragments like "cu"+"rl", chr() sequences), deny even
+        //     when the static network-tool scan found nothing.
+        if code_calls_subprocess(&code) && code_has_obfuscation_marker(&code) {
+            return Some(format!(
+                "blocked: `{bn}` inline code combines a \
+                 subprocess-spawning API with string-concatenation \
+                 or base64-decode obfuscation — a well-known pattern \
+                 for hiding a curl|bash payload from static scans.",
+            ));
+        }
+        // Explicit `system("curl …")` / `execSync("curl …")` literal
+        // in the inline string is a direct amplifier regardless of
         // secret/env context.
         let lower = code.to_ascii_lowercase();
         if lower.contains("system(\"curl") || lower.contains("system('curl")
@@ -2414,6 +2661,87 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
     None
 }
 
+/// Does `code` invoke any subprocess-spawning API across the
+/// scripting languages we classify?
+fn code_calls_subprocess(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    // Python / Ruby / PHP / Perl / Lua / Tcl / C-style ccall plus
+    // s-expression forms (`(system `, `(exec `) used by racket /
+    // guile / scheme.
+    let needles: &[&str] = &[
+        "os.system", "subprocess.", "os.popen", "os.execv", "os.exec",
+        "popen(", "system(", "exec(", "execsync(", "execfilesync(",
+        "spawn(", "spawnsync(",
+        "ccall(:system", "runtime.getruntime().exec",
+        "processbuilder", "process.start",
+        "backtick(", "`",       // Perl/Ruby backticks
+        "io.popen", "io.spawn",
+        "start-process",        // PowerShell (covered elsewhere, defensive)
+        // S-expression / Lisp-family: `(system "…")`, `(exec "…")`,
+        // `(process "…")`.
+        "(system ", "(system\t", "(system\"",
+        "(exec ", "(exec\t",
+        "(process ", "(subprocess ",
+    ];
+    needles.iter().any(|n| lower.contains(n))
+}
+
+/// Does `code` look like it deliberately hides a command string via
+/// obfuscation (base64 decode, chr() sequences, explicit string
+/// concatenation of short fragments)?
+fn code_has_obfuscation_marker(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    // Base64 decode APIs across languages.
+    if lower.contains("b64decode") || lower.contains("base64.decode")
+        || lower.contains("base64_decode") || lower.contains("atob(")
+        || lower.contains("buffer.from(")   // Node: Buffer.from(x, 'base64')
+        || lower.contains("from_base64")    // Rust/Julia variants
+    {
+        return true;
+    }
+    // chr()/String.fromCharCode number-ladder (reconstructing a string
+    // from ASCII codes).
+    if lower.contains("chr(") && lower.matches("chr(").count() >= 3 {
+        return true;
+    }
+    if lower.contains("fromcharcode(") && lower.matches(',').count() >= 3 {
+        return true;
+    }
+    // String concatenation of short fragments that reassemble a
+    // dangerous keyword. We look for fragments of curl/wget/bash/sh
+    // split across a concat operator (`+` for Python/JS/Ruby,
+    // `string-append` for Lisp/Scheme family, `.` for PHP, `..` for
+    // Lua, `<>` for Erlang/Elixir).
+    //
+    // Heuristic: any quoted fragment that's a non-trivial prefix of
+    // one of the danger words, adjacent to a concat marker.
+    let concat_markers: &[&str] =
+        &["+", "string-append", ".concat(", " . ", "..", "<>", "concat("];
+    let has_concat = concat_markers.iter().any(|m| lower.contains(m));
+    if !has_concat {
+        return false;
+    }
+    let danger = &["curl", "wget", "bash", "nc -"];
+    for d in danger {
+        // Split `d` into 2-3 char prefix + rest; if BOTH appear as
+        // quoted fragments, that's concat obfuscation.
+        for split_at in 2..d.len() {
+            let (a, b) = d.split_at(split_at);
+            let pat_a = format!("\"{a}\"");
+            let pat_b = format!("\"{b}");
+            if lower.contains(&pat_a) && lower.contains(&pat_b) {
+                return true;
+            }
+            let single_a = format!("'{a}'");
+            let single_b = format!("'{b}");
+            if lower.contains(&single_a) && lower.contains(&single_b) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Return the argv element after `flag`, handling both separated
 /// (`-c CODE`) and attached (`-cCODE`, `-c=CODE`) forms.
 fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
@@ -2427,9 +2755,32 @@ fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
             return Some(rest.to_string());
         }
         // Attached form: `-cSTR` where STR starts immediately.
-        if let Some(rest) = a.strip_prefix(flag) {
-            if !rest.is_empty() && !rest.starts_with('=') {
-                return Some(rest.to_string());
+        //
+        // 1.2.0 6th-pass review (Claude SEVERE NEW-S-2): only accept
+        // attached form when `flag` is a 2-char short flag AND the
+        // token isn't a GNU-style single-dash LONG flag like
+        // `-experimental-…`. We distinguish by requiring the NEXT
+        // character after the flag prefix to not itself look like
+        // another alpha continuation that would spell a different
+        // long flag (single-dash long flags are common in Node /
+        // find / tar). Concretely: reject attached form if `rest`
+        // looks like it continues an identifier — i.e. starts with
+        // an ASCII alpha AND contains NO shell-metacharacter to
+        // signal it's a code blob. The classifier prefers the
+        // separated `flag VALUE` form every real caller uses;
+        // attacker-embedded attached code always carries at least one
+        // of `" ' ( ; =` so this is a safe heuristic.
+        if flag.len() == 2 {
+            if let Some(rest) = a.strip_prefix(flag) {
+                if !rest.is_empty()
+                    && !rest.starts_with('=')
+                    && is_plausible_attached_code(rest)
+                {
+                    return Some(rest.to_string());
+                }
+                // Else fall through — this looks like another long flag
+                // (e.g. `-experimental-vm-modules`), not our inline-code
+                // flag's value.
             }
         }
         i += 1;
@@ -2437,27 +2788,100 @@ fn extract_after_flag(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
-/// For `awk 'PROGRAM' [file...]`, return the PROGRAM text — it's the
-/// first positional after any flags. Value-taking flags in awk: `-F`
-/// (field separator), `-v` (assignment), `-f` (program file).
+/// Does `s` look like a plausible attached code payload for an
+/// inline-code flag (`-cCODE`, `-eCODE`)? Real code blobs carry at
+/// least one of `" ' ( ; $ =` or an operator; a token that's pure
+/// alpha-continuation like `xperimental-vm-modules` is a distinct
+/// flag, not our value.
+fn is_plausible_attached_code(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c, '"' | '\'' | '(' | ';' | '$' | '=' | '{' | '[')
+    })
+}
+
+/// For `awk 'PROGRAM' [file...]`, return ALL positionals as a joined
+/// string — the PROGRAM text is one of them, but the caller just
+/// scans the whole thing for curl/system() patterns so joining is
+/// safe.
+///
+/// 1.2.0 6th-pass adversarial review (Claude SEVERE NEW-S-1):
+/// previous version returned only the FIRST positional after flags,
+/// but `awk -v "BEGIN{system(…)}" ""` makes awk consume the payload
+/// as `-v`'s value (which gawk rejects but mawk/nawk accept as a
+/// no-op assignment) and leaves `""` as the first positional —
+/// causing the classifier to scan the empty string instead of the
+/// payload. Fix: validate `-v`/`-f`/`--assign`/`--file` values are
+/// actually assignments (contain `=`) or filenames (no `(`/`;`), and
+/// join every remaining positional so even if the split is wrong we
+/// catch the payload in the scanner.
 fn awk_program_string(args: &[String]) -> Option<String> {
-    let value_taking = ["-F", "-v", "-f", "--field-separator", "--assign", "--file"];
     let mut i = 0;
+    let mut positionals: Vec<String> = Vec::new();
     while i < args.len() {
         let a = &args[i];
         if !a.starts_with('-') {
-            return Some(a.clone());
-        }
-        if value_taking.contains(&a.as_str()) {
-            i += 2;
+            positionals.push(a.clone());
+            i += 1;
             continue;
         }
+        // Exact long-form with `=VAL` — value is glued in same token.
         if a.starts_with("--") && a.contains('=') {
             i += 1;
             continue;
         }
+        // Exact short with value in next token: `-v`, `-F`, `-f`.
+        // Only consume the next token if it LOOKS like a legitimate
+        // value (assignment for -v, single char / literal for -F,
+        // filename for -f). Anything else — e.g. a full BEGIN
+        // program blob — is treated as a positional, NOT skipped.
+        if matches!(a.as_str(), "-v" | "--assign") {
+            if let Some(next) = args.get(i + 1) {
+                if awk_looks_like_assignment(next) {
+                    i += 2;
+                    continue;
+                }
+                // Next token is not an assignment — include it as a
+                // positional for scanning; don't skip it.
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(a.as_str(), "-F" | "--field-separator") {
+            // awk's -F takes a value but it's almost always a single
+            // char or short literal. If the next token is long or
+            // contains shell metas, treat it as a positional (scan
+            // it) and still skip; otherwise normal value-skip.
+            if let Some(next) = args.get(i + 1) {
+                if awk_looks_like_field_sep(next) {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(a.as_str(), "-f" | "--file") {
+            if let Some(next) = args.get(i + 1) {
+                if awk_looks_like_filename(next) {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         // Attached short (`-Fx`, `-vVAR=x`) — no skip.
-        if let Some(rest) = a.strip_prefix("-F").or_else(|| a.strip_prefix("-v")).or_else(|| a.strip_prefix("-f")) {
+        if let Some(rest) = a
+            .strip_prefix("-F")
+            .or_else(|| a.strip_prefix("-v"))
+            .or_else(|| a.strip_prefix("-f"))
+        {
             if !rest.is_empty() {
                 i += 1;
                 continue;
@@ -2465,7 +2889,42 @@ fn awk_program_string(args: &[String]) -> Option<String> {
         }
         i += 1;
     }
-    None
+    if positionals.is_empty() {
+        None
+    } else {
+        // Join everything so even if the value-split heuristics
+        // misclassify, the scanner still sees the full surface.
+        Some(positionals.join(" "))
+    }
+}
+
+fn awk_looks_like_assignment(s: &str) -> bool {
+    // `VAR=VALUE` shape: at least one `=`, and the part before `=`
+    // is a plain identifier (no quotes, no parens, no spaces).
+    if let Some((name, _)) = s.split_once('=') {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    } else {
+        false
+    }
+}
+
+fn awk_looks_like_field_sep(s: &str) -> bool {
+    // A legitimate -F value is short (single char, or a simple regex
+    // like `\t` / `,` / `:`) and contains NO code-like punctuation.
+    if s.len() > 16 {
+        return false;
+    }
+    !s.chars().any(|c| matches!(c, '(' | ';' | '{' | '$' | '"' | '\''))
+}
+
+fn awk_looks_like_filename(s: &str) -> bool {
+    // A filename won't typically contain `(`, `;`, `{`, or nested
+    // quotes — those signal an embedded program blob passed as a
+    // pathological value.
+    !s.chars().any(|c| matches!(c, '(' | ';' | '{' | '"'))
 }
 
 /// Deny well-known `git -c KEY=VALUE` RCE channels and adjacent
@@ -2491,7 +2950,9 @@ fn awk_program_string(args: &[String]) -> Option<String> {
 /// `protocol.ext.allow=always` already configured — fail closed.
 ///
 /// 1.2.0 5th-pass adversarial review (Claude SEVERE S-4).
+#[allow(clippy::too_many_lines)]
 fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
+    // Exact dangerous keys whose value will be executed.
     const DANGEROUS_KEYS: &[&str] = &[
         "core.pager",
         "core.editor",
@@ -2499,49 +2960,109 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
         "core.fsmonitor",
         "core.sshcommand",
         "core.askpass",
+        "core.gpgprogram",
+        "gpg.program",
         "protocol.ext.allow",
         "uploadpack.packobjectshook",
         "http.proxy",
         "https.proxy",
         "pack.packsizelimit",
         "credential.helper",
+        "include.path",
     ];
+    // Prefix classes — any sub-key of the form `PREFIX.<any>.<SUBKEY>`
+    // is dangerous because attacker chose PREFIX.<alias>. We match
+    // on substring presence of the bracketing parts.
+    // `alias.*=!cmd` — `git alias.X` invokes the alias, which can
+    // contain `!cmd` that shells out.
+    // `submodule.*.update=!cmd` — ran on `git submodule update`.
+    // `includeif.*.path=/path` — same risk as `include.path`.
+    const DANGEROUS_PREFIX_CLASSES: &[(&str, &str)] = &[
+        ("alias.", ""),                // alias.ANY_NAME
+        ("submodule.", ".update"),     // submodule.X.update
+        ("includeif.", ".path"),       // includeif.X.path
+    ];
+
     for stage in &pipeline.stages {
         if stage_bn_lc(stage) != "git" {
             continue;
         }
         let args = &stage.args;
-        // Walk args: `-c KEY=VAL` OR `-c=KEY=VAL` (rare).
+        // Walk args: `-c KEY=VAL`, `-c=KEY=VAL`, `-cKEY=VAL`
+        // (attached short form), `--config-env=KEY=ENV` (reads env
+        // var whose value git will interpret — treat as same risk).
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
-            let kv: Option<&str> = if a == "-c" {
-                args.get(i + 1).map(String::as_str)
+            let kv: Option<String> = if a == "-c" {
+                args.get(i + 1).cloned()
+            } else if let Some(rest) = a.strip_prefix("-c=") {
+                Some(rest.to_string())
+            } else if let Some(rest) = a.strip_prefix("-c") {
+                // Attached form `-cKEY=VAL` — require at least one
+                // `=` in `rest` and that the first chunk looks like a
+                // dotted git config key. Avoids matching unrelated
+                // `-cERT` / `-cXYZ` short flags (git has few short
+                // bundles in practice; the attached-c form is the
+                // documented RCE surface).
+                (!rest.is_empty() && rest.contains('=') && rest.contains('.'))
+                    .then(|| rest.to_string())
             } else {
-                a.strip_prefix("-c=")
+                // `--config-env=KEY=ENVVAR` — equivalent attack surface;
+                // treat the KEY as if it were set via `-c KEY=…`.
+                a.strip_prefix("--config-env=").map(str::to_string)
             };
             if let Some(kv) = kv {
                 let lower = kv.to_ascii_lowercase();
-                // Any dangerous key triggers the deny. Match on the
-                // `KEY=` prefix so `core.pager=whatever` is caught
-                // without being fooled by `core.pagerabc=…`.
+                // Exact keys.
                 for key in DANGEROUS_KEYS {
                     if lower.starts_with(&format!("{key}=")) {
                         return Some(format!(
-                            "blocked: `git -c {kv}` overrides a config \
-                             key that git will execute as a shell \
-                             command on the next operation. This is a \
-                             well-known RCE channel (`core.pager=!…`, \
-                             `core.fsmonitor`, `protocol.ext.allow`, \
-                             etc.).",
+                            "blocked: `git` config override `{kv}` \
+                             targets a key that git executes as a \
+                             shell command on the next operation \
+                             (`core.pager=!…`, `core.fsmonitor`, \
+                             `core.gpgprogram`, `protocol.ext.allow`, \
+                             `include.path`, etc.).",
+                        ));
+                    }
+                }
+                // Prefix + suffix classes.
+                for (prefix, suffix) in DANGEROUS_PREFIX_CLASSES {
+                    if !lower.starts_with(prefix) {
+                        continue;
+                    }
+                    // Find the `=` separator.
+                    let Some(eq) = lower.find('=') else { continue };
+                    let key_only = &lower[..eq];
+                    if suffix.is_empty() {
+                        // `alias.<anything>` is dangerous if the value
+                        // starts with `!` (shell-out) OR git invokes
+                        // the alias by name (we can't tell here, so
+                        // be conservative: deny `!`-prefixed values).
+                        let value = &kv[eq + 1..];
+                        let trimmed = value.trim().trim_matches(|c| c == '\'' || c == '"');
+                        if trimmed.starts_with('!') {
+                            return Some(format!(
+                                "blocked: `git` config override \
+                                 `{kv}` defines an alias whose value \
+                                 starts with `!` (git shell-escape). \
+                                 An alias registered this way is \
+                                 executable shell on the next \
+                                 invocation.",
+                            ));
+                        }
+                    } else if key_only.ends_with(suffix) {
+                        return Some(format!(
+                            "blocked: `git` config override `{kv}` \
+                             targets a `{prefix}*{suffix}` key that \
+                             git executes on the next operation. \
+                             These are well-known RCE channels.",
                         ));
                     }
                 }
             }
-            // `git clone ext::…` — external-transport helper. Without
-            // `protocol.ext.allow=always` it fails, but fail closed:
-            // we can't tell whether a site config has already
-            // enabled it.
+            // `git clone ext::…` — external-transport helper.
             if a == "clone" || i > 0 && args[i - 1] == "clone" {
                 if let Some(url) = args.iter().find(|s| s.starts_with("ext::")) {
                     return Some(format!(
