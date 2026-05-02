@@ -86,13 +86,20 @@ fn is_char_boundary(bytes: &[u8], i: usize) -> bool {
     bytes[i] & 0b1100_0000 != 0b1000_0000
 }
 
-/// Runs FIRST (alphabetical). Prefix-bisect the captured 2863-byte
-/// input to find the smallest crashing prefix. Each step's input is
+/// Prefix-bisect the captured 2863-byte input. Each step's input is
 /// logged with `about-to-parse` BEFORE the parse call; a matching
 /// `parse=…` line AFTER means that length didn't crash. The last
 /// `about-to-parse` line with no following `parse=…` is the crasher.
+///
+/// Ignored by default: the prefix bisect is known to crash the
+/// process at byte 2490, which under `--test-threads=1` also kills
+/// every subsequent test before it can log. Run explicitly with
+/// `cargo test --test linux_crash_bisect -- --ignored
+/// ccc_prefix_bisect_captured_crasher` when you want fresh prefix
+/// data.
 #[test]
-fn aaa_prefix_bisect_captured_crasher() {
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn ccc_prefix_bisect_captured_crasher() {
     if !enabled() {
         return;
     }
@@ -133,7 +140,7 @@ fn aaa_prefix_bisect_captured_crasher() {
 /// sitter error state built up over the preceding 2000+ bytes is
 /// load-bearing.
 #[test]
-fn bbb_suffix_probes_narrowing_from_byte_2490() {
+fn aaa_suffix_probes_narrowing_from_byte_2490() {
     if !enabled() {
         return;
     }
@@ -161,10 +168,14 @@ fn bbb_suffix_probes_narrowing_from_byte_2490() {
     }
 }
 
-/// Runs LAST. Confirms the full captured input crashes on Linux.
-/// If the prefix bisect above already narrowed a smaller crasher,
-/// this test is redundant but harmless.
+/// Confirms the full captured input crashes on Linux.
+///
+/// Ignored by default for the same reason as `ccc_prefix_bisect_…`:
+/// if it runs in the same binary as other tests, its SIGSEGV kills
+/// them too. Run explicitly with `--ignored` when you want to
+/// reconfirm.
 #[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
 fn zzz_full_input_captured_crasher() {
     if !enabled() {
         return;
