@@ -2,9 +2,26 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
-## [1.2.0] — 2026-05-01
+## [1.2.0] — 2026-05-02
 
-Adversarial-security hardening release. Closes **21 SEVERE + HIGH findings** from a full three-reviewer security review (Claude `crew:code-reviewer` + GPT via cursor-agent; Gemini failed silently). Every finding shipped with a red-test-first PoC. Not a feature release — no new capabilities; every change narrows a concrete bypass.
+Adversarial-security hardening release. Closes **54 SEVERE + HIGH findings** across **eight consecutive adversarial review rounds** (Claude `crew:code-reviewer` + GPT via cursor-agent). Every finding shipped with a red-test-first PoC. Not a feature release — no new capabilities; every change narrows a concrete bypass.
+
+The roadmap from here:
+- **1.2.1**: MEDIUM / LOW cleanup items deferred from these reviews.
+- **1.3.0**: fuzzing infrastructure (cargo-fuzz / afl) as the primary termination mechanism for "is the classifier complete?" questions. Review-based iteration has diminishing returns beyond this point; fuzzing can explore the bypass surface more exhaustively.
+
+Review rounds and findings count:
+| Round | Source | SEVERE | HIGH | Notable classes |
+| ----- | ------ | ------ | ---- | --------------- |
+| 1st–3rd | Original audit | 10 | 11 | See section below ("Original audit findings") |
+| 4th | GPT 4th-pass | 2 | 0 | GNU bundled short-flags (`cp -vt`, `sed -ni`) |
+| 5th | Claude + GPT | 6 | 4 | curl>>(bash) procsub, busybox/unshare/systemd-run, rsync -e, xargs amplifier, safe_read ALLOW+symlink, env -S attached, ssh host 'inner', git -c core.X RCE, scripting-lang shellout, chmod+x of attacker-path |
+| 6th | Claude + GPT | 4 | 3 | docker --entrypoint=, firejail/bwrap wrappers, ssh ProxyCommand, git -c attached/alias/submodule/env-config, scripting obfuscation, macOS $TMPDIR |
+| 7th | Claude + GPT | 3 | 3 | docker `--entrypoint=`, strace/flock/gosu/torify wrappers, ssh -o space form, git -C pivot, hex/unicode escapes, ssh -F attacker config |
+| 8th | Claude + GPT | 2 | 6 | GIT_DIR= env-var pivot, ssh -F relative/stdin, tar --to-command / --checkpoint-action=exec, container family (buildah/nerdctl/ctr/kubectl), pip install git+, crontab/at/systemd-timer, octal/named-unicode escape obfuscation |
+| **Total** | | **17 new** | **16 new** | **33 additional 4th-8th passes** |
+| Plus original | | 10 | 11 | 21 from the initial audit |
+| | | **27** | **27** | **54 total closures** |
 
 ### Security — pre-bash classifier
 
@@ -43,11 +60,71 @@ Adversarial-security hardening release. Closes **21 SEVERE + HIGH findings** fro
 - `Redirect.body: Option<String>` field (in `parser.rs`) for heredoc body capture.
 - `write_bytes_atomic_with_mode` helper (in `installer.rs`) — splits mode from the existing atomic-write helper so binary staging can use 0o755.
 
+### Security — iterative adversarial rounds (4th–8th pass additions)
+
+After the original 21 findings closed, five more rounds of adversarial review surfaced increasingly exotic attack classes. Each round closed before the next began; the rest remain documented as known-OOS below.
+
+**GNU argv-parsing edges (4th pass)**
+- `cp -vt /etc/profile.d SRC` / `install -mvt DIR SRC` / `sed -ni '…' ~/.bashrc` — bundled short-flag forms where the value-taking letter is at the tail of a cluster. New `short_flag_contains` helper; `target_directory_flag` recognizes `-[A-Za-z]+t` bundles.
+
+**New classifier families (5th pass)**
+- `network_with_shell_sink_substitution`: `curl > >(bash)` / `curl | tee >(bash)` procsub execution.
+- `extract_wrapper_inner` covers `busybox`, `toybox`, `unshare`, `systemd-run`, `chpst`.
+- `rsync_dash_e_inner`: `rsync -e 'bash -c "curl|bash"'` re-classifies the `-e` value.
+- `xargs_arbitrary_amplifier`: deny `xargs -I{} bash -c '{}'`.
+- `enforce_policy` in `safe_read` now runs the symlink walk unconditionally (override bypasses deny-list only).
+- `extract_env_dash_s` handles attached + bundled forms (`env -S'cmd'`, `env -iS'cmd'`).
+- `extract_ssh_remote_command`: `ssh host 'inner-bash'` re-classifies the remote argv.
+- `git_config_injection`: narrow deny for `-c core.fsmonitor=`/`core.pager=!`/`protocol.ext.allow=`/etc.
+- `scripting_lang_shellout`: python/perl/ruby/node/php/awk `-c`/`-e`/`BEGIN{…}` scanned for curl|bash.
+- `chmod_plus_x_attacker_path`: deny chmod+x targeting `/tmp`, `/var/tmp`, `/dev/shm`, `~/Downloads`, `~/.cache`.
+
+**Container and sandbox coverage (6th–8th pass)**
+- Wrappers: `firejail`, `bwrap`, `docker`, `podman`, `runc`, `crun` (6th), plus `strace`, `ltrace`, `valgrind`, `catchsegv`, `flock`, `gosu`, `fakeroot`, `torify`, `proxychains{,4}` (7th), plus `buildah`, `nerdctl`, `ctr`, `lxc-attach`, `apptainer`, `singularity`, `kubectl` (8th). `extract_container_run_inner` handles `docker run --entrypoint=sh alpine -c CODE` (attached `=` form, 7th-pass Claude+GPT co-finding).
+- `flock LOCK -c CMD` special-cased before prefix-runner to avoid mis-treating `-c` as the lock-file value.
+- `ssh_uses_attacker_config`: deny `ssh -F ./evil.conf`, `-F -`, `-F /dev/stdin`, and any `-F PATH` not ending in a standard `~/.ssh/config` / `/etc/ssh/ssh_config{,.d}` location.
+
+**Git expansion**
+- `git_config_injection` (6th pass): attached `-cKEY=VAL`, `--config-env=KEY=ENV`, `alias.*=!cmd` / `submodule.*.update=!cmd` / `includeif.*.path` prefix classes; additional exact keys (`core.gpgprogram`, `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`, `include.path`, `credential.helper`).
+- `git -C DIR` / `--git-dir=DIR` / `--work-tree=DIR` pivots into attacker-writeable dirs (7th pass).
+- `GIT_DIR=`/`GIT_SSH_COMMAND=`/`GIT_PAGER=`/`GIT_EDITOR=`/`GIT_ASKPASS=`/`GIT_EXTERNAL_DIFF=`/`GIT_PROXY_COMMAND=` env-var prefix assignments (8th pass). Parser exposes `Command::assignments` captured from `variable_assignment` nodes preceding the command word.
+
+**LOLBin and persistence**
+- `tar --to-command=CMD` and `tar --checkpoint-action=exec=CMD` (8th pass), plus GNU long-option prefix abbreviations (`--to-com=`, `--checkpoint-ac=exec=`).
+- `pip_editable_vcs_install`: deny `pip/pip3/pipx/uv/poetry install git+URL` / `install https://…/pkg.tar.gz` / PEP 508 `name @ git+…` — all run arbitrary install-time code.
+- `scheduler_persistence`: deny `crontab -`, `crontab -r`, `crontab -e`, `at TIME`, `batch`, `systemd-run --on-calendar=…`. `crontab -l` (read-only) allowed.
+
+**Scripting-language obfuscation**
+- `scripting_lang_shellout` now handles `python/perl/ruby/node/php/awk` plus 6th-pass additions: `julia`, `swift`, `racket`, `guile`, `sbcl`, `lua`, `tclsh`, `rscript`.
+- `code_has_obfuscation_marker` detects ≥3 of: `\xHH` hex escapes, `\uHHHH` unicode ASCII-range escapes, `\OOO` octal escapes, `\N{…}` named-unicode escapes. Plus string concatenation across `+`, `string-append`, `.`, `..`, `<>`, `concat(`.
+- `code_calls_subprocess` covers Python/Perl/Ruby/PHP/Node/Lua/Tcl/C-ccall/S-expression/Ruby `%x{}` / Perl `qx{}` / bare-backtick-plus-command-and-space forms.
+
+**Path normalization**
+- `lex_normalize_chmod_path` collapses `//` / `.` / `..` components; comparisons case-folded on macOS/Windows (APFS/NTFS default). macOS `$TMPDIR` (`/var/folders/`, `/private/var/folders/`) and Linux systemd `/run/user/` added to attacker-writeable list.
+
+**Added in 4th–8th pass**
+- `Command.assignments: Vec<(String, String)>` (parser): exposes `VAR=VAL` assignments that prefix a command word.
+- `extract_ssh_dangerous_option`, `ssh_uses_attacker_config` (ssh).
+- `extract_container_run_inner`, `is_container_entrypoint_shell`.
+- `git_config_injection` (expanded with env-var / prefix / attached / pivot coverage).
+- `scripting_lang_shellout`, `code_calls_subprocess`, `code_has_obfuscation_marker`, `count_hex_escapes`, `count_unicode_bmp_ascii_escapes`, `count_octal_ascii_escapes`, `count_named_unicode_escapes`.
+- `chmod_plus_x_attacker_path`, `is_chmod_exec_mode_token`, `path_in_attacker_writable_dir`, `lex_normalize_chmod_path`.
+- `xargs_arbitrary_amplifier`, `rsync_dash_e_inner`, `pip_editable_vcs_install`, `tar_command_exec`, `scheduler_persistence`.
+- `network_with_shell_sink_substitution`, `script_contains_shell_sink_transitively`, `redirect_target_is_shell_sink_procsub`.
+
+### Accepted out-of-scope additions (SECURITY.md)
+
+Findings deferred by deliberate choice — documented in `SECURITY.md`:
+- **Stateful cross-command attacks**: `cd /tmp/evil && git log` — Barbican sees one command at a time via `PreToolUse`; cwd tracking across hook invocations is out of scope for a single-binary classifier.
+- **`tar` non-GNU implementations**: the prefix-abbreviation defense targets GNU `getopt_long`. BSD / mock-tar implementations with different abbreviation behavior may accept forms we don't match.
+- **Symbolic links outside `$HOME`**: `safe_read` anti-laundering walk stops at `$HOME` to avoid false positives on platform fixtures (macOS `/var → /private/var`). System-level ancestor symlinks are explicitly out of scope.
+- **`docker exec` / `docker compose exec` / `ctr exec`** inside an already-running container: the inner `bash -c` is classified, but we don't try to parse the container's own option grammar for unknown subcommands.
+- **Out-of-process env vars**: launch-time `PATH`, `LD_PRELOAD`, `HOME` manipulation remains out of scope (attacker with launch-env control already owns the process).
+
 ### Testing
 
-- 45 new red-test-first PoC cases across `pre_bash_h1`, `pre_bash_h2`, `pre_bash_m1`, `pre_bash_m2`, `post_mcp`, `install`, plus 4 new unit tests for `env_flag` + env-var floor + post-mcp allowlist + installer symlink clobber.
-- Every SEVERE / HIGH finding has at least one concrete PoC pinned.
-- All 14 test binaries green; clippy clean on Rust 1.91 (`--all-targets --all-features -D warnings`).
+- **~120 new red-test-first PoC cases** across `pre_bash_h1`, `pre_bash_h2`, `pre_bash_m1`, `pre_bash_m2`, `post_mcp`, `install`, `safe_read` (plus initial 45 from the 1st–3rd passes). Every SEVERE / HIGH finding has at least one concrete PoC pinned.
+- **733 total tests** green; clippy clean on Rust 1.91 (`--all-targets --all-features -D warnings`).
 
 ## [1.1.0] — 2026-05-01
 
