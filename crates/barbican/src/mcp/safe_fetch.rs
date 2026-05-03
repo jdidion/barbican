@@ -95,8 +95,55 @@ pub async fn run(args: SafeFetchArgs) -> String {
 }
 
 /// The fetch state machine: resolve, SSRF-filter, send, follow
-/// redirects manually, truncate, decode.
+/// redirects manually, truncate, decode. Uses the default
+/// [`ProductionResolver`]; see [`fetch_with`] to inject a custom one.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchError> {
+    let resolver = ProductionResolver::new()?;
+    fetch_with(url, max_bytes, &resolver).await
+}
+
+/// Like [`fetch`], but with an injectable [`Resolver`] for testing.
+///
+/// The production path goes through [`fetch`] which constructs a
+/// [`ProductionResolver`] itself. This variant exists so integration
+/// tests can map hostnames to a local wiremock port without
+/// hitting the SSRF filter (the test resolver is responsible for
+/// returning safe addresses; the fetch loop trusts its output).
+///
+/// The resolver contract: return `Vec<SocketAddr>` that the caller
+/// will feed to `reqwest::Client::resolve_to_addrs`. The default
+/// impl filters every returned address through [`is_blocked_ip`];
+/// a test impl may choose not to. Never expose a non-default
+/// resolver to untrusted input — the `Resolver` trait is a policy
+/// boundary, not a lookup abstraction.
+///
+/// Visibility: `pub(crate)` always so the binary's own `fetch` can
+/// call it; elevated to `pub` only under `feature = "test-support"`
+/// so downstream library consumers can't construct a bypass resolver
+/// in a release build.
+#[cfg(feature = "test-support")]
+pub async fn fetch_with<R: Resolver + ?Sized>(
+    url: &str,
+    max_bytes: usize,
+    resolver: &R,
+) -> Result<FetchOutcome, FetchError> {
+    fetch_with_inner(url, max_bytes, resolver).await
+}
+
+#[cfg(not(feature = "test-support"))]
+pub(crate) async fn fetch_with<R: Resolver + ?Sized>(
+    url: &str,
+    max_bytes: usize,
+    resolver: &R,
+) -> Result<FetchOutcome, FetchError> {
+    fetch_with_inner(url, max_bytes, resolver).await
+}
+
+async fn fetch_with_inner<R: Resolver + ?Sized>(
+    url: &str,
+    max_bytes: usize,
+    resolver: &R,
+) -> Result<FetchOutcome, FetchError> {
     // Pin BARBICAN_ALLOW_IP_LITERALS once per fetch. If we re-read env
     // on every redirect hop, a concurrent writer to the process's
     // environment can flip policy mid-fetch, permitting a redirect to
@@ -105,25 +152,60 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchErr
     let mut current = validate_url_with(url, allow_ip_lit).map_err(FetchError::Reject)?;
     let mut hops = 0_u8;
     let timeout = Duration::from_secs(timeout_from_env());
-    let resolver = build_resolver()?;
 
     loop {
+        // Normalize the URL's host once, up front, so both the
+        // `resolve_to_addrs` map key and the actual request use the
+        // exact same string. reqwest's DNS override is an exact-match
+        // lookup against `current.host_str()` at request time — any
+        // skew between the key we register and the host reqwest looks
+        // up falls through to system DNS and defeats SSRF pinning.
+        //
+        // Two forms the URL may present that hickory / our map cannot
+        // key off of:
+        //   - trailing dot: `example.com.` (valid FQDN root marker)
+        //   - IPv6 brackets: `[::1]` (URL syntax)
+        // Rewrite `current` so `host_str()` is the trimmed form, then
+        // use that same string to both resolve and register the pin.
         let raw_host = current
             .host_str()
             .ok_or(FetchError::Reject(RejectReason::NoHost))?
             .to_string();
-        // Normalize: reqwest's resolve_to_addrs key-matches on the exact
-        // host string. A trailing dot (`example.com.`) is a valid FQDN
-        // root marker but would miss the map, and the client would fall
-        // through to system DNS — bypassing SSRF pinning. Strip it.
-        let host = raw_host.trim_end_matches('.').to_string();
-        // host_str keeps brackets around IPv6 literals (`[::1]`).
-        // hickory's lookup_ip can't parse that form, so strip them
-        // before DNS resolution.
+        let stripped_dot = raw_host.trim_end_matches('.');
+        let stripped_brackets = stripped_dot.trim_start_matches('[').trim_end_matches(']');
+        if stripped_brackets != raw_host {
+            // set_host() with a bracket-free IPv6 re-brackets it; pass
+            // the form the URL crate accepts and re-read host_str()
+            // for the canonical string reqwest will use.
+            let new_host = if stripped_dot == stripped_brackets {
+                stripped_dot.to_string()
+            } else {
+                stripped_brackets.to_string()
+            };
+            current
+                .set_host(Some(&new_host))
+                .map_err(|_| FetchError::Reject(RejectReason::NoHost))?;
+        }
+        let host = current
+            .host_str()
+            .ok_or(FetchError::Reject(RejectReason::NoHost))?
+            .to_string();
+        // For hickory: strip brackets if `host_str()` re-bracketed the
+        // IPv6 literal. The ProductionResolver short-circuits on IP
+        // literals before hitting hickory; MockResolver keys on the
+        // unbracketed form too.
         let lookup_host = host.trim_start_matches('[').trim_end_matches(']');
 
-        let addrs =
-            resolve_and_filter(&resolver, lookup_host, current.port_or_known_default()).await?;
+        let addrs = resolver
+            .resolve(lookup_host, current.port_or_known_default().unwrap_or(0))
+            .await?;
+        // Defense-in-depth: a resolver that returns zero addresses
+        // would otherwise cause reqwest to fall through to system DNS
+        // (the override map for `host` would be empty, not just
+        // missing). Treat empty as a DNS failure.
+        if addrs.is_empty() {
+            return Err(FetchError::Dns(format!("no addresses for {lookup_host}")));
+        }
 
         let client = Client::builder()
             .redirect(Policy::none())
@@ -215,52 +297,135 @@ async fn read_capped(resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8
     Ok(out)
 }
 
-async fn resolve_and_filter(
-    resolver: &TokioResolver,
-    host: &str,
-    port: Option<u16>,
-) -> Result<Vec<SocketAddr>, FetchError> {
-    let port = port.unwrap_or(0);
-    // Short-circuit: if the host is already an IP literal, don't call
-    // DNS — hickory may fail to parse some literal forms anyway, and
-    // `validate_url` already ran `is_blocked_ip` against it when the
-    // override is set. Re-run the check here defensively so a future
-    // refactor that loosens `validate_url` can't open a hole.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if let Some(reason) = is_blocked_ip(ip) {
-            return Err(FetchError::Reject(RejectReason::BlockedIp(reason)));
-        }
-        return Ok(vec![SocketAddr::new(ip, port)]);
-    }
-    let lookup = resolver
-        .lookup_ip(host)
-        .await
-        .map_err(|e| FetchError::Dns(e.to_string()))?;
-    let mut addrs = Vec::new();
-    for ip in lookup.iter() {
-        if let Some(reason) = is_blocked_ip(ip) {
-            return Err(FetchError::Reject(RejectReason::BlockedIp(reason)));
-        }
-        addrs.push(SocketAddr::new(ip, port));
-    }
-    if addrs.is_empty() {
-        return Err(FetchError::Dns(format!("no A/AAAA records for {host}")));
-    }
-    Ok(addrs)
+/// Abstraction over "hostname → safe-to-connect SocketAddrs." The
+/// default [`ProductionResolver`] wraps `hickory-resolver` and filters
+/// every returned IP through [`is_blocked_ip`]. Integration tests
+/// (with the `test-support` feature) can supply a mock that maps
+/// hostnames to loopback ports for wiremock.
+///
+/// **The trait is a policy boundary, not just a lookup abstraction.**
+/// The fetch loop trusts the addresses this returns and passes them
+/// directly to `reqwest::Client::resolve_to_addrs`. A trait impl that
+/// returns unfiltered addresses disables the SSRF filter for any
+/// fetch that uses it. Never expose a non-default resolver to
+/// untrusted input.
+///
+/// Visibility: `pub(crate)` by default so only this crate can
+/// implement it; elevated to `pub` under `feature = "test-support"`
+/// for integration tests. Downstream library consumers of `barbican`
+/// cannot reach this trait in a release build — a `MockResolver`
+/// lookalike in consumer code would not compile.
+#[cfg(feature = "test-support")]
+#[allow(async_fn_in_trait)]
+pub trait Resolver {
+    /// Return the list of `SocketAddr`s the fetch loop should feed to
+    /// reqwest for the given hostname. The production impl filters
+    /// every address through [`is_blocked_ip`] before returning.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError>;
 }
 
-fn build_resolver() -> Result<TokioResolver, FetchError> {
-    // Prefer the system resolver config if it can be read. Fall back to
-    // Cloudflare over plain UDP/TCP so hermetic environments without
-    // /etc/resolv.conf still work (notably: macOS sandboxes, Docker
-    // without resolv mounted, CI runners).
-    if let Ok(builder) = TokioResolver::builder_tokio() {
-        return builder.build().map_err(|e| FetchError::Dns(e.to_string()));
+#[cfg(not(feature = "test-support"))]
+#[allow(async_fn_in_trait)]
+pub(crate) trait Resolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError>;
+}
+
+/// Default [`Resolver`] impl — wraps `hickory-resolver`'s
+/// [`TokioResolver`] and runs [`is_blocked_ip`] on every returned IP.
+/// This is the resolver [`fetch`] uses.
+pub struct ProductionResolver {
+    inner: TokioResolver,
+}
+
+impl ProductionResolver {
+    /// Construct the production resolver. Prefers the system resolver
+    /// config (`/etc/resolv.conf`); falls back to Cloudflare UDP/TCP
+    /// when the system config can't be read (hermetic sandboxes, CI
+    /// runners, Docker without resolv mounted).
+    pub fn new() -> Result<Self, FetchError> {
+        let inner = if let Ok(builder) = TokioResolver::builder_tokio() {
+            builder
+                .build()
+                .map_err(|e| FetchError::Dns(e.to_string()))?
+        } else {
+            let cfg = ResolverConfig::udp_and_tcp(&CLOUDFLARE);
+            TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default())
+                .build()
+                .map_err(|e| FetchError::Dns(e.to_string()))?
+        };
+        Ok(Self { inner })
     }
-    let cfg = ResolverConfig::udp_and_tcp(&CLOUDFLARE);
-    TokioResolver::builder_with_config(cfg, TokioRuntimeProvider::default())
-        .build()
-        .map_err(|e| FetchError::Dns(e.to_string()))
+}
+
+impl Resolver for ProductionResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        // Short-circuit: if the host is already an IP literal, don't
+        // call DNS — hickory may fail to parse some literal forms
+        // anyway, and `validate_url` already ran `is_blocked_ip`
+        // against it when the override is set. Re-run the check here
+        // defensively so a future refactor that loosens `validate_url`
+        // can't open a hole.
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if let Some(reason) = is_blocked_ip(ip) {
+                return Err(FetchError::Reject(RejectReason::BlockedIp(reason)));
+            }
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        let lookup = self
+            .inner
+            .lookup_ip(host)
+            .await
+            .map_err(|e| FetchError::Dns(e.to_string()))?;
+        let mut addrs = Vec::new();
+        for ip in lookup.iter() {
+            if let Some(reason) = is_blocked_ip(ip) {
+                return Err(FetchError::Reject(RejectReason::BlockedIp(reason)));
+            }
+            addrs.push(SocketAddr::new(ip, port));
+        }
+        if addrs.is_empty() {
+            return Err(FetchError::Dns(format!("no A/AAAA records for {host}")));
+        }
+        Ok(addrs)
+    }
+}
+
+/// Test-only [`Resolver`] impl that maps hostnames to caller-provided
+/// `SocketAddr`s. Returns addresses verbatim, without running them
+/// through [`is_blocked_ip`] — this is the whole point: integration
+/// tests need to route `example.com` to a loopback wiremock port that
+/// the SSRF filter would normally reject.
+///
+/// Gated behind `feature = "test-support"` so it's never compiled
+/// into a release build. CI enables the feature via `cargo test
+/// --features test-support`.
+#[cfg(feature = "test-support")]
+pub struct MockResolver {
+    map: std::collections::HashMap<String, Vec<SocketAddr>>,
+}
+
+#[cfg(feature = "test-support")]
+impl MockResolver {
+    /// Construct a resolver that maps `host` → the given addresses
+    /// verbatim. `lookup_host` matches the form the fetch loop passes
+    /// (after trailing-dot strip + bracket strip); pass the host
+    /// exactly as it will appear on the wire.
+    #[must_use]
+    pub fn new(entries: impl IntoIterator<Item = (String, Vec<SocketAddr>)>) -> Self {
+        Self {
+            map: entries.into_iter().collect(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Resolver for MockResolver {
+    async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        self.map
+            .get(host)
+            .cloned()
+            .ok_or_else(|| FetchError::Dns(format!("MockResolver: no mapping for {host}")))
+    }
 }
 
 fn sanitize_body(raw: &str, content_type: &str, truncated: bool) -> (String, Vec<String>) {

@@ -327,3 +327,177 @@ async fn redirect_to_loopback_is_rejected() {
         "redirect to loopback must error; got: {out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Happy path via MockResolver (issue #25).
+//
+// The SSRF filter is a policy feature, not a testability feature — it
+// correctly rejects `127.0.0.1` (what wiremock binds to) regardless of
+// how the hostname resolves. To exercise the full fetch pipeline end-
+// to-end (including the sanitizer) we need a way to say "resolve
+// example.com to this loopback port" WITHOUT relaxing the SSRF check.
+//
+// The `MockResolver` (feature = "test-support") does exactly that:
+// maps hostnames to caller-provided `SocketAddr`s and skips
+// `is_blocked_ip`. The fetch loop consumes the addresses verbatim via
+// `reqwest::Client::resolve_to_addrs`. Full sanitizer coverage.
+// ---------------------------------------------------------------------
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn happy_path_sanitizer_strips_script_block_end_to_end() {
+    use barbican::mcp::safe_fetch::{fetch_with, MockResolver};
+    use std::net::SocketAddr;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html; charset=utf-8")
+                .set_body_string(
+                    "<html><body>\
+                     <p>hello world</p>\
+                     <script>alert('x')</script>\
+                     <style>body { background: red }</style>\
+                     <!-- secret comment -->\
+                     </body></html>",
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    // wiremock.uri() returns a `http://127.0.0.1:<port>` URL. Swap the
+    // host portion to `example.com` so `validate_url` sees a normal
+    // hostname, and register the mock resolver so the fetch loop
+    // resolves it to wiremock's actual loopback port.
+    let real_addr: SocketAddr = server
+        .uri()
+        .trim_start_matches("http://")
+        .parse()
+        .expect("wiremock returns a parseable 127.0.0.1:port URL");
+
+    let resolver = MockResolver::new([("example.com".to_string(), vec![real_addr])]);
+
+    let outcome = fetch_with(
+        &format!("http://example.com:{}/any", real_addr.port()),
+        8192,
+        &resolver,
+    )
+    .await
+    .expect("happy-path fetch should succeed");
+
+    // End-to-end sanitizer coverage: the body passes through
+    // `strip_html_tags` + NFKC + injection scan, none of which ran in
+    // the SSRF-rejection tests above.
+    assert_eq!(outcome.status, 200);
+    assert!(outcome.body.contains("hello world"), "kept benign content");
+    assert!(
+        !outcome.body.contains("<script>"),
+        "script block must be stripped; got: {}",
+        outcome.body
+    );
+    assert!(
+        !outcome.body.contains("alert"),
+        "script contents must be stripped; got: {}",
+        outcome.body
+    );
+    assert!(
+        !outcome.body.contains("<style>"),
+        "style block must be stripped; got: {}",
+        outcome.body
+    );
+    assert!(
+        !outcome.body.contains("secret comment"),
+        "HTML comment must be stripped; got: {}",
+        outcome.body
+    );
+    assert!(
+        outcome
+            .sanitizer_notes
+            .iter()
+            .any(|n| n.starts_with("content-type:")),
+        "sanitizer should note the content-type; got notes: {:?}",
+        outcome.sanitizer_notes
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn happy_path_returns_unknown_host_when_resolver_has_no_mapping() {
+    use barbican::mcp::safe_fetch::{fetch_with, MockResolver};
+
+    let resolver = MockResolver::new([]);
+    let result = fetch_with("http://example.com/path", 8192, &resolver).await;
+    match result {
+        Err(barbican::mcp::safe_fetch::FetchError::Dns(msg)) => {
+            assert!(
+                msg.contains("MockResolver: no mapping"),
+                "unknown host must surface the resolver's error; got: {msg}"
+            );
+        }
+        other => panic!("expected FetchError::Dns, got {other:?}"),
+    }
+}
+
+/// Regression: trailing-dot hostnames must be normalized before
+/// `resolve_to_addrs` registration so the map key matches whatever
+/// reqwest uses to look up the override. If the URL's host
+/// (`example.com.`) differs from the override key (`example.com`),
+/// reqwest falls through to system DNS and the SSRF pin is defeated.
+///
+/// Before the 1.3.2 fix this test would either:
+///   - hit system DNS for `example.com.` and return the real IP's
+///     response (potentially rejected by `is_blocked_ip` for a public
+///     host, or succeeding against a real server — either way, NOT
+///     the mock), or
+///   - fail to connect to a public IP because the test resolver
+///     never receives the lookup.
+/// After the fix the URL's host is rewritten to the trimmed form, the
+/// mock resolver receives `example.com` (matches the map key), and
+/// the mock body is returned — proving the override pin held.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn trailing_dot_host_still_routed_through_mock_resolver() {
+    use barbican::mcp::safe_fetch::{fetch_with, MockResolver};
+    use std::net::SocketAddr;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/plain")
+                .set_body_string("mock-ok"),
+        )
+        .mount(&server)
+        .await;
+
+    let real_addr: SocketAddr = server
+        .uri()
+        .trim_start_matches("http://")
+        .parse()
+        .expect("wiremock returns a parseable 127.0.0.1:port URL");
+
+    // Map key is the normalized form `example.com` — no trailing dot.
+    let resolver = MockResolver::new([("example.com".to_string(), vec![real_addr])]);
+
+    // Fetch using the trailing-dot form. If normalization is broken,
+    // the override lookup misses, reqwest falls through to system DNS,
+    // and the fetch either fails (no such host) or goes to a real
+    // public IP. Either way, it would not return "mock-ok".
+    let outcome = fetch_with(
+        &format!("http://example.com.:{}/any", real_addr.port()),
+        8192,
+        &resolver,
+    )
+    .await
+    .expect("trailing-dot host must route through the mock resolver");
+
+    assert_eq!(outcome.status, 200);
+    assert!(
+        outcome.body.contains("mock-ok"),
+        "mock body must be returned (pin held); got: {}",
+        outcome.body
+    );
+}

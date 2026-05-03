@@ -222,17 +222,20 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// Deny-by-default for inputs known to crash the `tree-sitter-bash`
 /// FFI on Linux.
 ///
-/// Catches: any `{` immediately followed by a 4-byte UTF-8 sequence
-/// starting with `F0 B1 A1` (i.e. codepoints U+31840 through
-/// U+3187F, a full "row" in the CJK Unified Ideograph Extension G
-/// block). Found by the 1.3.0 proptest fuzzer; the captured
-/// reproducer's crashing byte ended in `0x80` (U+31840) and
-/// classifier-sweep probes with the same first-three-bytes prefix
-/// and ending in `0xA0` (U+31860) also crashed — so the triggering
-/// state inside tree-sitter-bash's parser table is reached by the
-/// shared 3-byte prefix, not a single codepoint. Widened the match
-/// to the whole row to close the class without enumerating each
-/// case.
+/// Catches: any `{` immediately followed by the 3-byte UTF-8 prefix
+/// `F0 B1 A1` — the shared opening sequence of codepoints U+31840
+/// through U+3187F, a full "row" in the CJK Unified Ideograph
+/// Extension G block. The 4th byte (the UTF-8 continuation) is not
+/// checked explicitly: `&str` input guarantees well-formed UTF-8
+/// at the buffer level, so any match on the 3-byte prefix at a char
+/// boundary is a 4-byte codepoint in that row by construction.
+/// Found by the 1.3.0 proptest fuzzer; the captured reproducer's
+/// crashing byte ended in `0x80` (U+31840) and classifier-sweep
+/// probes with the same prefix ending in `0xA0` (U+31860) also
+/// crashed — so the triggering state inside tree-sitter-bash's
+/// parser table is reached by the shared 3-byte prefix, not a single
+/// codepoint. Widened the match to the whole row to close the class
+/// without enumerating each case.
 ///
 /// The check is a single linear scan over the input bytes. If more
 /// crashers surface over time the scan grows into a small list of
