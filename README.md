@@ -16,7 +16,48 @@ A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a 
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
-Status: **1.0.0**. All 12 roadmap phases and every audit finding (H1, H2, M1-M4, L1-L3) have shipped, each with a regression test. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
+Status: **1.3.1**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure has already caught and 1.3.1 fixed real-world bugs. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
+
+## Is Barbican right for you?
+
+Barbican is **a safety floor, not a ceiling.** Read this before installing.
+
+### What Barbican catches
+
+- **Dangerous bash compositions before they run**: `curl | bash`, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `nohup`, `find -exec`, `docker run <shell> -c`, container/sandbox/debugger fronts), DNS-channel exfil, secret-to-network pipelines, git config injection, scripting-lang shellouts, and ~30 more concrete shapes. Every one ships with a red-test-first regression test under `tests/pre_bash_*.rs`.
+- **Prompt-injection markers in tool output**: NFKC-normalized scans for "ignore previous instructions"-style patterns, with zero-width and bidi-override stripping. Not a complete defense, but closes the obvious cases.
+- **SSRF in `safe_fetch`**: RFC1918 / loopback / link-local / CGNAT / IMDS filtering, DNS pinning to defeat rebinding, mandatory `no_proxy()` to prevent proxy-side lookups.
+- **Sensitive-path reads in `safe_read`**: `.ssh/`, `.aws/`, `.env`, SSH/GPG key files, `/etc/shadow`, `/etc/sudoers`, etc. Escape hatch via `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`.
+- **Parse failures**: any input `tree-sitter-bash` can't parse cleanly is denied, not allowed. Deny-by-default is the top rule in [`CLAUDE.md`](CLAUDE.md).
+
+### What Barbican does NOT catch
+
+- **Commands that are syntactically fine but semantically harmful.** `rm -rf ~/important`, `git push --force origin main`, `aws s3 rb s3://prod-data` — all parseable, all allow. Barbican detects *composition* patterns, not *intent*. You still need to read what Claude Code emits.
+- **Attacks that fall outside the classifier families shipped today.** New attack shapes land as findings, then as red-test-first fixes. The fuzzing infrastructure narrows this surface daily, but "no open vulnerabilities" is not the same as "no vulnerabilities." See [`SECURITY.md § Explicit non-goals`](SECURITY.md) for the documented limits.
+- **A compromised launch environment.** If an attacker controls `HOME`, `PATH`, `LD_PRELOAD`, a shell `.envrc`, or the Barbican binary itself, Barbican runs against you. Documented in `SECURITY.md § Untrusted-launch environment`.
+- **A modified Claude Code binary.** Barbican sits behind Claude Code's hook contract. If Claude Code is compromised, so is everything it runs — including Barbican's hooks.
+
+### Risks of adoption (honest assessment)
+
+See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the full list. Headline risks:
+
+1. **New attack surface you didn't have before.** The Barbican binary, the MCP server, and the installer all run as your user. A compromised release or a bug in the hook itself is code execution in every session. We publish releases signed only by the release-automation identity on GitHub; there is no reproducible-build story yet.
+2. **Silent opt-outs.** Environment variables like `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1` or `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1` turn off individual checks. An attacker who can write to your shell startup can set them.
+3. **False confidence.** If you install Barbican and stop reviewing Claude Code's commands because "the hook will catch anything dangerous," you are worse off than before — the classifier is a narrow deny-list, not a semantic analyzer.
+
+### When to use Barbican
+
+- You use Claude Code for work that matters (production code, sensitive data, any shell access to systems you care about).
+- You treat Barbican as **one layer in a defense-in-depth posture**, alongside:
+  - Reviewing the commands Claude Code proposes before accepting.
+  - Running Claude Code under a user with scoped permissions, not root / not your personal laptop's daily-driver account.
+  - Not running with `ALLOW`-flagged env vars set unless you understand what each one opens up.
+
+### When NOT to use Barbican
+
+- You want a black box that makes Claude Code safe. It isn't.
+- You want to run Claude Code as root on a production host. Don't, with or without Barbican.
+- You're in an adversarial environment where the attacker controls your shell startup. Barbican's opt-out env vars become an attack surface.
 
 ## Install
 

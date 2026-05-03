@@ -42,7 +42,7 @@ Barbican does not defend against these classes; the user's operating environment
 - **Container-CLI subcommand grammars.** `docker run`, `podman run`, `buildah run`, `kubectl exec`, etc. are handled by scanning argv for a trailing `<shell> -c CODE`. Subcommand-specific argv grammars (e.g. `docker compose exec SERVICE CMD` variants) are not parsed precisely; the classifier may under-flag when the inner shell is obscured by a non-bash/sh launcher inside the container.
 - **Ancestor symlinks above `$HOME`.** `safe_read`'s `path_contains_symlink` anti-laundering walk stops at `$HOME`. Platform fixtures like macOS `/var → /private/var` or `/tmp → /private/tmp` are intentionally exempt — they're system-level and not attacker-plantable under the threat model. System-wide compromises that create ancestor symlinks above `$HOME` are out of scope.
 - **Fully-interpreted obfuscation in scripting-lang inline code.** `scripting_lang_shellout` detects hex `\x`, unicode `\u00`, octal `\OOO`, and named-unicode `\N{…}` escape ladders plus string concatenation across common concat operators. It does not decode escapes at classification time; an attacker with a more elaborate encoding scheme (double-base64, XOR, custom RC4) defeats the obfuscation-marker heuristic. Fuzzing in 1.3.0 will explore this surface.
-- **`safe_fetch` DNS reachability side channel.** Error messages distinguish NXDOMAIN / RFC1918 / BadScheme etc. with different phrasing. An attacker-influenced prompt that iterates hostnames through `safe_fetch` can learn reachability status from the `<barbican-error>` envelope. Classified as info-disclosure, not RCE; the full-opacity mitigation (collapse all errors to a single message) is deferred to 1.2.1.
+- **`safe_fetch` DNS reachability side channel** — shipped in 1.2.1. Every DNS / IP / scheme classification now surfaces the identical opaque user-visible message (`target cannot be fetched`); richer detail stays in the local audit log. Pinned by `render_error_is_opaque_across_dns_ip_and_scheme_variants` in `safe_fetch.rs` and `user_visible_error_is_identical_across_nxdomain_rfc1918_and_loopback` in the integration tests.
 
 ## Known parser limits
 
@@ -85,6 +85,51 @@ All knobs are environment variables read at process start; none are persistent o
 | `BARBICAN_SAFE_READ_MAX_BYTES` | `1048576` (1 MiB) | Default `safe_read` cap. Callers can override per-call; clamped to 10 MiB. |
 
 The rule for new knobs: **strict default, named opt-out, documented here**. Never silently weaken a check; if a real false positive surfaces, add a knob.
+
+## Risks of adoption
+
+Installing Barbican is not strictly additive over running Claude Code with no hook at all. This section enumerates the ways Barbican could, in principle, make a user *worse off* than their no-hook baseline. These are not known exploitable bugs — they are attack surface the user opts into by installing Barbican, and bug classes that would be critical if discovered.
+
+If you are deciding whether to recommend Barbican to someone, read this section first.
+
+### New attack surface introduced by installing
+
+- **The binary itself.** `barbican install` copies the release binary to `~/.claude/barbican/`, writes settings, and registers an MCP server that runs on every Claude Code session. A compromised release (stolen maintainer credentials, a supply-chain attack in the Rust dependency tree, a CI build step that injects code) is persistent code execution in every session. We don't currently ship reproducible builds, nor do we sign releases with a key separate from GitHub's release automation. Recommend running `cargo audit` against the lockfile in a release and verifying SHA-256 checksums against the GitHub-published release notes before installing.
+- **The MCP subprocess.** Barbican's `safe_fetch` / `safe_read` / `safe_inspect` tools run as the user for the duration of every Claude Code session. A bug in the `rmcp` crate's JSON-RPC parsing, in our MCP server's tool dispatch, or in the async runtime is an always-on vector. `cargo audit` catches advisories but not 0-days.
+- **The hook boundary.** The `pre-bash` and `post-mcp` hook binaries are fed stdin by Claude Code. A malformed payload that trips a panic or stack overflow in our parser or serde_json has the same cost as a classifier bypass: Claude Code's fallback behavior on a crashed hook is implementation-defined.
+- **Attacker-influenced file reads.** `safe_read` canonicalizes the caller-supplied path through `std::fs::canonicalize` before policy enforcement, and the canonicalize step itself walks symlinks. A path that tickles a kernel filesystem bug (e.g. a 100-level symlink chain, a procfs entry that blocks) is evaluated before the deny policy decides anything. When the path *does* pass policy, the body flows through the sanitizer's regex engine + NFKC normalization — both are attacker-influenced surface. The canonicalize-vs-open TOCTOU window is a separate concern documented in the "Out of scope" section above.
+
+### Trust inversion
+
+- **Opt-out env vars as footguns.** `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1`, `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`, `BARBICAN_ALLOW_IP_LITERALS=1`, `BARBICAN_SAFE_READ_ALLOW=/path`, `BARBICAN_SAFE_READ_EXTRA_DENY=/path`, `BARBICAN_GIT_HARD_DENY=0` — any of these in a compromised `.envrc`, a hostile parent shell, or a direnv-allowed directory flips Barbican into an allow-on-fail stance. The user thinks they have a safety layer; the attacker has already disabled it.
+- **False sense of security.** The most dangerous outcome is "user installs Barbican, stops reviewing Claude Code's commands." Barbican's classifier catches *composition* patterns (`curl | bash` and its many disguises). It does NOT catch *semantically harmful but syntactically benign* commands: `rm -rf $HOME/project-i-care-about`, `git push --force`, `aws s3 rb s3://production`, `chmod 777 /etc`. All of those are parseable and allow-list-ed. Users who substitute Barbican for diligent review are worse off.
+- **Documented limits that users skip.** `SECURITY.md § Out of scope` enumerates what Barbican doesn't defend against (stateful cross-command attacks, confusables outside NFKC, container-subcommand grammars, fully-interpreted obfuscation in scripting-lang inline code). A user who reads only the README's catch-list and not the out-of-scope list overestimates coverage.
+
+### Bugs whose existence would be critical
+
+These are not known to exist. If any *do* exist and haven't been discovered, they would make Barbican users meaningfully worse off than no-hook users:
+
+- **Fail-open on classifier panic.** If a future refactor wraps the classifier in `catch_unwind` and maps the caught panic to `Decision::Allow` (for "safety of Barbican, not safety of user"), that reverses the deny-by-default rule exactly when an attacker is tripping the panic. Audit: grep for `catch_unwind`, `unwrap_or(Allow)`, any panic boundary that resolves to allow rather than deny. Today there is no such path; we want to keep it that way.
+- **Allow-on-parse-failure fast path.** CLAUDE.md rule #1 says parse failures deny. A future "performance" optimization that short-circuits with allow on a cheap heuristic before the real parser runs would be a full bypass. No such path exists today.
+- **Wrong-answer parser IR.** Our test coverage asserts "the parser doesn't panic" and "classifiers deny these known shapes." It does NOT prove "the IR faithfully represents every input." A bug where a compound command's inner structure is misrepresented (e.g. an `exec` wrapper's inner command is dropped from the IR) would be a classification bypass — the classifier would apply its rules to an incomplete picture. Property-based fuzzing plus the continuous cargo-fuzz cron narrow this, but don't close it.
+- **Prompt-injection classifier narrowing.** NFKC is applied; Cyrillic confusables are out-of-scope per the explicit `nfkc_does_not_map_cyrillic_i` pinning test. An attacker who crafts injections using codepoints outside the NFKC mapping gets through the classifier but the model still sees them. A user who trusts "no injection flagged" more than they would have trusted "I read the model's output" is worse off.
+- **Classifier over-denial becomes a denial-of-service on the user's own work.** If a future change denies shapes users legitimately need and there's no documented escape, users disable Barbican entirely, and now every command runs unchecked. Mitigate by documenting every new deny in `CHANGELOG.md` with a minimal PoC the user can reproduce.
+
+### What to watch for as a user
+
+- Before installing: verify the release's SHA-256 against the GitHub release notes; read the `CHANGELOG.md` entry for the version you're installing.
+- After installing: run `barbican --version` in your shell of record to confirm you're on the version you expected; check `~/.claude/settings.json` to see the actual hook command lines Barbican wired up.
+- Weekly (if you're using it seriously): `barbican uninstall --dry-run` to confirm the uninstaller sees the expected artifacts (detects tampering); re-run install to catch drift from upstream changes.
+- If you see a command Claude Code proposes and wonder whether Barbican caught it: try the same command with `barbican pre-bash` manually, reading the deny reason (if any) from stderr.
+
+### How Barbican narrows these risks over time
+
+- Every fuzz-found crash (like 1.3.1 #33) turns into a red-test-first regression guard.
+- Every SECURITY.md section labeled "Out of scope" is a candidate for a future classifier; adversarial review rounds have moved items between these lists.
+- The continuous fuzzing cron (1.3.2+) runs daily; any new crash lands as a workflow artifact within 24 hours.
+- `cargo audit` runs on every PR; RustSec advisories on our transitive deps surface immediately.
+
+None of this makes the risks go to zero. It makes them knowable.
 
 ## Known advisories we ignore (with rationale)
 
