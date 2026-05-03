@@ -2,6 +2,69 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.1] — 2026-05-03
+
+Fuzzing shipped real findings release. Two bugs the 1.3.0 fuzzing infrastructure caught in the wild, plus the ergonomic cleanup around `cargo-fuzz` itself.
+
+### Fixed
+
+- **Non-UTF-8 stdin → exit 1 (deny-by-default violation)** (#31). `pre_bash::run` read stdin via `stdin.read_to_string`, which returns `Err` on non-UTF-8 bytes. anyhow bubbled that out of `main` as exit code 1, violating CLAUDE.md rule #1 — non-UTF-8 stdin now maps to `EXIT_DENY=2` with a reason on stderr, mirroring the malformed-JSON path from 1.2.0 H-3. Found by the first CI run of the proptest layer.
+- **`tree-sitter-bash` SIGSEGV on `{` + CJK Ext G row** (#33). Property-based fuzzing on Ubuntu CI captured a deterministic crash: any `{` immediately followed by a codepoint in `U+31840..U+3187F` (UTF-8 prefix `F0 B1 A1 ??`) SIGSEGV's inside the `tree-sitter-bash` FFI. macOS parses the same bytes cleanly as an error state; Linux walks off a table edge. Pre-flight scan at `parser::parse` entrance returns `Err(Malformed)` for inputs matching this shape before the FFI is touched. 5-byte minimal reproducer; bisected from a 2863-byte captured input via a forked-subprocess classifier sweep. Upstream filed as [tree-sitter/tree-sitter-bash#337](https://github.com/tree-sitter/tree-sitter-bash/issues/337).
+
+### Added
+
+- **Linux fuzz-repro CI job** (#32). Dedicated `continue-on-error` Ubuntu job that runs the parser-touching proptests with `BARBICAN_LINUX_REPRO=1`, writing each generated input to `$BARBICAN_REPRO_LOG` with `flush() + sync_all()` before the parse call. On a crash, the log survives the segfault and is uploaded as a workflow artifact (14-day retention). Discovered the SIGSEGV within its first run.
+- **Linux crash bisect harness** (#33). `tests/linux_crash_bisect.rs` + `tests/data/probe-*.bin` — forked-subprocess probe suite that classifies a crasher's trigger context across brace/paren/bracket/quote/space/letter prefixes and BMP/astral-plane codepoint variants. Kept in-tree as ongoing infrastructure for the next crash.
+- **Workspace exclusion of `crates/barbican/fuzz`** (#30). The cargo-fuzz crate needs its own `[workspace]` table so `cargo +nightly fuzz run` from the repo root stops erroring with "current package believes it's in a workspace when it's not".
+- **Corpus .gitignore** (#30). Libfuzzer-discovered inputs are named by SHA-1 hash and drop ~14k files per 10-minute run; the named seed files (underscore-containing slugs) stay tracked, hex-hash entries are ignored.
+
+### Changed
+
+- **Logo + README header** (#34). Barbican now has a logo: rust-orange shield with `B` + portcullis bars as negative space. Generated via Gemini 3 Pro, post-processed with PIL to alpha-out the rendered checkerboard pattern. README shows it in a two-column header above the H1 + tagline ("Pre-execution safety checks for AI-generated shell commands.").
+
+## [1.3.0] — 2026-05-02
+
+Fuzzing infrastructure release. Two layers (proptest + cargo-fuzz), three targets (`parse`, `classify`, `validate_url`), one internal `__fuzz` surface, pre-seeded corpora. The point of this release is to move the "is the classifier complete?" question from human-review iteration (diminishing returns past round 8 of adversarial review) to machine-driven structural invariant checking.
+
+### Added
+
+- **Layer 1 — proptest** (`crates/barbican/tests/fuzz_properties.rs`). Five invariants, 256 cases per property, 32 for shell-out properties. Runs in CI on every PR, aggregate <1 s wall-clock.
+  1. `parser::parse` returns `Ok | Err(Malformed | ParserInit)` for any UTF-8 ≤2000 chars — never panics.
+  2. `classify_command` returns `Allow | Deny{reason}` with non-empty, NUL-free, <4 KiB reason.
+  3. `barbican pre-bash` exits `{0, 2}` on any JSON envelope — never 1, never signal-killed, never hangs past 10 s.
+  4. `net::validate_url` returns `Ok | Err` for URL-shaped input.
+  5. `path_in_attacker_writable_dir` returns a clean bool on arbitrary Unicode.
+- **Layer 2 — cargo-fuzz** (`crates/barbican/fuzz/`, workspace-excluded, nightly-only). Three targets: `parse`, `classify`, `validate_url`. Pre-seeded corpora drawn from CHANGELOG PoCs (H1 curl-pipe-bash variants, H2 base64 decode-exec, M1 wrapper families, M2 secret/DNS/reverse-shell exfil, persistence, chmod, git config injection, scripting-lang shellout) plus benign allow shapes.
+- **`barbican::__fuzz`** internal API surface (`#[doc(hidden)]`). Re-exports `classify_command` and `path_in_attacker_writable_dir` so both fuzzing layers drive the classifier directly without shelling out. Not part of the stable public API.
+- **`docs/fuzzing.md`** — two-layer overview, workflow docs (run commands for each layer, crash-reduction recipe, rationale for the workspace-exclude choice).
+
+### Findings from the first runs
+
+Both pinned (not fixed) in 1.3.0, then fixed in 1.3.1:
+
+1. `pre_bash_hook_exit_contract_holds` shrunk to non-UTF-8 bytes on stdin → `pre_bash::run` exit 1. Fixed in 1.3.1 (#31).
+2. Ubuntu CI took SIGSEGV inside `tree-sitter-bash`. Fixed in 1.3.1 (#33).
+
+## [1.2.1] — 2026-05-02
+
+MEDIUM / LOW cleanup release deferred from the 1.2.0 adversarial review rounds. Seven commits, one finding per commit, each with a red-test-first PoC. No feature changes.
+
+### Security — safe_fetch
+
+- **`safe_fetch` DNS-reachability side channel**. Collapsed NXDOMAIN / RFC1918 / loopback / raw-IP / bad-scheme errors into one opaque `"target cannot be fetched"` message in the `<barbican-error>` envelope. The discriminating detail still reaches the local audit log via `tracing::warn!` so operators can diagnose failures, but an attacker-influenced prompt can no longer iterate hostnames and read reachability from the error body.
+
+### Security — pre-bash classifier
+
+- **`sh -s` stdin-execute detection**. New `shell_with_stdin_script` classifier catches `echo 'curl|bash' | sh -s`, `printf '…' | bash -s`, etc. Mirrors the heredoc classifier: scan the upstream payload for exfil shapes, network-tool + shell-sink word pairs, or anything the classifier stack would deny on its own.
+- **Env-dumper additions**: `compgen`, `typeset`, `/proc/self/environ`. Added to both the regex and the `ENV_DUMPERS` / `secret_path_regex` sets.
+- **EXFIL_NETWORK_TOOLS additions**: `aria2c`, `lftp`, `rclone`, `gsutil`, `aws`, `az`, `gcloud`. Seven additions keep the regex and phf set in lock-step.
+- **Persistence markers for git-plant surface**: `/.git/config` and `/.git/hooks/` added to `PERSISTENCE_PATH_MARKERS` (pre-bash) and `scan_sensitive_path` (post-edit). Defense-in-depth for the 7H1 `git --git-dir=/tmp/evil` attack: catch the plant AND catch the exploit.
+- **`ssh -F /dev/fd/N` pinning test**. The 8th-pass fix already covers the `/dev/fd/*` branch; added three red tests (`/dev/fd/0`, `/dev/fd/3`, `/dev/fd/9`) so a future refactor can't silently narrow it.
+
+### Security — sanitize
+
+- **`strip_html_tags` widening**: `<iframe>`, `<object>`, `<embed>`, `<noscript>`, `<template>`, `<svg …>` (whole subtree, covers `onload=`), and `<meta http-equiv="refresh">` now stripped from HTML bodies before they land in `<untrusted-content>`. Benign `<meta charset>` / `<meta name=description>` still pass through.
+
 ## [1.2.0] — 2026-05-02
 
 Adversarial-security hardening release. Closes **54 SEVERE + HIGH findings** across **eight consecutive adversarial review rounds** (Claude `crew:code-reviewer` + GPT via cursor-agent). Every finding shipped with a red-test-first PoC. Not a feature release — no new capabilities; every change narrows a concrete bypass.
