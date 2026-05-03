@@ -2,6 +2,24 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.3] — 2026-05-03
+
+Second tree-sitter-bash Linux crash class closed. A third class surfaced during the same lane and is pinned for future bisect.
+
+### Fixed
+
+- **`{` + U+31BC0..U+31BFF (CJK Extension H) tree-sitter-bash SIGSEGV on Linux** (#40). Bisected in CI run 25284064905 via the per-probe classifier sweep: `openbrace_plus_31BC3_cjk_ext_h` returned `signal-ExitStatus(unix_wait_status(139))` while 12 other candidate `{` + astral pairs returned `exit-2-deny` cleanly. Same structural shape as the 1.3.1 Ext G finding (the crash lives in the shared 3-byte UTF-8 prefix, not a single codepoint). `preflight_known_crashers` now consults a `CRASHER_PREFIXES` table with both Ext G (`F0 B1 A1`) and Ext H (`F0 B1 AF`); future rows add one entry each.
+
+### Added
+
+- **Pinning for the Ext H class**: `preflight_denies_openbrace_plus_u31bc3`, `preflight_denies_entire_u31bc0_row`, extended negative control `preflight_allows_openbrace_plus_other_astral_codepoints`.
+- **Third captured crasher pinned for future bisect**: `tests/data/linux_crash_03.bin` (642 bytes) from CI run 25284655051, taken AFTER the Ext H preflight landed. None of the 3 `{` + non-ASCII candidates in the new capture (U+C8, U+1CE7, U+1E5E2) reproduce in isolation — the new class is context-dependent (likely `$(`, `((`, or deeper grammar state). Probe data files checked in; `aaa_classifier_probes` extended so future CI runs can narrow further.
+- **Upstream tracker**: [tree-sitter/tree-sitter-bash#337](https://github.com/tree-sitter/tree-sitter-bash/issues/337) updated with the Ext H finding.
+
+### Known
+
+- Proptest properties in `tests/fuzz_properties.rs` remain Linux-gated. The Ext H widening closes one class but doesn't cover the third crasher captured during this lane; re-enabling the gates would re-surface SIGSEGVs in CI. Gate-removal deferred to 1.3.4 (or later) once the third class is bisected and its prefix row added to `CRASHER_PREFIXES`.
+
 ## [1.3.2] — 2026-05-03
 
 Post-1.2.0 crew-review sweep + honest framing. A fresh multi-provider review (Claude + GPT-5.2) caught one CRITICAL SSRF pin bypass, tightened the new resolver trait boundary, and corrected two inaccurate SECURITY.md claims. Also adds a "Risks of adoption" section so users can evaluate Barbican against a no-hook baseline with eyes open.
