@@ -15,16 +15,12 @@
 //! `cargo-fuzz` crate under `crates/barbican/fuzz/`. See
 //! `docs/fuzzing.md` for the full story.
 
-#[cfg(not(target_os = "linux"))]
 use std::io::Write;
-#[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use barbican::__fuzz::path_in_attacker_writable_dir;
-#[cfg(not(target_os = "linux"))]
 use barbican::__fuzz::{classify_command, Decision};
 use barbican::net::validate_url;
-#[cfg(not(target_os = "linux"))]
 use barbican::parser::{parse, ParseError};
 use proptest::prelude::*;
 
@@ -32,28 +28,18 @@ use proptest::prelude::*;
 // Invariant 1 — parser::parse
 // ---------------------------------------------------------------------
 
-// The first CI run of the proptest properties in this file
-// segfaulted the test binary on Ubuntu (macOS passed cleanly). The
-// crash happened within 180ms of the process starting, before any
-// per-test output was flushed — consistent with a stack overflow or
-// invalid memory access inside the `tree-sitter-bash` FFI when
-// driven with arbitrary generated UTF-8 on Linux.
+// These parser-touching properties were briefly gated off Linux
+// (1.3.0–1.3.2) pending root-cause of two tree-sitter-bash FFI
+// SIGSEGVs that fired on arbitrary UTF-8 input on Ubuntu:
 //
-// This is itself a fuzzing finding — the second produced by the
-// 1.3.0 infrastructure (the first is the non-UTF-8 stdin → exit 1
-// bug pinned in `pre_bash_hook_exit_contract_holds` further below).
-// Both are documented in `docs/fuzzing.md` under "Findings from
-// layer 1"; the Linux-specific crash is pinned as a 1.3.1
-// root-cause task and a minimized reproducer still needs to be
-// extracted from the CI artifact (the segfault prints no per-input
-// diagnostics on its way down).
+//   1. `{` + U+31840..U+3187F row (CJK Ext G) — pinned 1.3.1.
+//   2. `{` + U+31BC0..U+31BFF row (CJK Ext H) — pinned 1.3.3.
 //
-// In the meantime, every property that reaches `parser::parse`
-// (directly or via `classify_command`) is gated off Linux so stable
-// CI stays green. The `validate_url` and
-// `path_in_attacker_writable_dir` properties don't touch
-// tree-sitter and stay active on all platforms.
-#[cfg(not(target_os = "linux"))]
+// Both rows are caught by `parser::preflight_known_crashers` before
+// the FFI is touched, so the proptest properties now run on every
+// platform. If a third row surfaces, the per-probe classifier sweep
+// in `tests/linux_crash_bisect.rs` identifies it and the table in
+// `parser.rs::CRASHER_PREFIXES` grows by one entry.
 proptest! {
     /// For any UTF-8 string under 2000 chars, `parser::parse` returns
     /// `Ok(Script)` or one of the two documented `ParseError` variants.
@@ -77,10 +63,6 @@ proptest! {
 // Invariant 2 — classify_command
 // ---------------------------------------------------------------------
 
-// Gated off Linux pending root-cause of the tree-sitter-bash FFI
-// segfault documented at the top of the file; `classify_command`
-// internally calls `parser::parse`, so the same crash shape applies.
-#[cfg(not(target_os = "linux"))]
 proptest! {
     /// For any bash command string under 2000 chars, `classify_command`
     /// returns `Decision::Allow` or `Decision::Deny {...}`. Never
@@ -131,7 +113,6 @@ proptest! {
 /// Run `barbican pre-bash` with `stdin_bytes` on stdin; return the
 /// exit code and how long the call took. A `None` exit code indicates
 /// the process was terminated by signal (we assert that never happens).
-#[cfg(not(target_os = "linux"))]
 fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     let bin = env!("CARGO_BIN_EXE_barbican");
     let start = std::time::Instant::now();
@@ -151,11 +132,6 @@ fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     (status.code(), start.elapsed())
 }
 
-// Gated off Linux pending the same root-cause: the spawned
-// `barbican pre-bash` binary parses its JSON payload's `command`
-// field through `tree-sitter-bash`, so arbitrary UTF-8 via
-// `classify_command` in the child reaches the same FFI surface.
-#[cfg(not(target_os = "linux"))]
 proptest! {
     // Shell-out strategies keep the per-test budget narrow so the
     // aggregate `cargo test` runtime stays reasonable. 32 cases per
