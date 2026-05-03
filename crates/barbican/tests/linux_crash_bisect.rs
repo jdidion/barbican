@@ -140,6 +140,10 @@ fn ccc_prefix_bisect_captured_crasher() {
 /// sitter error state built up over the preceding 2000+ bytes is
 /// load-bearing.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "probe table is naturally long; every entry is a distinct attack-class probe, and compressing into data-driven loops hides which crasher each came from"
+)]
 fn aaa_classifier_probes() {
     if !enabled() {
         return;
@@ -206,6 +210,87 @@ fn aaa_classifier_probes() {
             "solo_31860_no_prefix",
             include_bytes!("data/probe-solo_31860.bin"),
         ),
+        // --- 1.3.3 lane: second crasher captured from CI run 25282442816.
+        // The 1.3.1 preflight correctly denies the `{ + U+31840..U+3187F`
+        // class, but a proptest input that passes the preflight still
+        // SIGSEGVs tree-sitter-bash on Ubuntu. The 3103-byte capture in
+        // `data/linux_crash_02.bin` contains 13 distinct `{ + astral`
+        // pairs (extracted by `tests/data/README.md` notes); each
+        // candidate becomes its own probe below so CI can tell us which
+        // pair owns the crash.
+        //
+        // If any of these return `signal-...` or fail to emit an
+        // `outcome=` line after `about-to-spawn`, that pair is the
+        // root cause and the preflight scan should widen to cover it.
+        // Primary suspect: U+31BC3 (CJK Extension H) — same structural
+        // shape as the known Ext G crasher, just a different block.
+        (
+            "openbrace_plus_31BC3_cjk_ext_h",
+            include_bytes!("data/probe-openbrace_31BC3_cjk_ext_h.bin"),
+        ),
+        (
+            "openbrace_plus_1AFFD_tangut",
+            include_bytes!("data/probe-openbrace_1AFFD_tangut.bin"),
+        ),
+        (
+            "openbrace_plus_10F52",
+            include_bytes!("data/probe-openbrace_10F52.bin"),
+        ),
+        (
+            "openbrace_plus_16AE9_bassa",
+            include_bytes!("data/probe-openbrace_16AE9_bassa.bin"),
+        ),
+        (
+            "openbrace_plus_1F8C1_supp_arrows_c",
+            include_bytes!("data/probe-openbrace_1F8C1_supp_arrows_c.bin"),
+        ),
+        (
+            "openbrace_plus_10FC5",
+            include_bytes!("data/probe-openbrace_10FC5.bin"),
+        ),
+        (
+            "openbrace_plus_1EE5D_arabmath",
+            include_bytes!("data/probe-openbrace_1EE5D_arabmath.bin"),
+        ),
+        (
+            "openbrace_plus_1EE61_arabmath",
+            include_bytes!("data/probe-openbrace_1EE61_arabmath.bin"),
+        ),
+        (
+            "openbrace_plus_FFD2_bmp",
+            include_bytes!("data/probe-openbrace_FFD2_bmp.bin"),
+        ),
+        (
+            "openbrace_plus_23A_latin",
+            include_bytes!("data/probe-openbrace_23A_latin.bin"),
+        ),
+        (
+            "openbrace_plus_1F5D_greek",
+            include_bytes!("data/probe-openbrace_1F5D_greek.bin"),
+        ),
+        (
+            "openbrace_plus_468_cyrillic",
+            include_bytes!("data/probe-openbrace_468_cyrillic.bin"),
+        ),
+        (
+            "openbrace_plus_DA7_sinhala",
+            include_bytes!("data/probe-openbrace_DA7_sinhala.bin"),
+        ),
+        // --- 1.3.3 lane, third crasher captured after the Ext H
+        // preflight widening. Input was `tests/data/linux_crash_03.bin`
+        // (642 bytes), containing only 3 `{ + non-ASCII` pairs.
+        (
+            "openbrace_plus_1E5E2_ol_onal",
+            include_bytes!("data/probe-openbrace_1E5E2_ol_onal.bin"),
+        ),
+        (
+            "openbrace_plus_1CE7_vedic_visarga",
+            include_bytes!("data/probe-openbrace_1CE7_vedic_visarga.bin"),
+        ),
+        (
+            "openbrace_plus_C8_latin_egrave",
+            include_bytes!("data/probe-openbrace_C8_latin_egrave.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
@@ -258,5 +343,34 @@ fn zzz_full_input_captured_crasher() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_01.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.3 lane: same shape as `zzz_full_input_captured_crasher` but
+/// on the NEW 3103-byte capture from CI run 25282442816 (the one
+/// that resurfaced when the Linux proptest gates were removed
+/// during 1.3.2). Pinned here so regression is deliberate, not
+/// accidental.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_02() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_02.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.3 lane, third capture: after the Ext H preflight widening
+/// landed, CI run 25284655051 surfaced ANOTHER 642-byte crasher
+/// whose `{ + astral` pairs are all outside the Ext G/H rows.
+/// Pinned here so the bisect harness knows about all three captures.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_03() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_03.bin");
     parse_and_log(bytes);
 }

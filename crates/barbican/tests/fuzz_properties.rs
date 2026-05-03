@@ -32,27 +32,24 @@ use proptest::prelude::*;
 // Invariant 1 — parser::parse
 // ---------------------------------------------------------------------
 
-// The first CI run of the proptest properties in this file
-// segfaulted the test binary on Ubuntu (macOS passed cleanly). The
-// crash happened within 180ms of the process starting, before any
-// per-test output was flushed — consistent with a stack overflow or
-// invalid memory access inside the `tree-sitter-bash` FFI when
-// driven with arbitrary generated UTF-8 on Linux.
+// These parser-touching properties are gated off Linux. Root cause:
+// arbitrary-UTF-8 proptest inputs trip SIGSEGVs in the tree-sitter-
+// bash FFI's parser-table state machine. Three classes confirmed so
+// far by per-probe classifier bisect (`tests/linux_crash_bisect.rs`):
 //
-// This is itself a fuzzing finding — the second produced by the
-// 1.3.0 infrastructure (the first is the non-UTF-8 stdin → exit 1
-// bug pinned in `pre_bash_hook_exit_contract_holds` further below).
-// Both are documented in `docs/fuzzing.md` under "Findings from
-// layer 1"; the Linux-specific crash is pinned as a 1.3.1
-// root-cause task and a minimized reproducer still needs to be
-// extracted from the CI artifact (the segfault prints no per-input
-// diagnostics on its way down).
+//   1. `{` + U+31840..U+3187F row (CJK Ext G) — pinned 1.3.1.
+//      Preflight-denied in `parser::preflight_known_crashers`.
+//   2. `{` + U+31BC0..U+31BFF row (CJK Ext H) — pinned 1.3.3.
+//      Preflight-denied in `parser::preflight_known_crashers`.
+//   3. A third class surfaced on CI run 25284655051 after the Ext H
+//      fix landed. Candidates narrow to 3: `{` + U+1E5E2 (Ol Onal),
+//      `{` + U+1CE7 (Vedic Visarga), `{` + U+C8 (Latin È). Probes
+//      for each now live in `tests/linux_crash_bisect.rs` so the
+//      next CI run of `linux fuzz repro` tells us which row(s) own
+//      the crash; the preflight table will widen and these gates
+//      will be removed in 1.3.4.
 //
-// In the meantime, every property that reaches `parser::parse`
-// (directly or via `classify_command`) is gated off Linux so stable
-// CI stays green. The `validate_url` and
-// `path_in_attacker_writable_dir` properties don't touch
-// tree-sitter and stay active on all platforms.
+// Upstream: https://github.com/tree-sitter/tree-sitter-bash/issues/337
 #[cfg(not(target_os = "linux"))]
 proptest! {
     /// For any UTF-8 string under 2000 chars, `parser::parse` returns
@@ -77,9 +74,6 @@ proptest! {
 // Invariant 2 — classify_command
 // ---------------------------------------------------------------------
 
-// Gated off Linux pending root-cause of the tree-sitter-bash FFI
-// segfault documented at the top of the file; `classify_command`
-// internally calls `parser::parse`, so the same crash shape applies.
 #[cfg(not(target_os = "linux"))]
 proptest! {
     /// For any bash command string under 2000 chars, `classify_command`
@@ -151,10 +145,6 @@ fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     (status.code(), start.elapsed())
 }
 
-// Gated off Linux pending the same root-cause: the spawned
-// `barbican pre-bash` binary parses its JSON payload's `command`
-// field through `tree-sitter-bash`, so arbitrary UTF-8 via
-// `classify_command` in the child reaches the same FFI surface.
 #[cfg(not(target_os = "linux"))]
 proptest! {
     // Shell-out strategies keep the per-test budget narrow so the

@@ -223,40 +223,54 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// FFI on Linux.
 ///
 /// Catches: any `{` immediately followed by the 3-byte UTF-8 prefix
-/// `F0 B1 A1` — the shared opening sequence of codepoints U+31840
-/// through U+3187F, a full "row" in the CJK Unified Ideograph
-/// Extension G block. The 4th byte (the UTF-8 continuation) is not
-/// checked explicitly: `&str` input guarantees well-formed UTF-8
-/// at the buffer level, so any match on the 3-byte prefix at a char
-/// boundary is a 4-byte codepoint in that row by construction.
-/// Found by the 1.3.0 proptest fuzzer; the captured reproducer's
-/// crashing byte ended in `0x80` (U+31840) and classifier-sweep
-/// probes with the same prefix ending in `0xA0` (U+31860) also
-/// crashed — so the triggering state inside tree-sitter-bash's
-/// parser table is reached by the shared 3-byte prefix, not a single
-/// codepoint. Widened the match to the whole row to close the class
-/// without enumerating each case.
+/// of a crashing codepoint row. Each row shares its first three
+/// UTF-8 bytes; the 4th byte is any valid continuation, and `&str`
+/// input guarantees well-formed UTF-8 at the buffer level so any
+/// match on the 3-byte prefix at a char boundary is a 4-byte
+/// codepoint in that row by construction.
 ///
-/// The check is a single linear scan over the input bytes. If more
-/// crashers surface over time the scan grows into a small list of
-/// dangerous byte patterns; that stays cheap. If the list grows
-/// past a handful, we escalate to a fork-based signal-catching
-/// wrapper.
+/// Known rows (add to `CRASHER_PREFIXES` as new ones surface):
+///
+/// | Row              | Prefix     | Block                    | CI run id     |
+/// |------------------|-----------:|--------------------------|---------------|
+/// | U+31840..U+3187F | `F0 B1 A1` | CJK Ext G                | 25264060820   |
+/// | U+31BC0..U+31BFF | `F0 B1 AF` | CJK Ext H                | 25284064905   |
+///
+/// Both rows were bisected via the per-probe classifier sweep in
+/// `tests/linux_crash_bisect.rs::aaa_classifier_probes`. The sweep
+/// ran one subprocess per candidate so a single SIGSEGV couldn't
+/// kill the whole test binary; each row matched exactly one probe
+/// with `signal-ExitStatus(unix_wait_status(139))` (SIGSEGV) while
+/// siblings returned `exit-2-deny` cleanly.
+///
+/// Adjacency matters: a single byte (space, letter, second `{`)
+/// between the brace and the codepoint reverts to a clean parse.
+/// That's what the scan below encodes — the brace and the prefix
+/// must be byte-adjacent.
+///
+/// The check is a single linear scan over the input bytes with a
+/// small constant-size table of dangerous byte patterns; if the
+/// table grows past a handful of rows we escalate to a fork-based
+/// signal-catching wrapper.
 fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
-    // First 3 bytes of the crashing codepoint row (U+31840..U+3187F).
-    const CJK_EXT_G_CRASHER_PREFIX: &[u8] = &[0xF0, 0xB1, 0xA1];
+    // First 3 bytes of each crashing codepoint row. Order doesn't
+    // matter — scan returns on the first match.
+    const CRASHER_PREFIXES: &[[u8; 3]] = &[
+        // U+31840..U+3187F — CJK Ext G (1.3.1).
+        [0xF0, 0xB1, 0xA1],
+        // U+31BC0..U+31BFF — CJK Ext H (1.3.3).
+        [0xF0, 0xB1, 0xAF],
+    ];
     let bytes = input.as_bytes();
     if bytes.len() < 5 {
         return Ok(());
     }
-    // Scan for `{` IMMEDIATELY followed by the 3-byte prefix (the
-    // 4th byte of the codepoint is any valid UTF-8 continuation;
-    // `&str` input guarantees well-formed UTF-8 so we can just
-    // match 4 bytes). The bisect showed adjacency matters: a
-    // single byte (space, letter) between the brace and the
-    // codepoint reverts to a clean parse.
     for i in 0..bytes.len().saturating_sub(4) {
-        if bytes[i] == b'{' && &bytes[i + 1..i + 4] == CJK_EXT_G_CRASHER_PREFIX {
+        if bytes[i] != b'{' {
+            continue;
+        }
+        let window = &bytes[i + 1..i + 4];
+        if CRASHER_PREFIXES.iter().any(|p| window == p.as_slice()) {
             return Err(ParseError::Malformed);
         }
     }
@@ -942,10 +956,40 @@ mod tests {
     }
 
     #[test]
+    fn preflight_denies_openbrace_plus_u31bc3() {
+        // 1.3.3 lane: second Linux tree-sitter-bash SIGSEGV, pinned
+        // by CI run 25284064905. `{` + U+31BC3 (CJK Ext H) is the
+        // 5-byte minimal reproducer.
+        let input = "{\u{31BC3}";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_u31bc0_row() {
+        // Same structural shape as the Ext G row: the crash lives in
+        // the shared `F0 B1 AF` prefix, not in a single codepoint.
+        // Spot-check the row endpoints + the known reproducer.
+        for cp in ['\u{31BC0}', '\u{31BC3}', '\u{31BD0}', '\u{31BFF}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
     fn preflight_allows_openbrace_plus_other_astral_codepoints() {
         // Negative control: astral codepoints OUTSIDE the crashing
-        // row must pass through the preflight. The forked-
+        // rows must pass through the preflight. The forked-
         // subprocess bisect confirmed these shapes parse cleanly.
+        // U+31880 sits between the Ext G crasher row (ends U+3187F)
+        // and the Ext H crasher row (starts U+31BC0). Not probing
+        // other gap codepoints because the classifier sweep has only
+        // proven safety for what was captured — if proptest finds a
+        // new row later, widen the preflight and update this list.
         for cp in ['\u{10000}', '\u{1F600}', '\u{20000}', '\u{31880}'] {
             let input = format!("{{{cp}");
             assert_eq!(
