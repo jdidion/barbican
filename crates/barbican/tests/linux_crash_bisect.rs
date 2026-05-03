@@ -291,6 +291,70 @@ fn aaa_classifier_probes() {
             "openbrace_plus_C8_latin_egrave",
             include_bytes!("data/probe-openbrace_C8_latin_egrave.bin"),
         ),
+        // --- 1.3.4 lane: prefix-bisect the 3rd crasher directly.
+        // The per-codepoint probes above all returned `exit-2-deny`
+        // in CI run 25284880008, so the crash is context-dependent:
+        // some longer subsequence of `linux_crash_03.bin` triggers
+        // it, not a simple `{` + astral pair. Forked subprocesses
+        // let us sweep a power-of-2 prefix ladder without a single
+        // crash killing the test binary. The smallest prefix that
+        // returns `signal-...` is the localized crash window.
+        (
+            "crash03_prefix_0005",
+            include_bytes!("data/probe-crash03_prefix_0005.bin"),
+        ),
+        (
+            "crash03_prefix_0010",
+            include_bytes!("data/probe-crash03_prefix_0010.bin"),
+        ),
+        (
+            "crash03_prefix_0020",
+            include_bytes!("data/probe-crash03_prefix_0020.bin"),
+        ),
+        (
+            "crash03_prefix_0040",
+            include_bytes!("data/probe-crash03_prefix_0040.bin"),
+        ),
+        (
+            "crash03_prefix_0080",
+            include_bytes!("data/probe-crash03_prefix_0080.bin"),
+        ),
+        (
+            "crash03_prefix_0160",
+            include_bytes!("data/probe-crash03_prefix_0160.bin"),
+        ),
+        (
+            "crash03_prefix_0320",
+            include_bytes!("data/probe-crash03_prefix_0320.bin"),
+        ),
+        (
+            "crash03_prefix_0400",
+            include_bytes!("data/probe-crash03_prefix_0400.bin"),
+        ),
+        (
+            "crash03_prefix_0500",
+            include_bytes!("data/probe-crash03_prefix_0500.bin"),
+        ),
+        (
+            "crash03_prefix_0550",
+            include_bytes!("data/probe-crash03_prefix_0550.bin"),
+        ),
+        (
+            "crash03_prefix_0600",
+            include_bytes!("data/probe-crash03_prefix_0600.bin"),
+        ),
+        (
+            "crash03_prefix_0620",
+            include_bytes!("data/probe-crash03_prefix_0620.bin"),
+        ),
+        (
+            "crash03_prefix_0630",
+            include_bytes!("data/probe-crash03_prefix_0630.bin"),
+        ),
+        (
+            "crash03_prefix_0640",
+            include_bytes!("data/probe-crash03_prefix_0640.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
