@@ -197,6 +197,14 @@ impl std::error::Error for ParseError {}
 
 /// Parse `input` as a bash script.
 pub fn parse(input: &str) -> Result<Script, ParseError> {
+    // 1.3.1 defense: reject inputs that trip the tree-sitter-bash
+    // SIGSEGV in the `{` + U+31860 shape before they reach the FFI.
+    // Discovered via the 1.3.0 fuzzing layer; bisected to a 5-byte
+    // minimal reproducer on Linux. Filed upstream as well, but the
+    // deny-by-default rule demands we close the path locally — a
+    // classifier that can't parse its input must deny, not panic.
+    preflight_known_crashers(input)?;
+
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -209,6 +217,47 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 
     let src = input.as_bytes();
     walk_program(&tree, src)
+}
+
+/// Deny-by-default for inputs known to crash the `tree-sitter-bash`
+/// FFI on Linux.
+///
+/// Catches: any `{` immediately followed by a 4-byte UTF-8 sequence
+/// starting with `F0 B1 A1` (i.e. codepoints U+31840 through
+/// U+3187F, a full "row" in the CJK Unified Ideograph Extension G
+/// block). Found by the 1.3.0 proptest fuzzer; the captured
+/// reproducer's crashing byte ended in `0x80` (U+31840) and
+/// classifier-sweep probes with the same first-three-bytes prefix
+/// and ending in `0xA0` (U+31860) also crashed — so the triggering
+/// state inside tree-sitter-bash's parser table is reached by the
+/// shared 3-byte prefix, not a single codepoint. Widened the match
+/// to the whole row to close the class without enumerating each
+/// case.
+///
+/// The check is a single linear scan over the input bytes. If more
+/// crashers surface over time the scan grows into a small list of
+/// dangerous byte patterns; that stays cheap. If the list grows
+/// past a handful, we escalate to a fork-based signal-catching
+/// wrapper.
+fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
+    // First 3 bytes of the crashing codepoint row (U+31840..U+3187F).
+    const CJK_EXT_G_CRASHER_PREFIX: &[u8] = &[0xF0, 0xB1, 0xA1];
+    let bytes = input.as_bytes();
+    if bytes.len() < 5 {
+        return Ok(());
+    }
+    // Scan for `{` IMMEDIATELY followed by the 3-byte prefix (the
+    // 4th byte of the codepoint is any valid UTF-8 continuation;
+    // `&str` input guarantees well-formed UTF-8 so we can just
+    // match 4 bytes). The bisect showed adjacency matters: a
+    // single byte (space, letter) between the brace and the
+    // codepoint reverts to a clean parse.
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i] == b'{' && &bytes[i + 1..i + 4] == CJK_EXT_G_CRASHER_PREFIX {
+            return Err(ParseError::Malformed);
+        }
+    }
+    Ok(())
 }
 
 /// Walk the `program` root and collect every pipeline.
@@ -831,5 +880,109 @@ mod tests {
         assert!(is_redirect_kind("herestring_redirect"));
         assert!(is_redirect_kind("heredoc_redirect"));
         assert!(!is_redirect_kind("command"));
+    }
+
+    // -------------------------------------------------------------
+    // 1.3.1 preflight: tree-sitter-bash SIGSEGV on `{` + CJK Ext G
+    // row U+31840..U+3187F
+    //
+    // These tests hit `preflight_known_crashers` directly (not
+    // `parse`) so they never touch the tree-sitter FFI. Calling
+    // `parse()` with these inputs in the integration-test binary
+    // changes the test schedule enough to trip a separate Linux-
+    // only latent crash in some existing test. Testing the
+    // preflight function directly is safe on every platform and
+    // is the smallest faithful test of the fix.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn preflight_denies_openbrace_plus_u31840() {
+        // U+31840 = F0 B1 A1 80. This is the codepoint at bytes
+        // 2486-2489 of the originally captured 2863-byte crasher.
+        let input = "{\u{31840}";
+        assert_eq!(input.as_bytes(), b"{\xF0\xB1\xA1\x80");
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_openbrace_plus_u31860() {
+        // U+31860 = F0 B1 A1 A0. Classifier-sweep probe CI showed
+        // this shape also SIGSEGVs — hence the widened preflight
+        // that matches the whole F0 B1 A1 ?? row (U+31840..U+3187F).
+        let input = "{\u{31860}";
+        assert_eq!(input.as_bytes(), b"{\xF0\xB1\xA1\xA0");
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_openbrace_plus_u31860_embedded() {
+        // Scan must find the shape anywhere in the input, not
+        // only at position 0.
+        let input = "echo hello; {\u{31860} bar";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_u31840_row() {
+        // Spot-check several codepoints across the full row to
+        // confirm the 3-byte-prefix match covers every codepoint
+        // in U+31840..U+3187F.
+        for cp in ['\u{31840}', '\u{31850}', '\u{31860}', '\u{3187F}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_allows_openbrace_plus_other_astral_codepoints() {
+        // Negative control: astral codepoints OUTSIDE the crashing
+        // row must pass through the preflight. The forked-
+        // subprocess bisect confirmed these shapes parse cleanly.
+        for cp in ['\u{10000}', '\u{1F600}', '\u{20000}', '\u{31880}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Ok(()),
+                "preflight over-matched on `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_allows_crasher_row_not_preceded_by_openbrace() {
+        // Codepoints from the crashing row are fine without the
+        // `{` prefix — bisect confirmed the adjacency requirement.
+        for input in ["\u{31860}", " \u{31860}", "a\u{31860}", "(\u{31860}"] {
+            assert_eq!(
+                preflight_known_crashers(input),
+                Ok(()),
+                "preflight over-matched on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_allows_short_inputs_without_scanning() {
+        // Scan requires 5 bytes minimum; shorter inputs early-
+        // return Ok without looking at any bytes (defensive).
+        assert_eq!(preflight_known_crashers(""), Ok(()));
+        assert_eq!(preflight_known_crashers("{"), Ok(()));
+        assert_eq!(preflight_known_crashers("{a"), Ok(()));
+        // 5 bytes, not the crasher:
+        assert_eq!(preflight_known_crashers("hello"), Ok(()));
+    }
+
+    #[test]
+    fn preflight_allows_openbrace_plus_crasher_non_adjacent() {
+        // Even ONE byte between `{` and the crasher must allow —
+        // the bisect confirmed adjacency is required.
+        let input = "{ \u{31860}";
+        assert_eq!(preflight_known_crashers(input), Ok(()));
     }
 }

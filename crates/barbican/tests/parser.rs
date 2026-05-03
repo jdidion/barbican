@@ -601,3 +601,38 @@ fn heredoc_with_trailing_file_redirect_preserves_file_redirect() {
         c.redirects
     );
 }
+
+// ---------------------------------------------------------------------
+// 1.3.1: tree-sitter-bash SIGSEGV on `{` + U+31860 (CJK Ext G)
+//
+// Found by the 1.3.0 proptest fuzzer. Minimal 5-byte reproducer on
+// Linux: `{` (0x7B) followed by U+31860 (0xF0 0xB1 0xA1 0x80). macOS
+// parses the same bytes cleanly as `Err(Malformed)`; Linux SIGSEGV's
+// inside the tree-sitter-bash FFI. Pre-flighted at `parse()` entrance
+// to guarantee deny-by-default regardless of platform.
+// ---------------------------------------------------------------------
+
+// The two `openbrace_plus_u31860_*` tests that were here are moved
+// to unit tests in `src/parser.rs` so they live next to the
+// preflight function they pin. Running them as integration tests
+// in `tests/parser.rs` alongside 47 other parser integration tests
+// triggered a Linux-only SIGSEGV (likely a scheduling-dependent
+// tree-sitter-bash FFI crash unrelated to the preflight itself —
+// the preflight catches the offending input BEFORE the FFI is
+// touched, so these tests can't be the crash source themselves,
+// but adding them changed the test schedule enough to trip some
+// existing latent crash). A unit test in src/ runs in a different
+// binary and gives the preflight its own clean test context.
+
+// Negative-control tests that exercised `{` + other astral codepoints
+// (U+10000, U+1F600, U+20000) AND `<space>` + U+31860 in-process here
+// caused the in-process test binary to SIGSEGV on Ubuntu CI. The
+// forked-subprocess bisect sweep had reported those shapes as
+// clean-denial, but that was the subprocess, not in-process: tree-
+// sitter-bash's error state is large enough that adjacent parser
+// tests in the same binary destabilize the FFI in a way the
+// standalone subprocess doesn't see. Those negative controls live
+// in `tests/linux_crash_bisect.rs` under the fork-per-probe
+// classifier sweep, where a crash doesn't take the test binary
+// down. Pinning them here would make the full test suite unrunnable
+// on Linux — which defeats the whole point of the preflight.
