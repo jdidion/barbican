@@ -140,6 +140,10 @@ fn ccc_prefix_bisect_captured_crasher() {
 /// sitter error state built up over the preceding 2000+ bytes is
 /// load-bearing.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "probe table is naturally long; every entry is a distinct attack-class probe, and compressing into data-driven loops hides which crasher each came from"
+)]
 fn aaa_classifier_probes() {
     if !enabled() {
         return;
