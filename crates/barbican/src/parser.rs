@@ -961,10 +961,7 @@ mod tests {
         // by CI run 25284064905. `{` + U+31BC3 (CJK Ext H) is the
         // 5-byte minimal reproducer.
         let input = "{\u{31BC3}";
-        assert_eq!(
-            preflight_known_crashers(input),
-            Err(ParseError::Malformed)
-        );
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
     }
 
     #[test]

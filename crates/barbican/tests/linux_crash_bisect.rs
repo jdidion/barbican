@@ -276,6 +276,21 @@ fn aaa_classifier_probes() {
             "openbrace_plus_DA7_sinhala",
             include_bytes!("data/probe-openbrace_DA7_sinhala.bin"),
         ),
+        // --- 1.3.3 lane, third crasher captured after the Ext H
+        // preflight widening. Input was `tests/data/linux_crash_03.bin`
+        // (642 bytes), containing only 3 `{ + non-ASCII` pairs.
+        (
+            "openbrace_plus_1E5E2_ol_onal",
+            include_bytes!("data/probe-openbrace_1E5E2_ol_onal.bin"),
+        ),
+        (
+            "openbrace_plus_1CE7_vedic_visarga",
+            include_bytes!("data/probe-openbrace_1CE7_vedic_visarga.bin"),
+        ),
+        (
+            "openbrace_plus_C8_latin_egrave",
+            include_bytes!("data/probe-openbrace_C8_latin_egrave.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
@@ -343,5 +358,19 @@ fn zzz_full_input_captured_crasher_02() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_02.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.3 lane, third capture: after the Ext H preflight widening
+/// landed, CI run 25284655051 surfaced ANOTHER 642-byte crasher
+/// whose `{ + astral` pairs are all outside the Ext G/H rows.
+/// Pinned here so the bisect harness knows about all three captures.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_03() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_03.bin");
     parse_and_log(bytes);
 }
