@@ -2,6 +2,29 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.2] — 2026-05-03
+
+Post-1.2.0 crew-review sweep + honest framing. A fresh multi-provider review (Claude + GPT-5.2) caught one CRITICAL SSRF pin bypass, tightened the new resolver trait boundary, and corrected two inaccurate SECURITY.md claims. Also adds a "Risks of adoption" section so users can evaluate Barbican against a no-hook baseline with eyes open.
+
+### Fixed
+
+- **`safe_fetch` trailing-dot DNS pinning bypass** (#38, crew-review CRITICAL). `fetch_with` normalized the `resolve_to_addrs` key to the trimmed form (`example.com`) but left the URL host as `example.com.` — reqwest's DNS override is exact-match against `current.host_str()`, so the map key missed and reqwest fell through to system DNS, defeating the SSRF pin. Fix: rewrite `current` via `url::Url::set_host` to the normalized form up front so the map key, hickory lookup, and request all use identical strings. Also added a defensive empty-address check. Red-test-first: `trailing_dot_host_still_routed_through_mock_resolver` asserts the mock receives the lookup end-to-end.
+- **`Resolver` trait + `fetch_with` were unconditionally `pub`** (#38, crew-review WARNING). Downstream crates linking `barbican` as a library could implement `Resolver` returning unfiltered addresses and call `fetch_with` to disable the SSRF filter. Gated both behind `feature = "test-support"`; production callers use `fetch()` which constructs `ProductionResolver` internally.
+- **`SECURITY.md` "deferred to 1.2.1" claim was stale** (#37/#38, crew-review WARNING). The opaque-error mitigation shipped in 1.2.1; rewrote to past tense and cited the pinning tests (`render_error_is_opaque_across_dns_ip_and_scheme_variants`, `user_visible_error_is_identical_across_nxdomain_rfc1918_and_loopback`).
+- **`SECURITY.md` "safe_read opens then denies" claim was incorrect** (#37, crew-review WARNING). `read_blocking` calls `enforce_policy` BEFORE `File::open`, so denied paths never reach open. Rewrote to describe the real attacker-influenced surface: the canonicalize symlink walk and the sanitizer's regex + NFKC pipeline.
+- **`preflight_known_crashers` docstring/code mismatch** (#38, crew-review SUGGESTION). Doc said "4-byte UTF-8 sequence starting with F0 B1 A1" but scan checked the 3-byte prefix only. Reconciled the comment and explained why the 4th-byte check is unnecessary (`&str` guarantees well-formed UTF-8).
+
+### Added
+
+- **Issue #25 — injectable `Resolver` trait for `safe_fetch`** (#38). New `Resolver` trait + `ProductionResolver` + `MockResolver` (under `feature = "test-support"`) + `fetch_with` lets integration tests route `example.com` to a loopback wiremock port WITHOUT relaxing the SSRF check. Full sanitizer-coverage happy-path test lands in `tests/safe_fetch.rs`.
+- **"Is Barbican right for you?" README section** (#37). What Barbican catches, what it doesn't, short "Risks of adoption" pointer, when/when-NOT-to-use guidance.
+- **`SECURITY.md § Risks of adoption`** (#37). Five subsections: new attack surface introduced by installing, trust inversion, bugs whose existence would be critical (fail-open classifier, allow-on-parse-failure, wrong-answer parser IR, prompt-injection classifier narrowing, over-denial DoS), what to watch for as a user, how Barbican narrows these over time. Closes the "can I recommend Barbican to a user who's using nothing today?" threat-modeling question with an honest "yes, but read this first" answer.
+- **Crew-review driven regression tests**. `trailing_dot_host_still_routed_through_mock_resolver` pins the fix above; lives in `tests/safe_fetch.rs` under `feature = "test-support"`.
+
+### Known
+
+- Proptest properties in `tests/fuzz_properties.rs` remain gated off Linux. The 1.3.1 preflight catches the known `{ + U+31840..U+3187F` crasher class, but when the gates were briefly removed during this release's review cycle CI surfaced a SECOND tree-sitter-bash Linux FFI SIGSEGV (different input class). Re-gated for 1.3.2; 1.3.3 will capture the new crash via the existing `linux_crash_bisect` harness, widen the preflight, and re-enable Linux proptest.
+
 ## [1.3.1] — 2026-05-03
 
 Fuzzing shipped real findings release. Two bugs the 1.3.0 fuzzing infrastructure caught in the wild, plus the ergonomic cleanup around `cargo-fuzz` itself.
