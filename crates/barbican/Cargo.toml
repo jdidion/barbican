@@ -59,6 +59,15 @@ url = "2.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Opt-in test-support surface. Enabling this exposes crate-level
+# `pub` test helpers — notably `safe_fetch::MockResolver` — that let
+# integration tests inject mock resolvers without relying on
+# `pub(crate)` visibility or `#[cfg(test)]` (integration tests don't
+# see `cfg(test)`). Never enabled by default; never enabled in
+# release builds.
+test-support = []
+
 [dev-dependencies]
 # Ephemeral directories and files for safe_read integration tests. Dev-only.
 tempfile = "3.13"
