@@ -1,0 +1,117 @@
+name: fuzz
+
+# Continuous fuzzing. Runs on a nightly cron and on manual dispatch;
+# not triggered by PRs (the existing `linux-fuzz-repro` best-effort
+# job in `ci.yml` already exercises the proptest layer on every PR,
+# and a 30-minute cargo-fuzz run would balloon PR latency).
+#
+# Each run: three parallel jobs, one per fuzz target. Each job fuzzes
+# for 30 min (`-max_total_time=1800`), using a corpus that's warmed
+# from the previous run's artifact if present (falls back to the
+# in-tree `fuzz/corpus/<target>/` seeds on a cold start).
+#
+# Any libfuzzer crash artifact (`crash-<sha1>`, `leak-<sha1>`,
+# `timeout-<sha1>`, `oom-<sha1>`) is uploaded as a workflow
+# artifact with 14-day retention so the first clean reduction step
+# is a one-liner `gh run download`.
+#
+# `continue-on-error: true` because the whole point is to crash.
+# A crash-free run is good news, not the success signal — the
+# success signal is the crash artifact.
+
+on:
+  schedule:
+    # 02:00 UTC daily. Times chosen to not contend with weekday PR CI.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz duration in seconds (default 1800)"
+        required: false
+        default: "1800"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse, classify, validate_url]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          rustup --version
+          rustc --version
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Pull down the most recent corpus artifact produced by this
+      # workflow (if any). The third-party action handles the
+      # "latest run that produced artifact X" lookup cleanly; the
+      # built-in actions/download-artifact is scoped to the current
+      # run by default. Falls back to the in-tree seed corpus if
+      # no prior artifact exists (first run sets `if-no-files-found:
+      # warn` below). The in-tree seed files live in
+      # crates/barbican/fuzz/corpus/<target>/ — they'll still be
+      # there after the checkout; the download merges on top.
+      - name: Warm corpus from prior run (best-effort)
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: fuzz.yml
+          name: fuzz-corpus-${{ matrix.target }}
+          path: crates/barbican/fuzz/corpus/${{ matrix.target }}
+          # Don't fail the job when there's no prior run (first-ever
+          # invocation of this workflow):
+          if_no_artifact_found: warn
+
+      - name: Run cargo-fuzz ${{ matrix.target }}
+        working-directory: crates/barbican
+        run: |
+          DURATION="${{ github.event.inputs.duration_seconds || '1800' }}"
+          echo "::notice::Fuzzing ${{ matrix.target }} for $DURATION seconds"
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time="$DURATION" \
+            -rss_limit_mb=4096 \
+            || true  # libfuzzer returns non-zero on crash; we still want to upload
+
+      - name: List corpus + artifacts after run
+        if: always()
+        working-directory: crates/barbican
+        run: |
+          echo "=== corpus size ==="
+          ls fuzz/corpus/${{ matrix.target }} | wc -l
+          echo "=== artifacts ==="
+          ls -la fuzz/artifacts/${{ matrix.target }} 2>/dev/null || echo "(no artifacts dir — no crashes)"
+          find fuzz/artifacts -type f 2>/dev/null | head -20
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: crates/barbican/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload warmed corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: crates/barbican/fuzz/corpus/${{ matrix.target }}/
+          # Overwrite the previous run's corpus so the next scheduled
+          # run always starts from the most recent coverage.
+          overwrite: true
+          if-no-files-found: warn
+          retention-days: 30
