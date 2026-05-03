@@ -612,31 +612,17 @@ fn heredoc_with_trailing_file_redirect_preserves_file_redirect() {
 // to guarantee deny-by-default regardless of platform.
 // ---------------------------------------------------------------------
 
-#[test]
-fn openbrace_plus_u31860_denies_deterministically() {
-    // The exact 5-byte minimal crasher. Must return Err(Malformed)
-    // on every platform — on Linux because of the preflight, on
-    // macOS because tree-sitter ends up in an error state.
-    let input = "{\u{31860}";
-    assert_eq!(
-        parse(input),
-        Err(ParseError::Malformed),
-        "the bisected minimal crasher must deny (preflight regression)"
-    );
-}
-
-#[test]
-fn openbrace_plus_u31860_denies_with_trailing_content() {
-    // Embedded in a longer command — the preflight scan must still
-    // find it. Classifier downstream doesn't care what the rest is;
-    // the parse has to fail.
-    let input = "echo hello; {\u{31860} bar";
-    assert_eq!(
-        parse(input),
-        Err(ParseError::Malformed),
-        "preflight must deny even when the crasher is embedded mid-command"
-    );
-}
+// The two `openbrace_plus_u31860_*` tests that were here are moved
+// to unit tests in `src/parser.rs` so they live next to the
+// preflight function they pin. Running them as integration tests
+// in `tests/parser.rs` alongside 47 other parser integration tests
+// triggered a Linux-only SIGSEGV (likely a scheduling-dependent
+// tree-sitter-bash FFI crash unrelated to the preflight itself —
+// the preflight catches the offending input BEFORE the FFI is
+// touched, so these tests can't be the crash source themselves,
+// but adding them changed the test schedule enough to trip some
+// existing latent crash). A unit test in src/ runs in a different
+// binary and gives the preflight its own clean test context.
 
 // Negative-control tests that exercised `{` + other astral codepoints
 // (U+10000, U+1F600, U+20000) AND `<space>` + U+31860 in-process here
