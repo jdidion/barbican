@@ -746,7 +746,31 @@ mod tests {
     fn parse_argv_errors_on_no_flag() {
         let argv = vec!["barbican-shell".into(), "ls".into()];
         let err = parse_argv(&argv, Dialect::Shell).unwrap_err();
-        assert!(err.contains("no -c BODY found"));
+        // 1.4.0 second crew review (Gemini WARNING-3): pre-flag args
+        // now trigger a dedicated "unrecognized argument before -c"
+        // message; the bare no-args case is still the old error.
+        assert!(
+            err.contains("unrecognized argument before -c") || err.contains("no -c BODY"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_argv_rejects_init_file_smuggling_before_c() {
+        // Deny-by-default: pre-flag interpreter flags could source an
+        // attacker-chosen file before BODY runs.
+        let argv = vec![
+            "barbican-shell".into(),
+            "--init-file".into(),
+            "/tmp/evil".into(),
+            "-c".into(),
+            "echo hi".into(),
+        ];
+        let err = parse_argv(&argv, Dialect::Shell).unwrap_err();
+        assert!(
+            err.contains("unrecognized argument before -c"),
+            "err: {err}"
+        );
     }
 
     #[test]

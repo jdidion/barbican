@@ -16,7 +16,7 @@ A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a 
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
-Status: **1.3.7**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure plus the 1.3.1–1.3.6 Linux tree-sitter-bash preflight lane have already caught and fixed real-world bugs, and 1.3.7 closes two more SSRF gaps from a final cross-provider audit. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
+Status: **1.4.0**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure plus the 1.3.1–1.3.8 Linux tree-sitter-bash preflight lane have already caught and fixed real-world bugs. 1.4.0 adds five classifier-gated wrapper binaries (`barbican-shell` / `-python` / `-node` / `-ruby` / `-perl`) and a streaming secret-token redactor, shipped after two rounds of three-provider adversarial review. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
 
 ## Is Barbican right for you?
 
@@ -65,7 +65,7 @@ Download the binary for your platform from the [latest release](https://github.c
 
 ```sh
 # Example: macOS arm64. Substitute the tarball name for your target.
-TAG=v1.3.7
+TAG=v1.4.0
 TARGET=aarch64-apple-darwin   # or: x86_64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
 TARBALL="barbican-${TAG#v}-${TARGET}.tar.gz"
 
@@ -116,7 +116,14 @@ Each one:
 
 The wrappers install to `~/.claude/barbican/` next to the main binary. Use them as the allow-list target in any rule that can't route through `Bash(bash:*)` — for example, in a Claude Code `allow` entry or a CI runner that shells out with a fixed interpreter path.
 
-**Limits.** The classifier decides on the body *statically*. Runtime-dynamic constructs — variable indirection, `eval`, `exec`-to-another-shell — still execute in the child. The wrappers block every pattern the `pre_bash` hook blocks, and no more.
+**Limits and behavior notes.**
+
+- The classifier decides on the body *statically*. Runtime-dynamic constructs — variable indirection, `eval`, `exec`-to-another-shell — still execute in the child. The wrappers block every pattern the `pre_bash` hook blocks, and no more.
+- For `barbican-node` / `-ruby` / `-perl`, a literal `--` is inserted between BODY and any extra args so a trailing `-e` / `--eval` cannot smuggle a second script past the classifier. A caller that depends on passing extra `-e` flags after BODY (unusual) should invoke the underlying interpreter directly.
+- `BARBICAN_SHELL` / `BARBICAN_PYTHON` / `BARBICAN_NODE` / `BARBICAN_RUBY` / `BARBICAN_PERL` overrides must be **absolute paths** and cannot contain `..` components. A bare basename (`BARBICAN_SHELL=bash`) is rejected with exit 2, preventing a caller-controlled `$PATH` from redirecting the wrapper to a malicious interpreter.
+- Wrappers install `SIG_IGN` for SIGINT / SIGTERM / SIGHUP in the wrapper process before spawning the child; the child resets to `SIG_DFL` via `pre_exec`. Ctrl-C from the terminal reaches the child normally, while the wrapper survives to record the audit entry and propagate the child's exit code. SIGKILL still terminates the wrapper (cannot be ignored).
+- Args before the inline flag (`barbican-shell --init-file /tmp/x -c BODY`) are **rejected** — the classifier can't reason about pre-BODY interpreter flags, so the wrapper refuses the invocation rather than silently pass them through. Use the underlying interpreter directly if you need pre-BODY flags.
+- Wrapper stdout/stderr are line-scoped redacted via a byte-oriented regex so arbitrary bytes (binary output, non-UTF-8) pass through unchanged. Per-line output is capped at 1 MiB; a child that writes longer without a newline sees the wrapper flush mid-line.
 
 ## Build from source
 
