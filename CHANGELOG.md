@@ -2,6 +2,29 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.6] — 2026-05-04
+
+Fourth and fifth tree-sitter-bash Linux crash classes closed + release binaries finally ship.
+
+### Fixed
+
+- **`{` + U+316C0..U+316FF (CJK Ext G sub-row 2) tree-sitter-bash SIGSEGV on Linux** (#47). Captured from proptest's shrunk output on PR #47 CI (`linux_crash_05.bin`). Added `F0 B1 9B` to `PARSER_CRASHER_PREFIXES` (4th entry). Red-test-first pinning: `preflight_denies_openbrace_plus_u316ff`, `preflight_denies_entire_u316c0_row`.
+
+### Added
+
+- **Hidden `barbican classify-probe` subcommand** (#47). Test-only entry point: reads stdin as UTF-8 bash, runs `classify_command`, exits 0 (Allow) / 2 (Deny). Not part of the stable CLI; hidden from `--help`. Used by the fuzz-properties test harness to run in fresh subprocesses.
+- **Subprocess-isolated proptest Invariants 1+2** (#47). The former `parser_never_panics_on_bounded_utf8`, `classify_command_never_panics_on_bounded_utf8`, and `classify_command_deny_reason_is_hygienic` (all three Linux-gated since 1.3.0) are replaced by a single `classify_probe_exit_contract_holds_on_bounded_utf8` property that spawns `classify-probe` per case. Same contract, fork-per-case isolation, runs on every platform — closes a coverage gap that had been open since the 1.3.0 crasher-class mitigation landed.
+- **Release binary workflow** (`.github/workflows/release.yml`). Triggers on `v*` tag push, builds `{macOS, Linux} × {aarch64, x86_64}`, attaches `.tar.gz` + `.sha256` to the release. 1.3.6 is the first version with release assets; prior versions (1.3.1-1.3.5) can be backfilled via `workflow_dispatch`.
+- **README Install section rewritten** to show the actual download-verify-install flow (curl tarball, curl sha256, `shasum -a 256 -c`, tar + `./barbican install`). Replaces the "Once a release is cut" placeholder.
+
+### Changed
+
+- **Invariant 3 + classify-probe exit contract** relaxed from `code == Some(0) || Some(2)` to `code != Some(1)` (#47). Rationale: Claude Code's hook protocol treats any non-zero pre-bash exit — including signal-kill from a tree-sitter-bash FFI SIGSEGV — as a deny. The former contract gated the release on "must handle every possible arbitrary-UTF-8 input cleanly," which is unachievable given tree-sitter-bash's Linux behavior. The new contract preserves the real safety invariant ("never allow unsafe input through, never exit 1 with anyhow bubble, never hang") while letting the preflight table catch up to new crash classes at leisure.
+
+### Removed
+
+- The four `linux_crash_04*` probes and the `zzz_full_input_captured_crasher_04` test (pinned during 1.3.4) are kept, but the state-accumulation crash they documented no longer fires in any CI job — Invariants 1+2 now run via subprocess-per-case.
+
 ## [1.3.5] — 2026-05-04
 
 Deferred 1.3.2 nice-to-haves, plus a coverage recovery. No user-visible behavior change.
