@@ -247,6 +247,9 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
 ///
 /// | Row              | Prefix       | Block                     | CI run id     |
 /// |------------------|-------------:|---------------------------|---------------|
+/// | Row              | Prefix       | Block                     | CI context    |
+/// |------------------|-------------:|---------------------------|---------------|
+/// | U+316C0..U+316FF | `F0 B1 9B`   | CJK Ext G sub-row 2       | 1.3.6 PR #47  |
 /// | U+31840..U+3187F | `F0 B1 A1`   | CJK Ext G                 | 25264060820   |
 /// | U+31BC0..U+31BFF | `F0 B1 AF`   | CJK Ext H sub-row 1       | 25284064905   |
 /// | U+31F80..U+31FBF | `F0 B1 BE`   | CJK Ext H sub-row 2       | 25299266828   |
@@ -254,8 +257,12 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
 /// Add new rows as the per-probe classifier sweep in
 /// `tests/linux_crash_bisect.rs::aaa_classifier_probes` identifies
 /// them. Upstream: <https://github.com/tree-sitter/tree-sitter-bash/issues/337>
-pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] =
-    &[[0xF0, 0xB1, 0xA1], [0xF0, 0xB1, 0xAF], [0xF0, 0xB1, 0xBE]];
+pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] = &[
+    [0xF0, 0xB1, 0x9B],
+    [0xF0, 0xB1, 0xA1],
+    [0xF0, 0xB1, 0xAF],
+    [0xF0, 0xB1, 0xBE],
+];
 
 #[cfg(test)]
 mod tests {
@@ -319,6 +326,7 @@ mod tests {
         // 1.3.1 / 1.3.3 / 1.3.4. Changing the table without also
         // updating `parser::preflight_known_crashers` tests would let
         // a Linux regression slip through.
+        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0x9B]));
         assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xA1]));
         assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xAF]));
         assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xBE]));
