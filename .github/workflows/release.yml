@@ -108,7 +108,11 @@ jobs:
           printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
 
       - name: Release build
-        run: cargo build --release --target ${{ matrix.target }} --locked
+        # `--bins` packs every `[[bin]]` target: the main `barbican`
+        # binary PLUS the 1.4.0 wrapper binaries (barbican-shell,
+        # -python, -node, -ruby, -perl) that cargo auto-discovers
+        # from src/bin/*.rs.
+        run: cargo build --release --target ${{ matrix.target }} --locked --bins
 
       - name: Stage artifact
         id: stage
@@ -121,8 +125,14 @@ jobs:
           STAGE_DIR="stage/$ARTIFACT"
           mkdir -p "$STAGE_DIR"
 
-          BIN="target/${{ matrix.target }}/release/barbican"
-          cp "$BIN" "$STAGE_DIR/barbican"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          # Main binary.
+          cp "$BIN_DIR/barbican" "$STAGE_DIR/barbican"
+          # 1.4.0 wrapper binaries (`barbican install` copies these
+          # alongside the main binary when present).
+          for wrapper in barbican-shell barbican-python barbican-node barbican-ruby barbican-perl; do
+            cp "$BIN_DIR/$wrapper" "$STAGE_DIR/$wrapper"
+          done
           cp README.md LICENSE CHANGELOG.md SECURITY.md "$STAGE_DIR/"
 
           # Pack as .tar.gz (same convention as rustup-init, fd, ripgrep,
