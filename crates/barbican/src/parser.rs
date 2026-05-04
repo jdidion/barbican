@@ -1019,6 +1019,34 @@ mod tests {
     }
 
     #[test]
+    fn preflight_denies_openbrace_plus_u30225() {
+        // 1.3.8 lane: sixth Linux tree-sitter-bash SIGSEGV class,
+        // surfaced by the best-effort `linux-fuzz-repro` job on PR #49
+        // CI (1.3.7 audit-fix PR, 8192-case proptest sweep). `{` +
+        // U+30225 (CJK Ext G row U+30200..U+3023F) is the 5-byte
+        // minimal reproducer extracted from the 995-byte proptest
+        // input (see `tests/data/linux_crash_06.bin`). This is the
+        // first preflight entry with lead byte `0xB0` — all previous
+        // classes shared `0xB1`.
+        let input = "{\u{30225}";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_u30200_row() {
+        // Row U+30200..U+3023F shares prefix `F0 B0 88`.
+        for cp in ['\u{30200}', '\u{30225}', '\u{3023F}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
     fn preflight_allows_openbrace_plus_other_astral_codepoints() {
         // Negative control: astral codepoints OUTSIDE the crashing
         // rows must pass through the preflight. The forked-

@@ -477,6 +477,66 @@ fn aaa_classifier_probes() {
             "crash04_prefix_0195",
             include_bytes!("data/probe-crash04_prefix_0195.bin"),
         ),
+        // --- 1.3.8 lane: sixth crasher captured from PR #49 CI
+        // (`linux-fuzz-repro` best-effort job on 2026-05-04, 8192-case
+        // proptest sweep). The crashing input contains `{` + U+30225
+        // (CJK Extension G, row U+30200..U+3023F), UTF-8 prefix
+        // `F0 B0 88`. Distinct from all four existing preflight rows
+        // (`F0 B1 {9B, A1, AF, BE}`) — lead byte `0xB0` is new.
+        //
+        // Bisect goals:
+        //  1. Confirm the minimal `{` + U+30225 tripplets-crashes
+        //     under `classify-probe` subprocess. If yes, widen the
+        //     preflight table to `F0 B0 88`.
+        //  2. Determine the row boundary: does any U+30200..U+3023F
+        //     codepoint crash, or is this a finer-grained subrow?
+        //     (The 1.3.4/1.3.6 pattern suggests whole-row coverage is
+        //     safe to assume; 1.3.3 needed a sub-row.)
+        //  3. Confirm sibling rows (U+301C0..U+301FF, U+30240..U+3027F)
+        //     are safe — if they also crash, we need a wider prefix.
+        (
+            "openbrace_plus_30225_minimal",
+            include_bytes!("data/probe-openbrace_30225.bin"),
+        ),
+        (
+            "openbrace_plus_30200_row_start",
+            include_bytes!("data/probe-openbrace_30200.bin"),
+        ),
+        (
+            "openbrace_plus_3021F_row_mid",
+            include_bytes!("data/probe-openbrace_3021F.bin"),
+        ),
+        (
+            "openbrace_plus_3023F_row_end",
+            include_bytes!("data/probe-openbrace_3023F.bin"),
+        ),
+        // Row boundaries — if these crash too, the prefix needs to
+        // be wider than F0 B0 88 (e.g. the whole F0 B0 88 + row byte).
+        (
+            "openbrace_plus_301FF_just_below_row",
+            include_bytes!("data/probe-openbrace_301FF.bin"),
+        ),
+        (
+            "openbrace_plus_30240_just_above_row",
+            include_bytes!("data/probe-openbrace_30240.bin"),
+        ),
+        (
+            "openbrace_plus_30000_ext_g_start",
+            include_bytes!("data/probe-openbrace_30000.bin"),
+        ),
+        (
+            "openbrace_plus_30100_row_above",
+            include_bytes!("data/probe-openbrace_30100.bin"),
+        ),
+        (
+            "openbrace_plus_30300_row_below",
+            include_bytes!("data/probe-openbrace_30300.bin"),
+        ),
+        // Negative control — solo U+30225 with no `{` prefix.
+        (
+            "solo_30225_no_prefix",
+            include_bytes!("data/probe-solo_30225.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
@@ -586,5 +646,26 @@ fn zzz_full_input_captured_crasher_05() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_05.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.8 lane, sixth capture: surfaced by the best-effort
+/// `linux-fuzz-repro` job on PR #49 CI (the 1.3.7 audit-fix PR). The
+/// proptest runner walked 8192 random UTF-8 inputs and found a new
+/// SIGSEGV class. The crashing input contains `{` + U+30225 (CJK
+/// Extension G, row U+30200..U+3023F) — UTF-8 prefix `F0 B0 88`.
+/// This is a distinct range from the 4 existing preflight rows
+/// (all of which have lead byte `0xB1`); `0xB0` is new.
+///
+/// Pending: confirm the minimal `{` + U+30225 reproduces under a
+/// single `classify-probe` subprocess (see `probe-crash06_minimal`
+/// in `aaa_classifier_probes`) before widening the preflight table.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_06() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_06.bin");
     parse_and_log(bytes);
 }
