@@ -29,18 +29,12 @@ use crate::sanitize::strip_ansi;
 /// Max chars any string field is allowed to reach before truncation.
 const MAX_STRING_CHARS: usize = 4000;
 
-/// Max bytes we'll ever read from stdin. Guards against OOM DoS on
-/// an unbounded payload. 8 MiB comfortably covers any realistic
-/// tool-call payload; anything larger is rejected (the log gets a
-/// single-line "too large" marker instead).
-const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024;
-
 /// Run the audit hook. Never returns Err — writer failures are
 /// swallowed so the parent tool call proceeds.
 pub fn run() -> Result<()> {
     let mut buf = String::new();
     if std::io::stdin()
-        .take(MAX_STDIN_BYTES)
+        .take(crate::hooks::MAX_STDIN_BYTES)
         .read_to_string(&mut buf)
         .is_err()
     {
@@ -170,6 +164,25 @@ fn scalar_string(v: Option<&Value>) -> Value {
 /// (the hook must never break the session).
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
+        // 1.3.7 adversarial review (gemini-3.1-pro CRITICAL #1):
+        // `create_dir_all` transparently follows symlinks in any
+        // already-existing ancestor. An attacker with write access to
+        // `$HOME` can pre-plant `~/.claude` as a symlink to an
+        // arbitrary directory; `create_dir_all("~/.claude/barbican")`
+        // then creates `barbican/` under the attacker's target, and
+        // the leaf-only `symlink_metadata(parent)` below would not
+        // catch it (the post-`create_dir_all` parent is a real dir,
+        // just in the wrong place). Walk every existing ancestor
+        // first and reject if any is a symlink — same discipline as
+        // `mcp::safe_read::path_contains_symlink` for the 1.2.0 H-8
+        // fix.
+        if ancestor_chain_has_symlink(parent) {
+            return Err(std::io::Error::other(format!(
+                "barbican audit: refusing to write — symlinked \
+                 ancestor on `{}`",
+                parent.display()
+            )));
+        }
         std::fs::create_dir_all(parent)?;
         // 1.2.0 second-pass adversarial review (HIGH #1): if the
         // parent dir is itself a symlink (planted by a prior
@@ -214,6 +227,53 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
     Ok(())
+}
+
+/// Walk the already-existing portion of `parent`'s ancestor chain,
+/// up to (but excluding) the user's home directory, and return true
+/// if any component is a symlink. Matches the 1.2.0 H-8 anti-
+/// laundering pattern in `mcp::safe_read::path_contains_symlink`:
+/// system-level ancestors above `$HOME` (e.g. macOS's `/var` →
+/// `/private/var`) are platform fixtures outside the attacker model
+/// and would produce false positives. Intermediate components that
+/// don't yet exist are fine — `create_dir_all` materializes them as
+/// real directories; only pre-existing symlinks are attacker-
+/// controlled. If `$HOME` is unresolvable the walk is skipped (the
+/// audit path-derivation already rejects non-absolute `$HOME`).
+///
+/// 1.3.7 adversarial review (gemini-3.1-pro CRITICAL #1).
+fn ancestor_chain_has_symlink(parent: &std::path::Path) -> bool {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return false,
+    };
+    if home.as_os_str().is_empty() || !home.is_absolute() {
+        return false;
+    }
+    // Only scope anti-laundering to paths under $HOME. A path outside
+    // $HOME can't be reasoned about without risking macOS /var
+    // false-positives.
+    if !parent.starts_with(&home) {
+        return false;
+    }
+    let mut cur: Option<&std::path::Path> = Some(parent);
+    while let Some(p) = cur {
+        if !p.starts_with(&home) {
+            break;
+        }
+        if let Ok(md) = std::fs::symlink_metadata(p) {
+            if md.file_type().is_symlink() {
+                return true;
+            }
+        }
+        cur = p.parent();
+        if let Some(next) = cur {
+            if next == p {
+                break;
+            }
+        }
+    }
+    false
 }
 
 /// The POSIX `O_NOFOLLOW` flag value. `0x100` on Linux and macOS
@@ -340,5 +400,63 @@ mod tests {
         assert_eq!(civil_from_unix(1_777_420_800), (2026, 4, 29, 0, 0, 0));
         // 2026-04-29 14:23:45 UTC — checks h/m/s too.
         assert_eq!(civil_from_unix(1_777_472_625), (2026, 4, 29, 14, 23, 45));
+    }
+
+    /// 1.3.7 adversarial review (gemini-3.1-pro CRITICAL #1):
+    /// `create_dir_all` transparently follows symlinks in any existing
+    /// ancestor. Pin the anti-laundering walk so a symlinked ancestor
+    /// surfaces before the audit write happens.
+    ///
+    /// SAFETY: this test mutates the process-global `HOME` env var. It
+    /// must run serially with any other HOME-sensitive test. We scope
+    /// the mutation to the test body and restore on exit.
+    #[test]
+    fn ancestor_chain_has_symlink_catches_planted_ancestor() {
+        let base = std::env::temp_dir().join(format!(
+            "barbican-audit-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Stand up a fake HOME inside the tempdir so the ancestor walk
+        // scopes under it.
+        let fake_home = base.join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let prior_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded test, no concurrent HOME readers.
+        std::env::set_var("HOME", &fake_home);
+
+        // Real target directory the symlink points at.
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+
+        // Planted symlink inside the fake HOME acting as an ancestor.
+        let link = fake_home.join("planted");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // `$HOME/planted/nested` walks through `planted` (symlink).
+        let under_symlink = link.join("nested");
+        assert!(
+            ancestor_chain_has_symlink(&under_symlink),
+            "symlinked ancestor must be caught"
+        );
+
+        // Sanity: a non-symlinked ancestor chain under HOME is fine.
+        let plain = fake_home.join("plain").join("nested");
+        assert!(!ancestor_chain_has_symlink(&plain));
+
+        // Paths outside HOME are out of scope (no false positive on
+        // macOS /var → /private/var or similar).
+        let outside = std::path::PathBuf::from("/var/log/whatever");
+        assert!(!ancestor_chain_has_symlink(&outside));
+
+        // Restore prior HOME.
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

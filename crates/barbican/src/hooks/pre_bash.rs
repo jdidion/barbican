@@ -90,8 +90,14 @@ pub fn run() -> Result<()> {
     // anyhow `?` would exit 1 — violating CLAUDE.md rule #1
     // (deny-by-default should map to EXIT_DENY=2 with a reason on
     // stderr, mirroring the malformed-JSON path below).
+    // Cap stdin at MAX_STDIN_BYTES (8 MiB). An over-cap payload is
+    // silently truncated; the truncated bytes will fail the JSON
+    // parse below (or the UTF-8 decode above), landing in the
+    // existing deny-by-default branch. This is the same pattern
+    // `audit.rs` uses. 1.3.7 adversarial review (Claude WARNING #7).
     let mut raw = Vec::new();
     std::io::stdin()
+        .take(crate::hooks::MAX_STDIN_BYTES)
         .read_to_end(&mut raw)
         .context("reading pre-bash hook JSON from stdin")?;
 

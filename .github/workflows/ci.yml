@@ -19,8 +19,8 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -28,8 +28,8 @@ jobs:
     name: cargo clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -41,8 +41,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
       - name: Test
         run: cargo test --all-targets --all-features
 
@@ -50,8 +50,8 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
         with:
           shared-key: audit
       - name: Install cargo-audit
@@ -89,8 +89,8 @@ jobs:
       # realistic chance of tripping the crash. Default is 256.
       PROPTEST_CASES: "8192"
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
         with:
           shared-key: linux-fuzz-repro
       - name: Bisect the captured crasher (if one is pinned)
@@ -126,7 +126,7 @@ jobs:
           cat barbican-bisect.txt 2>/dev/null || echo "(log empty or missing)"
       - name: Upload repro log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-fuzz-repro-log
           path: barbican-repro.txt
@@ -134,7 +134,7 @@ jobs:
           retention-days: 14
       - name: Upload bisect log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-fuzz-bisect-log
           path: barbican-bisect.txt
@@ -145,8 +145,8 @@ jobs:
     name: release build (aarch64-apple-darwin)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
         with:
           shared-key: release-aarch64
       - name: Add target

@@ -20,7 +20,11 @@ use crate::scan::{flatten_value_strings, scan_cap_from_env, scan_injection, trun
 
 pub fn run() -> Result<()> {
     let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
+    if std::io::stdin()
+        .take(crate::hooks::MAX_STDIN_BYTES)
+        .read_to_string(&mut buf)
+        .is_err()
+    {
         return Ok(());
     }
     let Ok(payload) = serde_json::from_str::<Value>(&buf) else {

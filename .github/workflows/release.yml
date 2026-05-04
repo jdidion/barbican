@@ -33,6 +33,12 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # 1.3.7 adversarial review (Claude WARNING #1, #3): each job gets
+    # the minimum permissions required. `build` only reads the repo
+    # and produces artifacts; it has no release-write access.
+    # `attach-to-release` holds `contents: write`.
+    permissions:
+      contents: read
     strategy:
       # One platform's build failure shouldn't block the others — the
       # release gets whatever assets succeed, and the maintainer can
@@ -40,20 +46,50 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 1.3.7 adversarial review (gemini-3.1-pro WARNING #2): pin
+          # runner images to specific versions instead of `*-latest`
+          # so an upstream runner rollout can't silently change the
+          # release toolchain.
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-14
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # 1.3.7 adversarial review (Claude WARNING #2): SHA-pin every
+      # third-party action to a tagged commit. Tag-only refs let an
+      # attacker who compromises the action repository silently swap
+      # the tag to a malicious commit. The `# v4.2.2` annotation is
+      # the human-readable version for review.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+          # Need `main`'s history for the ancestor check below.
+          fetch-depth: 0
 
-      - uses: Swatinem/rust-cache@v2
+      # 1.3.7 adversarial review (Claude WARNING #3): `workflow_dispatch`
+      # accepts a user-supplied `tag:` input. Without gating, a
+      # collaborator with dispatch permission but no release-admin
+      # permission could push a tag on an attacker-controlled branch,
+      # dispatch the workflow, and exercise `build.rs` / `cargo
+      # --locked` on an arbitrary commit with workflow-identity OIDC
+      # tokens in reach. Require dispatched tags to be on `main`'s
+      # history; the tag-push trigger path is already gated by repo
+      # tag-write permissions, so this check is a no-op there.
+      - name: Guard dispatched tag is on main
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if ! git merge-base --is-ancestor "$(git rev-parse "$TAG")" origin/main; then
+            echo "::error::dispatched tag $TAG is not an ancestor of origin/main; refusing to build" >&2
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
         with:
           shared-key: release-${{ matrix.target }}
 
@@ -103,7 +139,7 @@ jobs:
           echo "checksum=${ARTIFACT}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.stage.outputs.artifact_name }}
           path: |
@@ -115,25 +151,58 @@ jobs:
   attach-to-release:
     name: attach assets to release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Only runs after all matrix builds finish, and only when a release
     # already exists for the tag — otherwise `gh release upload` errors.
     # `if: always()` so a partial matrix still gets its successful
     # assets uploaded.
     if: always() && needs.build.result != 'cancelled'
     permissions:
+      # `contents: write` is required for `gh release upload`.
+      # `id-token: write` + `attestations: write` drive the
+      # build-provenance attestations (see final step below).
+      # 1.3.7 adversarial review (Claude WARNING #1, #3).
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
-      - name: Flatten and upload
+      - name: Flatten artifacts for upload
+        id: flatten
+        run: |
+          # Flatten: each matrix job uploads a directory with .tar.gz +
+          # .sha256; we want flat files for the attestation step and
+          # the release upload.
+          mkdir -p flat
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) \
+            -exec cp {} flat/ \;
+          ls -la flat/
+
+      # 1.3.7 adversarial review (Claude WARNING #1, gemini-3.1-pro
+      # WARNING #2, grok-4-20-thinking SUGGESTION 1): the sha256
+      # files verify transport integrity only — an attacker who
+      # compromises the release can swap both tarball and sha256 in
+      # one upload. Build-provenance attestations (Sigstore-backed,
+      # keyless via GitHub OIDC) close the authenticity gap: users
+      # run `gh attestation verify <tarball> --repo jdidion/barbican`
+      # to confirm the artifact was produced by THIS workflow on a
+      # commit that lives on THIS repository. No external key
+      # material to rotate.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "flat/*.tar.gz"
+
+      - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -148,13 +217,6 @@ jobs:
             echo "::error::release $TAG does not exist; run 'gh release create $TAG' first" >&2
             exit 1
           fi
-
-          # Flatten: each matrix job uploads a directory with .tar.gz +
-          # .sha256; we want flat files on the release page.
-          mkdir -p flat
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) \
-            -exec cp {} flat/ \;
-          ls -la flat/
 
           # --clobber so a re-run can overwrite a partial upload.
           gh release upload "$TAG" flat/* --clobber
