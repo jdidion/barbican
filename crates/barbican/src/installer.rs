@@ -245,12 +245,46 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     // binary on the next install. Route binary staging through the
     // same O_NOFOLLOW + O_EXCL + fsync + rename discipline the JSON
     // writers use; set mode 0o755 on open rather than chmod-after.
-    let bytes = fs::read(src).with_context(|| format!("read source binary {}", src.display()))?;
+    //
+    // 1.4.0 second crew review (Gemini CRITICAL): the *source* side
+    // was vulnerable to a TOCTOU between the caller's `symlink_metadata`
+    // check and the read. Open the source with `O_NOFOLLOW` directly —
+    // a symlink at the source path fails the open with ELOOP, no
+    // separate check required.
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(o_nofollow_source())
+        .open(src)
+        .with_context(|| format!("open source binary {}", src.display()))?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .with_context(|| format!("read source binary {}", src.display()))?;
     let tmp = tmp_path(dst);
     write_bytes_atomic_with_mode(&tmp, dst, &bytes, 0o755)
         .with_context(|| format!("install binary to {}", dst.display()))?;
     log(&format!("installed binary to {}", dst.display()));
     Ok(())
+}
+
+/// POSIX `O_NOFOLLOW` flag for the installer's source-open path.
+/// Shares the per-OS values with `audit_io::o_nofollow` but doesn't
+/// re-use it so the installer doesn't take a dependency on an
+/// unrelated module's internal constant.
+const fn o_nofollow_source() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        0x0100
+    }
+    #[cfg(target_os = "linux")]
+    {
+        0x20000
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
 }
 
 /// 1.4.0 wrapper binaries that ship alongside `barbican`. The installer
