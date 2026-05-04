@@ -65,10 +65,12 @@ struct ToolInput {
 /// The classifier's output. A `Deny` carries a short human-readable
 /// reason surfaced on stderr so the user sees why the call was blocked.
 ///
-/// `pub(crate)` so the `__fuzz` module can re-export it to property
-/// tests and fuzz targets without widening the module's main surface.
+/// Widened from `pub(crate)` to `pub` in 1.4.0 so the new wrapper
+/// binaries (`barbican-shell` / `barbican-python` / etc.) can
+/// classify an arbitrary `-c` body without going through the hook-
+/// JSON envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Decision {
+pub enum Decision {
     Allow,
     Deny { reason: String },
 }
@@ -235,11 +237,12 @@ pub mod __fuzz {
 /// Classify a raw bash command string. Deny on parse failure; otherwise
 /// apply each policy in turn.
 ///
-/// `pub(crate)` so the `__fuzz` re-export in this module can surface it
-/// via `barbican::__fuzz::classify_command` for property tests and
-/// `cargo-fuzz` targets. The module stays private; only the hidden
-/// shim widens it further.
-pub(crate) fn classify_command(command: &str) -> Decision {
+/// Widened from `pub(crate)` to `pub` in 1.4.0 so the wrapper
+/// binaries (`barbican-shell` / `barbican-python` / etc.) can call
+/// the classifier directly. The `__fuzz` shim is preserved for the
+/// existing proptest / cargo-fuzz layer.
+#[must_use]
+pub fn classify_command(command: &str) -> Decision {
     match parser::parse(command) {
         Err(ParseError::Malformed) => Decision::Deny {
             reason: "command could not be parsed safely (deny by default)".to_string(),

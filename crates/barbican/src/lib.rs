@@ -13,6 +13,7 @@ pub mod redact;
 pub mod sanitize;
 pub mod scan;
 pub mod tables;
+pub mod wrappers;
 
 /// Internal, unstable surface exposed only so the 1.3.0 fuzzing
 /// infrastructure (proptest properties in `tests/fuzz_properties.rs`
