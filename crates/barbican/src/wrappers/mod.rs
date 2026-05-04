@@ -374,14 +374,31 @@ fn spawn_with_redaction(
 /// line, and push the (possibly-rewritten) line onto `tx`. When the
 /// pipe reaches EOF the sender is dropped and the forwarder thread
 /// exits.
+///
+/// 1.4.0 adversarial review (all three reviewers): uses
+/// `BufRead::read_until(b'\n', …)` rather than `split(b'\n')` so the
+/// trailing newline is preserved when present and NOT fabricated when
+/// absent. `split` strips the delimiter unconditionally and leaves
+/// the caller unable to tell whether the last chunk was newline-
+/// terminated — a child that writes `printf 'x'` must see its output
+/// reach our stdout as exactly `x`, not `x\n`.
 #[allow(clippy::needless_pass_by_value)] // must own `tx` so it drops at fn exit and closes the channel
 fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::Sender<Vec<u8>>) {
-    let reader = BufReader::new(pipe);
-    for line in reader.split(b'\n') {
-        let Ok(mut bytes) = line else { break };
-        // Put the newline back unless it was the trailing partial line.
-        bytes.push(b'\n');
-        let text = String::from_utf8_lossy(&bytes);
+    let mut reader = BufReader::new(pipe);
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            // EOF (Ok(0)) or I/O error: pipe closed, the forwarder
+            // sees the channel close when `tx` drops at fn exit.
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // `read_until` preserves the delimiter if present; the final
+        // chunk before EOF may have no `\n`. Either way we forward
+        // the bytes verbatim (modulo redaction), so wrapper output
+        // is byte-identical to the child's output on the happy path.
+        let text = String::from_utf8_lossy(&buf);
         let redacted = redact_secrets(&text);
         if tx.send(redacted.as_bytes().to_vec()).is_err() {
             break;

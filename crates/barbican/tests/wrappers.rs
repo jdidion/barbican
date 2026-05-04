@@ -248,6 +248,37 @@ fn python_wrapper_allow_hello_if_python3_available() {
     assert!(out.contains("ok"), "output: {out}");
 }
 
+// ---- newline preservation (CRITICAL-C from 1.4 crew review) ----
+//
+// `pipe_to_redacted_chunks` previously used `BufRead::split(b'\n')`
+// and unconditionally appended `\n` to every chunk, so
+// `barbican-shell -c "printf 'x'"` emitted `x\n` instead of `x`.
+// Pin exact byte-equivalence to raw bash.
+
+#[test]
+fn shell_preserves_no_trailing_newline() {
+    // `printf` emits exactly 'x' with no trailing newline.
+    let (exit, out, _) = run_wrapper(bin_shell(), "-c", "printf 'x'", &[]);
+    assert_eq!(exit, 0);
+    assert_eq!(
+        out.as_bytes(),
+        b"x",
+        "wrapper must not fabricate a trailing newline; got {out:?}"
+    );
+}
+
+#[test]
+fn shell_preserves_trailing_newline_when_present() {
+    // `echo` includes a trailing newline; wrapper must preserve it.
+    let (exit, out, _) = run_wrapper(bin_shell(), "-c", "echo hi", &[]);
+    assert_eq!(exit, 0);
+    assert_eq!(
+        out.as_bytes(),
+        b"hi\n",
+        "wrapper must preserve the child's trailing newline; got {out:?}"
+    );
+}
+
 // ---- flag-smuggling after BODY (CRITICAL-2 from 1.4 crew review) ----
 //
 // Node / Perl / Ruby all re-parse -e / --eval tokens after BODY if no
