@@ -681,3 +681,25 @@ fn zzz_full_input_captured_crasher_07() {
     let bytes = include_bytes!("data/linux_crash_07.bin");
     parse_and_log(bytes);
 }
+
+/// 1.3.8 lane, eighth capture: surfaced by the third CI run on PR #50
+/// after the `F0 B1` lead-pair widening. The 3540-byte input contains
+/// 10 `{` + astral pairs spanning 6 distinct lead pairs: `F0 9F`,
+/// `F0 9E`, `F0 9D`, `F3 A0`, `F0 9B`, `F0 90`. Only the first pair
+/// (`{` + U+1F8C1, lead `F0 9F`) can realistically be the trigger
+/// since all of `F0 B0..B1` is already preflight-blocked.
+///
+/// This is the evidence that promoted the preflight from a lead-pair
+/// table to a blanket 4-byte-UTF-8-lead (`0xF0..=0xF7`) check —
+/// whatever tree-sitter-bash state the `{` prefix puts the parser
+/// into is broken for every 4-byte codepoint, not for a specific
+/// block.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_08() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_08.bin");
+    parse_and_log(bytes);
+}

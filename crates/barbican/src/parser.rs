@@ -255,10 +255,31 @@ fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
         if bytes[i] != b'{' {
             continue;
         }
-        // 2-byte lead-pair check first — coarser, covers whole blocks
-        // (2^12 codepoints each). The 1.3.8 bisect proved `F0 B0`
-        // crashes across multiple rows, so checking the 3-byte table
-        // for entries under the same lead pair would be redundant.
+        // 1.3.8 final widening: deny `{` followed by ANY 4-byte UTF-8
+        // codepoint (lead byte 0xF0..=0xF7, which encodes U+10000..
+        // U+10FFFF — the whole astral range). The 1.3.1 through 1.3.8
+        // bisects captured 7 distinct crasher codepoints across 6
+        // non-adjacent lead pairs (`F0 B0`, `F0 B1`, plus class-8's
+        // `F0 9F`, `F0 9E`, `F0 9D`, `F3 A0`), strongly suggesting the
+        // upstream tree-sitter-bash bug is triggered by the 4-byte
+        // continuation path generically, not by any specific codepoint
+        // or row. Rather than chase every lead pair one CI iteration
+        // at a time, block the whole class. Legitimate bash almost
+        // never contains `{` adjacent to astral characters (emoji in
+        // braces, CJK Ext G/H in script literals), so the false-
+        // positive rate is near-zero.
+        //
+        // The 2-byte lead-pair and 3-byte row tables below are kept
+        // for future use: if a narrower bisect surfaces a lead pair
+        // that is NOT blanket-dangerous and a specific row inside it
+        // IS dangerous, the tables are where that finding goes.
+        let next_byte = bytes[i + 1];
+        if (0xF0..=0xF7).contains(&next_byte) {
+            return Err(ParseError::Malformed);
+        }
+        // Legacy 2-byte lead-pair and 3-byte row checks — both empty
+        // or redundant with the blanket 4-byte-lead check above, but
+        // kept as the structural homes for future narrower entries.
         let lead_pair = &bytes[i + 1..i + 3];
         if crate::tables::PARSER_CRASHER_LEAD_PAIRS
             .iter()
@@ -266,8 +287,6 @@ fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
         {
             return Err(ParseError::Malformed);
         }
-        // 3-byte row check — narrower, for leads where only specific
-        // rows crash (1.3.1/1.3.3/1.3.4/1.3.6 `F0 B1 XX` rows).
         let window = &bytes[i + 1..i + 4];
         if crate::tables::PARSER_CRASHER_PREFIXES
             .iter()
@@ -1072,30 +1091,49 @@ mod tests {
         }
     }
 
+    /// 1.3.8 final widening (class 8): the preflight now denies `{` +
+    /// ANY 4-byte UTF-8 codepoint, so the former "allows other astral
+    /// codepoints" negative control no longer applies. This test
+    /// replaces it by confirming the preflight allows `{` + BMP
+    /// (1, 2, 3-byte UTF-8) codepoints — only the 4-byte lead-byte
+    /// range is dangerous.
     #[test]
-    fn preflight_allows_openbrace_plus_other_astral_codepoints() {
-        // Negative control: astral codepoints OUTSIDE the crashing
-        // blocks must pass through the preflight. The 1.3.8 bisect
-        // (PR #50) widened the preflight to cover the whole `F0 B0`
-        // and `F0 B1` lead pairs — so U+31880 (formerly a gap between
-        // known crasher rows) is now blocked block-wide. We probe
-        // lead pairs OUTSIDE `F0 B0..B1` to confirm the preflight
-        // doesn't over-match.
-        //
-        // Not probing `F0 B2` / `F0 B3` or lead pairs below `F0 B0` —
-        // those are open questions for a future CI bisect. If proptest
-        // finds a new block later, widen the preflight and revise.
+    fn preflight_allows_openbrace_plus_bmp_codepoints() {
         for cp in [
-            '\u{10000}', // F0 90 — plane 1, SMP
-            '\u{1F600}', // F0 9F — emoji
-            '\u{20000}', // F0 A0 — CJK Ext B
-            '\u{2FFFF}', // F0 AF — last plane-2 codepoint below Ext G
+            '\u{41}',   // ASCII `A` (1 byte)
+            '\u{E9}',   // Latin small letter e with acute (2 bytes)
+            '\u{6F22}', // CJK ideograph 漢 (3 bytes)
+            '\u{FFFD}', // BMP replacement character (3 bytes)
         ] {
             let input = format!("{{{cp}");
             assert_eq!(
                 preflight_known_crashers(&input),
                 Ok(()),
                 "preflight over-matched on `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    /// 1.3.8 final widening: `{` + ANY astral (4-byte UTF-8) codepoint
+    /// now denies. Probe across the whole astral range — pre-1.3.8
+    /// passes (e.g. U+10000, U+1F600, U+20000, U+2FFFF) are now
+    /// expected to deny.
+    #[test]
+    fn preflight_denies_openbrace_plus_any_astral() {
+        for cp in [
+            '\u{10000}',  // F0 90 80 80 — plane 1, start
+            '\u{1F600}',  // F0 9F 98 80 — emoji
+            '\u{20000}',  // F0 A0 80 80 — CJK Ext B
+            '\u{2FFFF}',  // F0 AF BF BF — last plane-2 codepoint below Ext G
+            '\u{E0144}',  // F3 A0 85 84 — tag-space (class-8 witness)
+            '\u{10FFFF}', // F4 8F BF BF — last valid Unicode codepoint
+        ] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
                 cp as u32
             );
         }
