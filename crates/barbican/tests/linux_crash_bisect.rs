@@ -355,6 +355,45 @@ fn aaa_classifier_probes() {
             "crash03_prefix_0640",
             include_bytes!("data/probe-crash03_prefix_0640.bin"),
         ),
+        // 1.3.4 dense pass: CI run 25298191581 narrowed the crash
+        // window for linux_crash_03 to [79, 157) bytes (79 parses
+        // clean, 157 SIGSEGVs). 8-byte-grained sweep inside.
+        (
+            "crash03_prefix_0088",
+            include_bytes!("data/probe-crash03_prefix_0088.bin"),
+        ),
+        (
+            "crash03_prefix_0096",
+            include_bytes!("data/probe-crash03_prefix_0096.bin"),
+        ),
+        (
+            "crash03_prefix_0104",
+            include_bytes!("data/probe-crash03_prefix_0104.bin"),
+        ),
+        (
+            "crash03_prefix_0112",
+            include_bytes!("data/probe-crash03_prefix_0112.bin"),
+        ),
+        (
+            "crash03_prefix_0120",
+            include_bytes!("data/probe-crash03_prefix_0120.bin"),
+        ),
+        (
+            "crash03_prefix_0128",
+            include_bytes!("data/probe-crash03_prefix_0128.bin"),
+        ),
+        (
+            "crash03_prefix_0136",
+            include_bytes!("data/probe-crash03_prefix_0136.bin"),
+        ),
+        (
+            "crash03_prefix_0144",
+            include_bytes!("data/probe-crash03_prefix_0144.bin"),
+        ),
+        (
+            "crash03_prefix_0152",
+            include_bytes!("data/probe-crash03_prefix_0152.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
