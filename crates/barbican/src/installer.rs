@@ -117,10 +117,21 @@ pub fn install(opts: &InstallOptions) -> Result<()> {
             opts.binary_source.display(),
             installed_binary.display()
         ));
+        for wrapper_name in WRAPPER_BINARIES {
+            let wrapper_dst = barbican_dir.join(wrapper_name);
+            log(&format!(
+                "would copy wrapper -> {} (if present next to source)",
+                wrapper_dst.display()
+            ));
+        }
     } else {
         fs::create_dir_all(&barbican_dir)
             .with_context(|| format!("create {}", barbican_dir.display()))?;
         copy_binary(&opts.binary_source, &installed_binary)?;
+        // 1.4.0 wrapper binaries — copied alongside the main binary
+        // when present. Release tarballs always include them; a
+        // development `cargo install` may not (we log + skip).
+        copy_wrapper_binaries(&opts.binary_source, &barbican_dir)?;
     }
 
     let settings_path = opts.claude_home.join("settings.json");
@@ -239,6 +250,43 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     write_bytes_atomic_with_mode(&tmp, dst, &bytes, 0o755)
         .with_context(|| format!("install binary to {}", dst.display()))?;
     log(&format!("installed binary to {}", dst.display()));
+    Ok(())
+}
+
+/// 1.4.0 wrapper binaries that ship alongside `barbican`. The installer
+/// copies each one into `~/.claude/barbican/` (next to the main binary)
+/// when the source file is present next to the main binary's source
+/// path. Release tarballs always include them; a development `cargo
+/// install` without `--bin` may not.
+pub(crate) const WRAPPER_BINARIES: &[&str] = &[
+    "barbican-shell",
+    "barbican-python",
+    "barbican-node",
+    "barbican-ruby",
+    "barbican-perl",
+];
+
+/// Copy each wrapper binary that sits next to `main_binary_src` into
+/// `barbican_dir`. Missing wrappers are logged + skipped (not fatal)
+/// so a dev-build install that only built the main binary still
+/// succeeds.
+fn copy_wrapper_binaries(main_binary_src: &Path, barbican_dir: &Path) -> Result<()> {
+    let Some(src_parent) = main_binary_src.parent() else {
+        return Ok(());
+    };
+    for name in WRAPPER_BINARIES {
+        let src = src_parent.join(name);
+        let dst = barbican_dir.join(name);
+        if src.exists() {
+            copy_binary(&src, &dst)?;
+        } else {
+            log(&format!(
+                "wrapper {name} not present at {} — skipping \
+                 (dev build without `cargo build --bins`?)",
+                src.display()
+            ));
+        }
+    }
     Ok(())
 }
 

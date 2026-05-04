@@ -776,3 +776,69 @@ fn install_refuses_to_follow_binary_dst_symlink() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 1.4.0 wrapper binaries — `barbican install` copies each wrapper
+// (barbican-shell/python/node/ruby/perl) that sits next to the main
+// binary into ~/.claude/barbican/. Missing wrappers are skipped.
+// ---------------------------------------------------------------------
+
+const WRAPPER_NAMES: &[&str] = &[
+    "barbican-shell",
+    "barbican-python",
+    "barbican-node",
+    "barbican-ruby",
+    "barbican-perl",
+];
+
+#[test]
+fn install_copies_wrapper_binaries_when_present_next_to_source() {
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    // Drop a fake wrapper binary next to the main binary source — the
+    // installer looks for `<bin-src-parent>/barbican-<lang>`.
+    let src_parent = o.binary_source.parent().unwrap();
+    for name in WRAPPER_NAMES {
+        let p = src_parent.join(name);
+        fs::write(&p, format!("#!/bin/sh\necho {name}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&p, perms).unwrap();
+        }
+    }
+
+    installer::install(&o).expect("install");
+
+    for name in WRAPPER_NAMES {
+        let dst = home.join("barbican").join(name);
+        assert!(dst.is_file(), "wrapper {name} should be copied to {dst:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "wrapper {name} should be 0o755, got {mode:o}");
+        }
+    }
+}
+
+#[test]
+fn install_succeeds_when_wrapper_binaries_are_absent() {
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    // Do NOT create any wrapper files next to the source; the installer
+    // must log + skip each missing wrapper instead of aborting.
+    installer::install(&o).expect("install must still succeed without wrappers");
+
+    let main_bin = home.join("barbican").join("barbican");
+    assert!(main_bin.is_file(), "main binary should still land");
+    for name in WRAPPER_NAMES {
+        let dst = home.join("barbican").join(name);
+        assert!(
+            !dst.exists(),
+            "wrapper {name} must not be fabricated when source is missing"
+        );
+    }
+}
