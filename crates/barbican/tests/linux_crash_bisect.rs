@@ -291,6 +291,192 @@ fn aaa_classifier_probes() {
             "openbrace_plus_C8_latin_egrave",
             include_bytes!("data/probe-openbrace_C8_latin_egrave.bin"),
         ),
+        // --- 1.3.4 lane: prefix-bisect the 3rd crasher directly.
+        // The per-codepoint probes above all returned `exit-2-deny`
+        // in CI run 25284880008, so the crash is context-dependent:
+        // some longer subsequence of `linux_crash_03.bin` triggers
+        // it, not a simple `{` + astral pair. Forked subprocesses
+        // let us sweep a power-of-2 prefix ladder without a single
+        // crash killing the test binary. The smallest prefix that
+        // returns `signal-...` is the localized crash window.
+        (
+            "crash03_prefix_0005",
+            include_bytes!("data/probe-crash03_prefix_0005.bin"),
+        ),
+        (
+            "crash03_prefix_0010",
+            include_bytes!("data/probe-crash03_prefix_0010.bin"),
+        ),
+        (
+            "crash03_prefix_0020",
+            include_bytes!("data/probe-crash03_prefix_0020.bin"),
+        ),
+        (
+            "crash03_prefix_0040",
+            include_bytes!("data/probe-crash03_prefix_0040.bin"),
+        ),
+        (
+            "crash03_prefix_0080",
+            include_bytes!("data/probe-crash03_prefix_0080.bin"),
+        ),
+        (
+            "crash03_prefix_0160",
+            include_bytes!("data/probe-crash03_prefix_0160.bin"),
+        ),
+        (
+            "crash03_prefix_0320",
+            include_bytes!("data/probe-crash03_prefix_0320.bin"),
+        ),
+        (
+            "crash03_prefix_0400",
+            include_bytes!("data/probe-crash03_prefix_0400.bin"),
+        ),
+        (
+            "crash03_prefix_0500",
+            include_bytes!("data/probe-crash03_prefix_0500.bin"),
+        ),
+        (
+            "crash03_prefix_0550",
+            include_bytes!("data/probe-crash03_prefix_0550.bin"),
+        ),
+        (
+            "crash03_prefix_0600",
+            include_bytes!("data/probe-crash03_prefix_0600.bin"),
+        ),
+        (
+            "crash03_prefix_0620",
+            include_bytes!("data/probe-crash03_prefix_0620.bin"),
+        ),
+        (
+            "crash03_prefix_0630",
+            include_bytes!("data/probe-crash03_prefix_0630.bin"),
+        ),
+        (
+            "crash03_prefix_0640",
+            include_bytes!("data/probe-crash03_prefix_0640.bin"),
+        ),
+        // 1.3.4 dense pass: CI run 25298191581 narrowed the crash
+        // window for linux_crash_03 to [79, 157) bytes (79 parses
+        // clean, 157 SIGSEGVs). 8-byte-grained sweep inside.
+        (
+            "crash03_prefix_0088",
+            include_bytes!("data/probe-crash03_prefix_0088.bin"),
+        ),
+        (
+            "crash03_prefix_0096",
+            include_bytes!("data/probe-crash03_prefix_0096.bin"),
+        ),
+        (
+            "crash03_prefix_0104",
+            include_bytes!("data/probe-crash03_prefix_0104.bin"),
+        ),
+        (
+            "crash03_prefix_0112",
+            include_bytes!("data/probe-crash03_prefix_0112.bin"),
+        ),
+        (
+            "crash03_prefix_0120",
+            include_bytes!("data/probe-crash03_prefix_0120.bin"),
+        ),
+        (
+            "crash03_prefix_0128",
+            include_bytes!("data/probe-crash03_prefix_0128.bin"),
+        ),
+        (
+            "crash03_prefix_0136",
+            include_bytes!("data/probe-crash03_prefix_0136.bin"),
+        ),
+        (
+            "crash03_prefix_0144",
+            include_bytes!("data/probe-crash03_prefix_0144.bin"),
+        ),
+        (
+            "crash03_prefix_0152",
+            include_bytes!("data/probe-crash03_prefix_0152.bin"),
+        ),
+        // 1.3.4 narrowed pass: [135, 142) bytes of linux_crash_03
+        // contains the crash trigger. At byte 135 the codepoint
+        // U+31F88 starts (CJK Ext H, prefix `F0 B1 BE`) — a row
+        // NOT covered by the existing `F0 B1 A1` (Ext G) or
+        // `F0 B1 AF` (Ext H sub-row) entries in `CRASHER_PREFIXES`.
+        // Byte 134 is ASCII `5`, byte 133 is ASCII `{`. Probe
+        // isolated variants to confirm which context the crash
+        // needs (direct `{` + codepoint, `{5` + codepoint, or
+        // longer context).
+        (
+            "openbrace_plus_31F88_cjk_ext_h_row3",
+            include_bytes!("data/probe-openbrace_31F88.bin"),
+        ),
+        (
+            "openbrace_5_plus_31F88",
+            include_bytes!("data/probe-openbrace5_31F88.bin"),
+        ),
+        (
+            "solo_31F88_no_prefix",
+            include_bytes!("data/probe-solo_31F88.bin"),
+        ),
+        (
+            "crash03_window_120_142",
+            include_bytes!("data/probe-crash03_window_120_142.bin"),
+        ),
+        (
+            "crash03_window_132_142",
+            include_bytes!("data/probe-crash03_window_132_142.bin"),
+        ),
+        // 1.3.4 late finding: after the Ext H 2nd-row (F0 B1 BE)
+        // preflight landed, CI surfaced a 198-byte crasher that
+        // contains NO `{` characters at all, so the 1.3.1-style
+        // `{` + codepoint pattern doesn't apply. Checked in as
+        // `linux_crash_04.bin`; power-of-2 prefix ladder here so
+        // forked-subprocess CI can narrow the crash window.
+        (
+            "crash04_prefix_0005",
+            include_bytes!("data/probe-crash04_prefix_0005.bin"),
+        ),
+        (
+            "crash04_prefix_0010",
+            include_bytes!("data/probe-crash04_prefix_0010.bin"),
+        ),
+        (
+            "crash04_prefix_0020",
+            include_bytes!("data/probe-crash04_prefix_0020.bin"),
+        ),
+        (
+            "crash04_prefix_0040",
+            include_bytes!("data/probe-crash04_prefix_0040.bin"),
+        ),
+        (
+            "crash04_prefix_0060",
+            include_bytes!("data/probe-crash04_prefix_0060.bin"),
+        ),
+        (
+            "crash04_prefix_0080",
+            include_bytes!("data/probe-crash04_prefix_0080.bin"),
+        ),
+        (
+            "crash04_prefix_0100",
+            include_bytes!("data/probe-crash04_prefix_0100.bin"),
+        ),
+        (
+            "crash04_prefix_0120",
+            include_bytes!("data/probe-crash04_prefix_0120.bin"),
+        ),
+        (
+            "crash04_prefix_0140",
+            include_bytes!("data/probe-crash04_prefix_0140.bin"),
+        ),
+        (
+            "crash04_prefix_0160",
+            include_bytes!("data/probe-crash04_prefix_0160.bin"),
+        ),
+        (
+            "crash04_prefix_0180",
+            include_bytes!("data/probe-crash04_prefix_0180.bin"),
+        ),
+        (
+            "crash04_prefix_0195",
+            include_bytes!("data/probe-crash04_prefix_0195.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
@@ -372,5 +558,19 @@ fn zzz_full_input_captured_crasher_03() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_03.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.4 lane, fourth capture: after the 3-row preflight fix
+/// (1.3.4 Ext H sub-row 2) landed, CI surfaced a 198-byte crasher
+/// that contains NO `{` characters at all. Different crash class
+/// from 1-3; prefix-bisect probes above localize the window.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_04() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_04.bin");
     parse_and_log(bytes);
 }

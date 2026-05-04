@@ -32,22 +32,24 @@ use proptest::prelude::*;
 // Invariant 1 — parser::parse
 // ---------------------------------------------------------------------
 
-// These parser-touching properties are gated off Linux. Root cause:
-// arbitrary-UTF-8 proptest inputs trip SIGSEGVs in the tree-sitter-
-// bash FFI's parser-table state machine. Three classes confirmed so
-// far by per-probe classifier bisect (`tests/linux_crash_bisect.rs`):
+// These parser-touching properties are Linux-gated. tree-sitter-bash
+// on Ubuntu SIGSEGVs on arbitrary UTF-8 proptest input across many
+// distinct crash classes. Known classes, all preflight-denied by
+// `parser::preflight_known_crashers`:
 //
 //   1. `{` + U+31840..U+3187F row (CJK Ext G) — pinned 1.3.1.
-//      Preflight-denied in `parser::preflight_known_crashers`.
 //   2. `{` + U+31BC0..U+31BFF row (CJK Ext H) — pinned 1.3.3.
-//      Preflight-denied in `parser::preflight_known_crashers`.
-//   3. A third class surfaced on CI run 25284655051 after the Ext H
-//      fix landed. Candidates narrow to 3: `{` + U+1E5E2 (Ol Onal),
-//      `{` + U+1CE7 (Vedic Visarga), `{` + U+C8 (Latin È). Probes
-//      for each now live in `tests/linux_crash_bisect.rs` so the
-//      next CI run of `linux fuzz repro` tells us which row(s) own
-//      the crash; the preflight table will widen and these gates
-//      will be removed in 1.3.4.
+//   3. `{` + U+31F80..U+31FBF row (CJK Ext H, different row) —
+//      pinned 1.3.4.
+//
+// UNRESOLVED class (1.3.4): CI run for the 1.3.4 preflight widening
+// captured a 198-byte input (`tests/data/linux_crash_04.bin`) that
+// SIGSEGVs on Linux WITHOUT containing any `{` character. The shape
+// is different from classes 1-3; the per-probe classifier sweep has
+// new candidates pinned but the crash trigger is not yet identified.
+// Gates stay in place until class 4 is bisected and added to
+// `CRASHER_PREFIXES` (or a fork-based signal-catching wrapper
+// replaces the prefix table entirely).
 //
 // Upstream: https://github.com/tree-sitter/tree-sitter-bash/issues/337
 #[cfg(not(target_os = "linux"))]
