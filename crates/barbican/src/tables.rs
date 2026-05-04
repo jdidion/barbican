@@ -237,47 +237,16 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     "ssh",
 };
 
-/// 3-byte UTF-8 prefixes of codepoint ROWS known to crash the
-/// `tree-sitter-bash` FFI on Linux when byte-adjacent to `{`.
-///
-/// This table is now EMPTY — every historical 3-byte `F0 B1 XX`
-/// entry has been subsumed by the 2-byte `F0 B1` lead-pair entry
-/// below. The field is retained for forward compatibility: a future
-/// CI bisect may identify a lead pair where only specific rows
-/// crash (narrower than block-level), at which point 3-byte entries
-/// become useful again.
-pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] = &[];
-
-/// 2-byte UTF-8 prefixes of codepoint BLOCKS known to crash the
-/// `tree-sitter-bash` FFI on Linux when byte-adjacent to `{`. Each
-/// entry covers 2^12 = 4096 codepoints (the full range a 4-byte
-/// UTF-8 lead-pair can encode).
-///
-/// | Block            | Prefix   | Covers                        | CI context      |
-/// |------------------|---------:|-------------------------------|-----------------|
-/// | U+30000..U+30FFF | `F0 B0`  | CJK Ext G lower block         | 1.3.8 PR #50-1  |
-/// | U+31000..U+31FFF | `F0 B1`  | CJK Ext G upper / Ext H start | 1.3.8 PR #50-2  |
-///
-/// ## Evidence
-///
-/// `F0 B0` — PR #50 first CI run bisected 9 codepoints in 5 distinct
-/// rows (U+30000, U+30100, U+301FF, U+30225, U+30240, U+30300); all
-/// SIGSEGV'd under a fresh `classify-probe` subprocess when byte-
-/// adjacent to `{`.
-///
-/// `F0 B1` — Over 1.3.1-1.3.6 we pinned 4 specific rows (U+316C0,
-/// U+31840, U+31BC0, U+31F80); a fifth row (U+314C0) surfaced in
-/// PR #50's second CI run via `linux_crash_07.bin`. With five
-/// non-adjacent rows across the block confirmed crashing and no
-/// row tested where the whack-a-mole ever stopped, the block-level
-/// mitigation is appropriate.
-///
-/// Candidates for future CI investigation: `F0 B2` (U+32000..U+32FFF),
-/// `F0 B3` (U+33000..U+33FFF), and lead pairs below `F0 B0` such as
-/// `F0 9F`, `F0 90`, `F0 91`. The class-7 capture contained `{` +
-/// codepoints in all four of these lower lead pairs, though the
-/// presence-order suggests `F0 B1` was the actual trigger.
-pub const PARSER_CRASHER_LEAD_PAIRS: &[[u8; 2]] = &[[0xF0, 0xB0], [0xF0, 0xB1]];
+// (1.3.1-1.3.8 had two tables here — `PARSER_CRASHER_PREFIXES` for
+// 3-byte row prefixes and `PARSER_CRASHER_LEAD_PAIRS` for 2-byte
+// block prefixes. They grew incrementally as CI bisects surfaced new
+// crash classes. 1.3.8 final widening collapsed both into a single
+// byte-class test in `parser::preflight_known_crashers`: any `{`
+// followed anywhere by a 4-byte UTF-8 lead byte (0xF0..=0xF7). The
+// tables are retired — see `parser::preflight_known_crashers` for
+// the current check and upstream
+// https://github.com/tree-sitter/tree-sitter-bash/issues/337 for
+// the full bisect trail.)
 
 #[cfg(test)]
 mod tests {
@@ -323,39 +292,5 @@ mod tests {
     fn obfuscation_tools_covers_h2() {
         assert!(OBFUSCATION_TOOLS.contains("base64"));
         assert!(OBFUSCATION_TOOLS.contains("xxd"));
-    }
-
-    #[test]
-    fn parser_crasher_prefixes_shape() {
-        // The 3-byte table is currently empty — every historical row
-        // folded into the 2-byte `PARSER_CRASHER_LEAD_PAIRS` list after
-        // the 1.3.8 bisect proved the whole `F0 B0` and `F0 B1` blocks
-        // crash. The field is retained for forward compatibility: a
-        // future CI bisect may identify a lead pair where only
-        // specific rows crash (narrower than block-level), at which
-        // point 3-byte entries become useful again.
-        for prefix in PARSER_CRASHER_PREFIXES {
-            assert_eq!(prefix.len(), 3, "crasher prefixes are 3-byte: {prefix:?}");
-            assert_eq!(
-                prefix[0], 0xF0,
-                "all known crashers start with 4-byte UTF-8 lead byte 0xF0"
-            );
-        }
-    }
-
-    #[test]
-    fn parser_crasher_lead_pairs_are_2_bytes_and_match_known_blocks() {
-        for pair in PARSER_CRASHER_LEAD_PAIRS {
-            assert_eq!(pair.len(), 2, "crasher lead-pair is 2-byte: {pair:?}");
-            assert_eq!(
-                pair[0], 0xF0,
-                "all known crashers start with 4-byte UTF-8 lead byte 0xF0"
-            );
-        }
-        // 1.3.8 bisect (PR #50): both lead pairs confirmed crashing
-        // across multiple distinct rows under a fresh `classify-probe`
-        // subprocess when byte-adjacent to `{`.
-        assert!(PARSER_CRASHER_LEAD_PAIRS.contains(&[0xF0, 0xB0]));
-        assert!(PARSER_CRASHER_LEAD_PAIRS.contains(&[0xF0, 0xB1]));
     }
 }
