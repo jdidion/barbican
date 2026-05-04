@@ -1,0 +1,160 @@
+name: release
+
+# Triggered when a `v*` tag is pushed. Builds release binaries for the
+# platforms Claude Code runs on (macOS arm64/x86_64, Linux x86_64/arm64),
+# computes SHA-256 checksums, and attaches everything to the GitHub
+# release created from the tag.
+#
+# The release page itself is created manually (`gh release create v1.X.Y
+# --title ... --notes ...`) — this workflow just adds binaries to it.
+# Running on tag push (not release-published) lets us build before the
+# release is marked published, so the assets are ready as soon as the
+# release goes live.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Lets maintainers re-run the workflow manually if a tag push upload
+  # fails transiently (GitHub API hiccup, rate limit, etc.) without
+  # re-tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v1.3.6)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's build failure shouldn't block the others — the
+      # release gets whatever assets succeed, and the maintainer can
+      # re-run the workflow for missing platforms.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # Linux aarch64 cross needs the aarch64 linker. The `cross` crate
+      # would also work, but installing gcc-aarch64 is lighter and
+      # avoids the nested-docker complexity.
+      - name: Install aarch64 linker (Linux only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+
+      - name: Release build
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Stage artifact
+        id: stage
+        run: |
+          # Tag resolution: `github.ref_name` on tag push, the input on
+          # workflow_dispatch. Strip the leading `v` for the filename.
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          ARTIFACT="barbican-${VERSION}-${{ matrix.target }}"
+          STAGE_DIR="stage/$ARTIFACT"
+          mkdir -p "$STAGE_DIR"
+
+          BIN="target/${{ matrix.target }}/release/barbican"
+          cp "$BIN" "$STAGE_DIR/barbican"
+          cp README.md LICENSE CHANGELOG.md SECURITY.md "$STAGE_DIR/"
+
+          # Pack as .tar.gz (same convention as rustup-init, fd, ripgrep,
+          # etc.). No .zip — single-binary release, Unix-only users.
+          tar -czf "${ARTIFACT}.tar.gz" -C stage "$ARTIFACT"
+
+          # SHA-256 for the release notes and install-script verification.
+          # `shasum` is portable across macOS + Ubuntu; `sha256sum` is
+          # Linux-only.
+          shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
+
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "tarball=${ARTIFACT}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${ARTIFACT}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.artifact_name }}
+          path: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
+
+  attach-to-release:
+    name: attach assets to release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only runs after all matrix builds finish, and only when a release
+    # already exists for the tag — otherwise `gh release upload` errors.
+    # `if: always()` so a partial matrix still gets its successful
+    # assets uploaded.
+    if: always() && needs.build.result != 'cancelled'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+
+          # Release must already exist (we create releases manually via
+          # `gh release create` from the maintainer's shell). If it
+          # doesn't, surface a clear error instead of trying to create
+          # one here — releases carry hand-written notes that shouldn't
+          # be generated by CI.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG does not exist; run 'gh release create $TAG' first" >&2
+            exit 1
+          fi
+
+          # Flatten: each matrix job uploads a directory with .tar.gz +
+          # .sha256; we want flat files on the release page.
+          mkdir -p flat
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) \
+            -exec cp {} flat/ \;
+          ls -la flat/
+
+          # --clobber so a re-run can overwrite a partial upload.
+          gh release upload "$TAG" flat/* --clobber
