@@ -130,6 +130,31 @@ impl Dialect {
         }
     }
 
+    /// Whether this dialect's interpreter re-parses flag tokens after
+    /// BODY, such that a trailing `-e` / `--eval` / `-m module` could
+    /// sneak a second script past the wrapper's classifier. If true,
+    /// the wrapper inserts a literal `--` between BODY and extra args
+    /// to stop flag parsing.
+    ///
+    /// Verified behavior:
+    /// - `node -e X -e Y` — Y replaces X without `--` (re-parses).
+    /// - `perl -e X -e Y` — aggregates both scripts (re-parses).
+    /// - `ruby -e X -e Y` — runs both (re-parses).
+    /// - `python3 -c X -m Y` — everything after X goes to sys.argv
+    ///   (does NOT re-parse); `--` is still safe, just inert.
+    /// - `bash -c X NAME ARGS…` — positional form, no flag re-parse;
+    ///   `--` would become `$0` and break the positional contract.
+    fn needs_argv_terminator(self) -> bool {
+        match self {
+            // Python's `-c` consumes every following arg as
+            // `sys.argv[1:]` without re-parsing flags; a second `-c`
+            // is NOT honored. Injecting `--` would just pollute
+            // sys.argv with an unexpected token for callers.
+            Self::Shell | Self::Python => false,
+            Self::Node | Self::Ruby | Self::Perl => true,
+        }
+    }
+
     /// Short tag used inside the audit-log `dialect` field.
     fn audit_tag(self) -> &'static str {
         match self {
@@ -182,7 +207,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     // Allow path — spawn the interpreter with pipes and redact output.
     let interpreter = resolve_interpreter(dialect);
-    let exit_code = spawn_with_redaction(&interpreter, dialect.inline_flag(), &body, &extra_args);
+    let exit_code = spawn_with_redaction(dialect, &interpreter, &body, &extra_args);
 
     write_audit_entry(dialect, "allow", None, &body_sha256, Some(exit_code));
     std::process::exit(exit_code);
@@ -242,13 +267,33 @@ fn resolve_interpreter(dialect: Dialect) -> String {
         .unwrap_or_else(|_| dialect.default_interpreter().to_string())
 }
 
-/// Spawn `interpreter flag body [extra_args...]` with piped stdout /
-/// stderr. Every chunk is streamed through [`redact_secrets`] before
+/// Spawn `interpreter flag body [-- extra_args...]` with piped stdout
+/// / stderr. Every chunk is streamed through [`redact_secrets`] before
 /// being forwarded to our own stdout / stderr. Returns the child's
 /// exit code.
-fn spawn_with_redaction(interpreter: &str, flag: &str, body: &str, extra_args: &[String]) -> i32 {
+///
+/// 1.4.0 adversarial review (Claude CRITICAL-2): for non-shell
+/// dialects, insert `--` between BODY and extra_args so a trailing
+/// `-e`, `--eval`, or `-m <module>` cannot sneak a second script past
+/// the classifier. `node -e X -e Y` / `perl -e X -e Y` /
+/// `ruby -e X -e Y` all re-parse flags after BODY; `--` stops that.
+/// Bash's `-c BODY NAME ARGS...` form doesn't honor `--` — the first
+/// arg after BODY becomes `$0` regardless, and bash does NOT re-parse
+/// flags after `-c BODY`, so shell is already safe without the
+/// separator. Python is also safe (its `-c` consumes all following
+/// args as `sys.argv[1:]`), but inserting `--` there is idiomatic and
+/// keeps the invariant consistent.
+fn spawn_with_redaction(
+    dialect: Dialect,
+    interpreter: &str,
+    body: &str,
+    extra_args: &[String],
+) -> i32 {
     let mut cmd = Command::new(interpreter);
-    cmd.arg(flag).arg(body);
+    cmd.arg(dialect.inline_flag()).arg(body);
+    if dialect.needs_argv_terminator() && !extra_args.is_empty() {
+        cmd.arg("--");
+    }
     for a in extra_args {
         cmd.arg(a);
     }

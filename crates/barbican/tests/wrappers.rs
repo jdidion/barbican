@@ -248,6 +248,67 @@ fn python_wrapper_allow_hello_if_python3_available() {
     assert!(out.contains("ok"), "output: {out}");
 }
 
+// ---- flag-smuggling after BODY (CRITICAL-2 from 1.4 crew review) ----
+//
+// Node / Perl / Ruby all re-parse -e / --eval tokens after BODY if no
+// `--` separator is present. The wrapper approves BODY via the static
+// classifier, so a trailing second script would execute with the
+// classifier having never seen it. Pin the `--` separator for each
+// affected dialect.
+
+#[test]
+fn node_wrapper_blocks_second_eval_after_body() {
+    // Without `--`, `node -e 'first' -e 'malicious'` would run
+    // 'malicious'. With `--`, node treats the second `-e` as a
+    // positional and runs 'first' only.
+    let (exit, out, _) = run_wrapper(
+        bin_node(),
+        "-e",
+        "console.log('first')",
+        &["-e", "console.log('malicious')"],
+    );
+    assert_eq!(exit, 0);
+    assert!(out.contains("first"), "first script must run: {out}");
+    assert!(
+        !out.contains("malicious"),
+        "second -e after BODY must not execute: {out}"
+    );
+}
+
+#[test]
+fn perl_wrapper_blocks_second_eval_after_body() {
+    // Perl aggregates multiple -e scripts without `--`; with `--` the
+    // second one becomes ARGV.
+    let (exit, _, err) = run_wrapper(
+        bin_perl(),
+        "-e",
+        r#"print "first\n""#,
+        &["-e", r#"print "malicious\n""#],
+    );
+    // The first script ran successfully — stdout checked via exit 0.
+    assert_eq!(exit, 0, "stderr: {err}");
+    assert!(
+        !err.contains("malicious"),
+        "second -e after BODY must not be interpreted as a script"
+    );
+}
+
+#[test]
+fn ruby_wrapper_blocks_second_eval_after_body() {
+    let (exit, out, _) = run_wrapper(
+        bin_ruby(),
+        "-e",
+        "puts 'first'",
+        &["-e", "puts 'malicious'"],
+    );
+    assert_eq!(exit, 0);
+    assert!(out.contains("first"));
+    assert!(
+        !out.contains("malicious"),
+        "second -e after BODY must not execute: {out}"
+    );
+}
+
 // ---- symlinked-ancestor audit-log TOCTOU regression ----
 //
 // 1.4.0 adversarial review (Claude CRITICAL-1, GPT-5.2 CRITICAL): the
