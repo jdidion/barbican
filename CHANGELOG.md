@@ -2,6 +2,28 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.5] — 2026-05-04
+
+Deferred 1.3.2 nice-to-haves, plus a coverage recovery. No user-visible behavior change.
+
+### Added
+
+- **`tables::PARSER_CRASHER_PREFIXES`** (#44). Centralizes the tree-sitter-bash Linux SIGSEGV crasher prefix list with `NETWORK_TOOLS` / `SHELL_INTERPRETERS` / etc. New direct test `parser_crasher_prefixes_are_3_bytes_and_match_known_rows` so regressions to the table surface at cargo-test time rather than as a Linux CI segfault. 1.3.2 crew-review suggestion S1 from Claude.
+- **`SECURITY.md § Out of scope` bullet on `safe_fetch` Cloudflare DNS fallback** (#44). Documents `ProductionResolver::new`'s fallback behavior when `/etc/resolv.conf` can't be read (hermetic sandboxes, stripped containers): hostname queries leave the sandbox for `1.1.1.1` / `1.0.0.1`. SSRF filtering still applies to the resolved IP, but the fact of DNS egress is an unexpected surface for air-gapped users. Mitigation is network-level, not an env-var switch. 1.3.2 crew-review warning from gpt-5.2.
+- **Linux CI coverage on Invariant 3** (#44). `pre_bash_hook_exit_contract_holds` and `pre_bash_hook_exit_contract_holds_for_valid_json` now run on Ubuntu. Each proptest case spawns a fresh `barbican pre-bash` subprocess, so the in-process state-accumulation crash class that still blocks Invariants 1/2 cannot fire. Closes a coverage gap on the OS where every tree-sitter-bash crasher has been discovered.
+
+### Changed
+
+- **Preflight implementation reads the centralized table.** `parser::preflight_known_crashers` now looks up `tables::PARSER_CRASHER_PREFIXES` instead of an inline const — same 3 rows (Ext G + 2 Ext H sub-rows), same behavior.
+
+### Fuzz campaign
+
+- Nightly-mode `cargo-fuzz` run: 10 minutes × 3 targets (`parse`, `classify`, `validate_url`), ~9.9M total runs on 1.3.4 + 1.3.5 HEAD. Zero crash artifacts.
+
+### Known (unchanged from 1.3.4)
+
+- In-process parser proptest invariants (#1, #2) remain Linux-gated pending class-4 resolution. Progress path: fork-based signal-catching wrapper replacing the prefix table, OR a deterministic bisect of `linux_crash_04.bin`.
+
 ## [1.3.4] — 2026-05-04
 
 Third Linux tree-sitter-bash SIGSEGV class closed via dense prefix-bisect of `linux_crash_03.bin`. A fourth class surfaced after the fix landed; pinned for future work.
