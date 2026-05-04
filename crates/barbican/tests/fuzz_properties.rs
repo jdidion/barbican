@@ -15,16 +15,12 @@
 //! `cargo-fuzz` crate under `crates/barbican/fuzz/`. See
 //! `docs/fuzzing.md` for the full story.
 
-#[cfg(not(target_os = "linux"))]
 use std::io::Write;
-#[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use barbican::__fuzz::path_in_attacker_writable_dir;
-#[cfg(not(target_os = "linux"))]
 use barbican::__fuzz::{classify_command, Decision};
 use barbican::net::validate_url;
-#[cfg(not(target_os = "linux"))]
 use barbican::parser::{parse, ParseError};
 use proptest::prelude::*;
 
@@ -32,25 +28,22 @@ use proptest::prelude::*;
 // Invariant 1 — parser::parse
 // ---------------------------------------------------------------------
 
-// These parser-touching properties are gated off Linux. Root cause:
-// arbitrary-UTF-8 proptest inputs trip SIGSEGVs in the tree-sitter-
-// bash FFI's parser-table state machine. Three classes confirmed so
-// far by per-probe classifier bisect (`tests/linux_crash_bisect.rs`):
+// These parser-touching properties were gated off Linux across
+// 1.3.0–1.3.3 pending root-cause of three tree-sitter-bash FFI
+// SIGSEGV classes that fired on arbitrary UTF-8 proptest input:
 //
 //   1. `{` + U+31840..U+3187F row (CJK Ext G) — pinned 1.3.1.
-//      Preflight-denied in `parser::preflight_known_crashers`.
 //   2. `{` + U+31BC0..U+31BFF row (CJK Ext H) — pinned 1.3.3.
-//      Preflight-denied in `parser::preflight_known_crashers`.
-//   3. A third class surfaced on CI run 25284655051 after the Ext H
-//      fix landed. Candidates narrow to 3: `{` + U+1E5E2 (Ol Onal),
-//      `{` + U+1CE7 (Vedic Visarga), `{` + U+C8 (Latin È). Probes
-//      for each now live in `tests/linux_crash_bisect.rs` so the
-//      next CI run of `linux fuzz repro` tells us which row(s) own
-//      the crash; the preflight table will widen and these gates
-//      will be removed in 1.3.4.
+//   3. `{` + U+31F80..U+31FBF row (CJK Ext H, different row) —
+//      pinned 1.3.4 via dense prefix-bisect of `linux_crash_03.bin`.
+//
+// All three rows are caught by `parser::preflight_known_crashers`
+// before the FFI is touched, so the proptest properties now run on
+// every platform. If a fourth row surfaces, the `aaa_classifier_probes`
+// sweep in `tests/linux_crash_bisect.rs` identifies it and the table
+// in `parser.rs::CRASHER_PREFIXES` grows by one entry.
 //
 // Upstream: https://github.com/tree-sitter/tree-sitter-bash/issues/337
-#[cfg(not(target_os = "linux"))]
 proptest! {
     /// For any UTF-8 string under 2000 chars, `parser::parse` returns
     /// `Ok(Script)` or one of the two documented `ParseError` variants.
@@ -74,7 +67,6 @@ proptest! {
 // Invariant 2 — classify_command
 // ---------------------------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
 proptest! {
     /// For any bash command string under 2000 chars, `classify_command`
     /// returns `Decision::Allow` or `Decision::Deny {...}`. Never
@@ -125,7 +117,6 @@ proptest! {
 /// Run `barbican pre-bash` with `stdin_bytes` on stdin; return the
 /// exit code and how long the call took. A `None` exit code indicates
 /// the process was terminated by signal (we assert that never happens).
-#[cfg(not(target_os = "linux"))]
 fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     let bin = env!("CARGO_BIN_EXE_barbican");
     let start = std::time::Instant::now();
@@ -145,7 +136,6 @@ fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     (status.code(), start.elapsed())
 }
 
-#[cfg(not(target_os = "linux"))]
 proptest! {
     // Shell-out strategies keep the per-test budget narrow so the
     // aggregate `cargo test` runtime stays reasonable. 32 cases per

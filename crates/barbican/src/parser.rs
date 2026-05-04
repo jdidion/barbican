@@ -235,6 +235,7 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// |------------------|-----------:|--------------------------|---------------|
 /// | U+31840..U+3187F | `F0 B1 A1` | CJK Ext G                | 25264060820   |
 /// | U+31BC0..U+31BFF | `F0 B1 AF` | CJK Ext H                | 25284064905   |
+/// | U+31F80..U+31FBF | `F0 B1 BE` | CJK Ext H (different row)| 25299266828   |
 ///
 /// Both rows were bisected via the per-probe classifier sweep in
 /// `tests/linux_crash_bisect.rs::aaa_classifier_probes`. The sweep
@@ -260,6 +261,10 @@ fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
         [0xF0, 0xB1, 0xA1],
         // U+31BC0..U+31BFF — CJK Ext H (1.3.3).
         [0xF0, 0xB1, 0xAF],
+        // U+31F80..U+31FBF — CJK Ext H (1.3.4). Different row within
+        // the same block as 1.3.3; bisect confirmed it's a separate
+        // crash state (CI run 25299266828).
+        [0xF0, 0xB1, 0xBE],
     ];
     let bytes = input.as_bytes();
     if bytes.len() < 5 {
@@ -970,6 +975,30 @@ mod tests {
         // the shared `F0 B1 AF` prefix, not in a single codepoint.
         // Spot-check the row endpoints + the known reproducer.
         for cp in ['\u{31BC0}', '\u{31BC3}', '\u{31BD0}', '\u{31BFF}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_denies_openbrace_plus_u31f88() {
+        // 1.3.4 lane: third Linux tree-sitter-bash SIGSEGV class,
+        // pinned by CI run 25299266828. `{` + U+31F88 is the
+        // 5-byte minimal reproducer (bisected from the 642-byte
+        // `linux_crash_03.bin` capture).
+        let input = "{\u{31F88}";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_u31f80_row() {
+        // Same prefix-row shape: U+31F80..U+31FBF share `F0 B1 BE`.
+        for cp in ['\u{31F80}', '\u{31F88}', '\u{31FA0}', '\u{31FBF}'] {
             let input = format!("{{{cp}");
             assert_eq!(
                 preflight_known_crashers(&input),
