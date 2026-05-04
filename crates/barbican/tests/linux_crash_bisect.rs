@@ -423,6 +423,60 @@ fn aaa_classifier_probes() {
             "crash03_window_132_142",
             include_bytes!("data/probe-crash03_window_132_142.bin"),
         ),
+        // 1.3.4 late finding: after the Ext H 2nd-row (F0 B1 BE)
+        // preflight landed, CI surfaced a 198-byte crasher that
+        // contains NO `{` characters at all, so the 1.3.1-style
+        // `{` + codepoint pattern doesn't apply. Checked in as
+        // `linux_crash_04.bin`; power-of-2 prefix ladder here so
+        // forked-subprocess CI can narrow the crash window.
+        (
+            "crash04_prefix_0005",
+            include_bytes!("data/probe-crash04_prefix_0005.bin"),
+        ),
+        (
+            "crash04_prefix_0010",
+            include_bytes!("data/probe-crash04_prefix_0010.bin"),
+        ),
+        (
+            "crash04_prefix_0020",
+            include_bytes!("data/probe-crash04_prefix_0020.bin"),
+        ),
+        (
+            "crash04_prefix_0040",
+            include_bytes!("data/probe-crash04_prefix_0040.bin"),
+        ),
+        (
+            "crash04_prefix_0060",
+            include_bytes!("data/probe-crash04_prefix_0060.bin"),
+        ),
+        (
+            "crash04_prefix_0080",
+            include_bytes!("data/probe-crash04_prefix_0080.bin"),
+        ),
+        (
+            "crash04_prefix_0100",
+            include_bytes!("data/probe-crash04_prefix_0100.bin"),
+        ),
+        (
+            "crash04_prefix_0120",
+            include_bytes!("data/probe-crash04_prefix_0120.bin"),
+        ),
+        (
+            "crash04_prefix_0140",
+            include_bytes!("data/probe-crash04_prefix_0140.bin"),
+        ),
+        (
+            "crash04_prefix_0160",
+            include_bytes!("data/probe-crash04_prefix_0160.bin"),
+        ),
+        (
+            "crash04_prefix_0180",
+            include_bytes!("data/probe-crash04_prefix_0180.bin"),
+        ),
+        (
+            "crash04_prefix_0195",
+            include_bytes!("data/probe-crash04_prefix_0195.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
@@ -504,5 +558,19 @@ fn zzz_full_input_captured_crasher_03() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_03.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.4 lane, fourth capture: after the 3-row preflight fix
+/// (1.3.4 Ext H sub-row 2) landed, CI surfaced a 198-byte crasher
+/// that contains NO `{` characters at all. Different crash class
+/// from 1-3; prefix-bisect probes above localize the window.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_04() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_04.bin");
     parse_and_log(bytes);
 }
