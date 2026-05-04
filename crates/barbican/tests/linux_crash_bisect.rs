@@ -654,12 +654,8 @@ fn zzz_full_input_captured_crasher_05() {
 /// proptest runner walked 8192 random UTF-8 inputs and found a new
 /// SIGSEGV class. The crashing input contains `{` + U+30225 (CJK
 /// Extension G, row U+30200..U+3023F) — UTF-8 prefix `F0 B0 88`.
-/// This is a distinct range from the 4 existing preflight rows
-/// (all of which have lead byte `0xB1`); `0xB0` is new.
-///
-/// Pending: confirm the minimal `{` + U+30225 reproduces under a
-/// single `classify-probe` subprocess (see `probe-crash06_minimal`
-/// in `aaa_classifier_probes`) before widening the preflight table.
+/// PR #50 CI bisected this to the whole `F0 B0` lead pair
+/// (U+30000..U+30FFF) via 9 probe codepoints across 5 rows.
 #[test]
 #[ignore = "crashes the test process; run explicitly via --ignored"]
 fn zzz_full_input_captured_crasher_06() {
@@ -667,5 +663,21 @@ fn zzz_full_input_captured_crasher_06() {
         return;
     }
     let bytes = include_bytes!("data/linux_crash_06.bin");
+    parse_and_log(bytes);
+}
+
+/// 1.3.8 lane, seventh capture: surfaced by the second CI run on
+/// PR #50 after the `F0 B0` lead-pair widening. The 1629-byte input
+/// contains 5 `{` + astral pairs; the first (char 66) is
+/// `{` + U+314CD (UTF-8 prefix `F0 B1 93`), a row NOT in the 4
+/// previously-pinned `F0 B1 XX` rows. This evidence promoted the
+/// whole `F0 B1` lead pair to the preflight block list.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_07() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_07.bin");
     parse_and_log(bytes);
 }

@@ -240,45 +240,44 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
 /// 3-byte UTF-8 prefixes of codepoint ROWS known to crash the
 /// `tree-sitter-bash` FFI on Linux when byte-adjacent to `{`.
 ///
-/// | Row              | Prefix       | Block                     | CI context    |
-/// |------------------|-------------:|---------------------------|---------------|
-/// | U+316C0..U+316FF | `F0 B1 9B`   | CJK Ext G sub-row 2       | 1.3.6 PR #47  |
-/// | U+31840..U+3187F | `F0 B1 A1`   | CJK Ext G                 | 25264060820   |
-/// | U+31BC0..U+31BFF | `F0 B1 AF`   | CJK Ext H sub-row 1       | 25284064905   |
-/// | U+31F80..U+31FBF | `F0 B1 BE`   | CJK Ext H sub-row 2       | 25299266828   |
-///
-/// See also [`PARSER_CRASHER_LEAD_PAIRS`] for 2-byte prefixes that
-/// cover a whole 4096-codepoint swath — used when a CI bisect
-/// confirms that many rows sharing a 2-byte prefix all crash.
-pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] = &[
-    [0xF0, 0xB1, 0x9B],
-    [0xF0, 0xB1, 0xA1],
-    [0xF0, 0xB1, 0xAF],
-    [0xF0, 0xB1, 0xBE],
-];
+/// This table is now EMPTY — every historical 3-byte `F0 B1 XX`
+/// entry has been subsumed by the 2-byte `F0 B1` lead-pair entry
+/// below. The field is retained for forward compatibility: a future
+/// CI bisect may identify a lead pair where only specific rows
+/// crash (narrower than block-level), at which point 3-byte entries
+/// become useful again.
+pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] = &[];
 
 /// 2-byte UTF-8 prefixes of codepoint BLOCKS known to crash the
 /// `tree-sitter-bash` FFI on Linux when byte-adjacent to `{`. Each
 /// entry covers 2^12 = 4096 codepoints (the full range a 4-byte
 /// UTF-8 lead-pair can encode).
 ///
-/// | Block                | Prefix   | Covers                        | CI context    |
-/// |----------------------|---------:|-------------------------------|---------------|
-/// | U+30000..U+30FFF     | `F0 B0`  | CJK Ext G lower block         | 1.3.8 PR #50  |
+/// | Block            | Prefix   | Covers                        | CI context      |
+/// |------------------|---------:|-------------------------------|-----------------|
+/// | U+30000..U+30FFF | `F0 B0`  | CJK Ext G lower block         | 1.3.8 PR #50-1  |
+/// | U+31000..U+31FFF | `F0 B1`  | CJK Ext G upper / Ext H start | 1.3.8 PR #50-2  |
 ///
-/// The 1.3.8 investigation probed 9 codepoints with lead-pair `F0 B0`
-/// across 5 distinct rows: U+30000, U+30100, U+301FF, U+30240, U+30300
-/// all SIGSEGV'd under a fresh `classify-probe` subprocess when
-/// byte-adjacent to `{`. The 4 `F0 B0 88`-row codepoints were caught
-/// by the pre-existing 3-byte speculative entry; once the scope
-/// widened to the whole `F0 B0` lead pair, the 3-byte `F0 B0 88`
-/// became redundant and was folded into the 2-byte entry.
+/// ## Evidence
 ///
-/// Do NOT add `F0 B1` to this table — the 4 known `F0 B1 XX` rows
-/// crash, but probing other `F0 B1` rows is an open question for a
-/// future bisect run. Widening speculatively would cover 4096
-/// codepoints we haven't confirmed.
-pub const PARSER_CRASHER_LEAD_PAIRS: &[[u8; 2]] = &[[0xF0, 0xB0]];
+/// `F0 B0` — PR #50 first CI run bisected 9 codepoints in 5 distinct
+/// rows (U+30000, U+30100, U+301FF, U+30225, U+30240, U+30300); all
+/// SIGSEGV'd under a fresh `classify-probe` subprocess when byte-
+/// adjacent to `{`.
+///
+/// `F0 B1` — Over 1.3.1-1.3.6 we pinned 4 specific rows (U+316C0,
+/// U+31840, U+31BC0, U+31F80); a fifth row (U+314C0) surfaced in
+/// PR #50's second CI run via `linux_crash_07.bin`. With five
+/// non-adjacent rows across the block confirmed crashing and no
+/// row tested where the whack-a-mole ever stopped, the block-level
+/// mitigation is appropriate.
+///
+/// Candidates for future CI investigation: `F0 B2` (U+32000..U+32FFF),
+/// `F0 B3` (U+33000..U+33FFF), and lead pairs below `F0 B0` such as
+/// `F0 9F`, `F0 90`, `F0 91`. The class-7 capture contained `{` +
+/// codepoints in all four of these lower lead pairs, though the
+/// presence-order suggests `F0 B1` was the actual trigger.
+pub const PARSER_CRASHER_LEAD_PAIRS: &[[u8; 2]] = &[[0xF0, 0xB0], [0xF0, 0xB1]];
 
 #[cfg(test)]
 mod tests {
@@ -327,10 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn parser_crasher_prefixes_are_3_bytes_and_match_known_rows() {
-        // Centralizing the prefix table here means regressions elsewhere
-        // (e.g. an accidental edit to the first bytes) surface as a test
-        // failure rather than as a Linux SIGSEGV caught only by CI.
+    fn parser_crasher_prefixes_shape() {
+        // The 3-byte table is currently empty — every historical row
+        // folded into the 2-byte `PARSER_CRASHER_LEAD_PAIRS` list after
+        // the 1.3.8 bisect proved the whole `F0 B0` and `F0 B1` blocks
+        // crash. The field is retained for forward compatibility: a
+        // future CI bisect may identify a lead pair where only
+        // specific rows crash (narrower than block-level), at which
+        // point 3-byte entries become useful again.
         for prefix in PARSER_CRASHER_PREFIXES {
             assert_eq!(prefix.len(), 3, "crasher prefixes are 3-byte: {prefix:?}");
             assert_eq!(
@@ -338,14 +341,6 @@ mod tests {
                 "all known crashers start with 4-byte UTF-8 lead byte 0xF0"
             );
         }
-        // Known rows by prefix — these are the bisected findings from
-        // 1.3.1 / 1.3.3 / 1.3.4 / 1.3.6. Changing the table without
-        // also updating `parser::preflight_known_crashers` tests would
-        // let a Linux regression slip through.
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0x9B]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xA1]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xAF]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xBE]));
     }
 
     #[test]
@@ -357,9 +352,10 @@ mod tests {
                 "all known crashers start with 4-byte UTF-8 lead byte 0xF0"
             );
         }
-        // 1.3.8 bisect (PR #50): `F0 B0` covers U+30000..U+33FFF.
-        // Probes across 5 distinct rows all SIGSEGV'd under a fresh
-        // `classify-probe` subprocess when byte-adjacent to `{`.
+        // 1.3.8 bisect (PR #50): both lead pairs confirmed crashing
+        // across multiple distinct rows under a fresh `classify-probe`
+        // subprocess when byte-adjacent to `{`.
         assert!(PARSER_CRASHER_LEAD_PAIRS.contains(&[0xF0, 0xB0]));
+        assert!(PARSER_CRASHER_LEAD_PAIRS.contains(&[0xF0, 0xB1]));
     }
 }

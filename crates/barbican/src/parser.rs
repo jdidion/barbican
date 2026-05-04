@@ -1075,14 +1075,22 @@ mod tests {
     #[test]
     fn preflight_allows_openbrace_plus_other_astral_codepoints() {
         // Negative control: astral codepoints OUTSIDE the crashing
-        // rows must pass through the preflight. The forked-
-        // subprocess bisect confirmed these shapes parse cleanly.
-        // U+31880 sits between the Ext G crasher row (ends U+3187F)
-        // and the Ext H crasher row (starts U+31BC0). Not probing
-        // other gap codepoints because the classifier sweep has only
-        // proven safety for what was captured — if proptest finds a
-        // new row later, widen the preflight and update this list.
-        for cp in ['\u{10000}', '\u{1F600}', '\u{20000}', '\u{31880}'] {
+        // blocks must pass through the preflight. The 1.3.8 bisect
+        // (PR #50) widened the preflight to cover the whole `F0 B0`
+        // and `F0 B1` lead pairs — so U+31880 (formerly a gap between
+        // known crasher rows) is now blocked block-wide. We probe
+        // lead pairs OUTSIDE `F0 B0..B1` to confirm the preflight
+        // doesn't over-match.
+        //
+        // Not probing `F0 B2` / `F0 B3` or lead pairs below `F0 B0` —
+        // those are open questions for a future CI bisect. If proptest
+        // finds a new block later, widen the preflight and revise.
+        for cp in [
+            '\u{10000}', // F0 90 — plane 1, SMP
+            '\u{1F600}', // F0 9F — emoji
+            '\u{20000}', // F0 A0 — CJK Ext B
+            '\u{2FFFF}', // F0 AF — last plane-2 codepoint below Ext G
+        ] {
             let input = format!("{{{cp}");
             assert_eq!(
                 preflight_known_crashers(&input),
