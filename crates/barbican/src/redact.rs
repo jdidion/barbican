@@ -96,43 +96,44 @@ impl SecretKind {
 /// anthropic → openai ordering inside the alternation (anthropic's
 /// `sk-ant-` prefix is longer and wins on leftmost-longest). Changing
 /// the order changes tiebreaking, so don't.
+///
 /// The pattern source, factored out so both the string and
 /// byte-oriented regexes can share it.
 fn combined_pattern() -> &'static str {
     concat!(
-            // Anthropic: sk-ant-api03-…, sk-ant-admin01-…, and any
-            // future sk-ant-<kind>NN- suffix shape. The trailing
-            // identifier is URL-safe base64 (A-Z, a-z, 0-9, -, _).
-            r"(?P<anthropic>sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{40,200})",
-            // OpenAI: `sk-proj-…` (project keys), `sk-…` legacy. The
-            // legacy `sk-…` form overlaps in prefix with Anthropic, so
-            // we lead with `sk-proj-` and fall back to `sk-[A-Za-z0-9]+`
-            // with a length floor that excludes `sk-ant-` (which the
-            // anthropic pattern already ate).
-            r"|(?P<openai>sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,200})",
-            // GitHub: ghp_ (classic PAT), github_pat_ (fine-grained),
-            // gho_ (OAuth), ghu_ (user-to-server), ghs_ (server-to-server),
-            // ghr_ (refresh).
-            r"|(?P<github>(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})",
-            // GitLab: glpat- prefix, 20-char alphanumeric.
-            r"|(?P<gitlab>glpat-[A-Za-z0-9_-]{20})",
-            // AWS: AKIA / ASIA followed by 16 uppercase alnums.
-            r"|(?P<aws>(?:AKIA|ASIA)[A-Z0-9]{16})",
-            // Slack: xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + dash-separated
-            // numeric segments + token body. The token body varies in
-            // length; 10+ is defensive (real bot tokens are ~50+).
-            r"|(?P<slack>xox[abprs]-[A-Za-z0-9-]{10,200})",
-            // Atlassian API token: ATATT3x + URL-safe-base64 body +
-            // 8-char CRC32 checksum. Real Atlassian tokens use
-            // LOWERCASE hex for the CRC; the earlier `[A-F0-9]{8}`
-            // anchor missed every live token. Accept both cases.
-            // 1.4.0 crew review (Claude WARNING-1).
-            r"|(?P<atlassian>ATATT3x[A-Za-z0-9_-]{200,400}[A-Fa-f0-9]{8})",
-            // JWT: three Base64URL segments separated by dots, starting
-            // with `eyJ` (which decodes to `{"`, the JSON object lead).
-            // Length floors are very conservative; real JWTs are
-            // 100-2000+ bytes.
-            r"|(?P<jwt>eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
+        // Anthropic: sk-ant-api03-…, sk-ant-admin01-…, and any
+        // future sk-ant-<kind>NN- suffix shape. The trailing
+        // identifier is URL-safe base64 (A-Z, a-z, 0-9, -, _).
+        r"(?P<anthropic>sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{40,200})",
+        // OpenAI: `sk-proj-…` (project keys), `sk-…` legacy. The
+        // legacy `sk-…` form overlaps in prefix with Anthropic, so
+        // we lead with `sk-proj-` and fall back to `sk-[A-Za-z0-9]+`
+        // with a length floor that excludes `sk-ant-` (which the
+        // anthropic pattern already ate).
+        r"|(?P<openai>sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,200})",
+        // GitHub: ghp_ (classic PAT), github_pat_ (fine-grained),
+        // gho_ (OAuth), ghu_ (user-to-server), ghs_ (server-to-server),
+        // ghr_ (refresh).
+        r"|(?P<github>(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})",
+        // GitLab: glpat- prefix, 20-char alphanumeric.
+        r"|(?P<gitlab>glpat-[A-Za-z0-9_-]{20})",
+        // AWS: AKIA / ASIA followed by 16 uppercase alnums.
+        r"|(?P<aws>(?:AKIA|ASIA)[A-Z0-9]{16})",
+        // Slack: xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + dash-separated
+        // numeric segments + token body. The token body varies in
+        // length; 10+ is defensive (real bot tokens are ~50+).
+        r"|(?P<slack>xox[abprs]-[A-Za-z0-9-]{10,200})",
+        // Atlassian API token: ATATT3x + URL-safe-base64 body +
+        // 8-char CRC32 checksum. Real Atlassian tokens use
+        // LOWERCASE hex for the CRC; the earlier `[A-F0-9]{8}`
+        // anchor missed every live token. Accept both cases.
+        // 1.4.0 crew review (Claude WARNING-1).
+        r"|(?P<atlassian>ATATT3x[A-Za-z0-9_-]{200,400}[A-Fa-f0-9]{8})",
+        // JWT: three Base64URL segments separated by dots, starting
+        // with `eyJ` (which decodes to `{"`, the JSON object lead).
+        // Length floors are very conservative; real JWTs are
+        // 100-2000+ bytes.
+        r"|(?P<jwt>eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
     )
 }
 
@@ -146,8 +147,7 @@ fn combined_regex() -> &'static Regex {
 fn combined_bytes_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
     RE.get_or_init(|| {
-        BytesRegex::new(combined_pattern())
-            .expect("redact secret-pattern bytes regex must compile")
+        BytesRegex::new(combined_pattern()).expect("redact secret-pattern bytes regex must compile")
     })
 }
 

@@ -384,7 +384,8 @@ fn shell_passes_non_utf8_bytes_through_without_corruption() {
     assert_eq!(out.status.code(), Some(0));
     let _ = out.status.signal();
     assert_eq!(
-        out.stdout, vec![0xFF],
+        out.stdout,
+        vec![0xFF],
         "wrapper must forward 0xFF as-is, not corrupt to U+FFFD (3-byte EF BF BD); \
          got: {:?}",
         out.stdout
