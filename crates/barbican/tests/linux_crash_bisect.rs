@@ -394,6 +394,35 @@ fn aaa_classifier_probes() {
             "crash03_prefix_0152",
             include_bytes!("data/probe-crash03_prefix_0152.bin"),
         ),
+        // 1.3.4 narrowed pass: [135, 142) bytes of linux_crash_03
+        // contains the crash trigger. At byte 135 the codepoint
+        // U+31F88 starts (CJK Ext H, prefix `F0 B1 BE`) — a row
+        // NOT covered by the existing `F0 B1 A1` (Ext G) or
+        // `F0 B1 AF` (Ext H sub-row) entries in `CRASHER_PREFIXES`.
+        // Byte 134 is ASCII `5`, byte 133 is ASCII `{`. Probe
+        // isolated variants to confirm which context the crash
+        // needs (direct `{` + codepoint, `{5` + codepoint, or
+        // longer context).
+        (
+            "openbrace_plus_31F88_cjk_ext_h_row3",
+            include_bytes!("data/probe-openbrace_31F88.bin"),
+        ),
+        (
+            "openbrace_5_plus_31F88",
+            include_bytes!("data/probe-openbrace5_31F88.bin"),
+        ),
+        (
+            "solo_31F88_no_prefix",
+            include_bytes!("data/probe-solo_31F88.bin"),
+        ),
+        (
+            "crash03_window_120_142",
+            include_bytes!("data/probe-crash03_window_120_142.bin"),
+        ),
+        (
+            "crash03_window_132_142",
+            include_bytes!("data/probe-crash03_window_132_142.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
