@@ -574,3 +574,17 @@ fn zzz_full_input_captured_crasher_04() {
     let bytes = include_bytes!("data/linux_crash_04.bin");
     parse_and_log(bytes);
 }
+
+/// 1.3.6 lane, fifth capture: surfaced by proptest-shrunk JSON
+/// envelope on PR #47 CI. Contains `{` + U+316FF (CJK Ext G sub-row 2,
+/// prefix `F0 B1 9B`). Preflight table widened in the same PR;
+/// this file is pinned so regressions surface.
+#[test]
+#[ignore = "crashes the test process; run explicitly via --ignored"]
+fn zzz_full_input_captured_crasher_05() {
+    if !enabled() {
+        return;
+    }
+    let bytes = include_bytes!("data/linux_crash_05.bin");
+    parse_and_log(bytes);
+}

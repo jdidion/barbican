@@ -61,9 +61,22 @@ See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the 
 
 ## Install
 
-Once a release is cut:
+Download the binary for your platform from the [latest release](https://github.com/jdidion/barbican/releases/latest), verify the checksum, then run `./barbican install`:
 
 ```sh
+# Example: macOS arm64. Substitute the tarball name for your target.
+TAG=v1.3.6
+TARGET=aarch64-apple-darwin   # or: x86_64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
+TARBALL="barbican-${TAG#v}-${TARGET}.tar.gz"
+
+curl -LO "https://github.com/jdidion/barbican/releases/download/${TAG}/${TARBALL}"
+curl -LO "https://github.com/jdidion/barbican/releases/download/${TAG}/${TARBALL}.sha256"
+
+# Verify — if this fails, stop. The tarball is not what the maintainer tagged.
+shasum -a 256 -c "${TARBALL}.sha256"
+
+tar -xzf "${TARBALL}"
+cd "barbican-${TAG#v}-${TARGET}"
 ./barbican install           # backs up ~/.claude/settings.json and wires hooks
 ./barbican install --dry-run # preview, no filesystem changes
 ```

@@ -970,6 +970,31 @@ mod tests {
     }
 
     #[test]
+    fn preflight_denies_openbrace_plus_u316ff() {
+        // 1.3.6 lane: fifth Linux tree-sitter-bash SIGSEGV class,
+        // surfaced by `pre_bash_hook_exit_contract_holds_for_valid_json`
+        // on PR #47 CI. `{` + U+316FF (CJK Ext G sub-row 2) is the
+        // 5-byte minimal reproducer (extracted from the proptest
+        // shrink output; full capture in `tests/data/linux_crash_05.bin`).
+        let input = "{\u{316FF}";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_u316c0_row() {
+        // Row U+316C0..U+316FF shares prefix `F0 B1 9B`.
+        for cp in ['\u{316C0}', '\u{316E0}', '\u{316FF}'] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    #[test]
     fn preflight_denies_openbrace_plus_u31f88() {
         // 1.3.4 lane: third Linux tree-sitter-bash SIGSEGV class,
         // pinned by CI run 25299266828. `{` + U+31F88 is the
