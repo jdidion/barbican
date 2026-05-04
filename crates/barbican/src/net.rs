@@ -140,6 +140,27 @@ pub fn is_blocked_ip(ip: IpAddr) -> Option<&'static str> {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_blocked_v4(v4);
             }
+            // IPv4-compatible IPv6 (RFC4291 § 2.5.5.1) — the deprecated
+            // `::a.b.c.d` form where the first 96 bits are zero. Distinct
+            // from the mapped form above. `to_ipv4_mapped()` explicitly
+            // does NOT match this shape. We handle `::` and `::1` first
+            // in `is_blocked_v6` so their labels stay v6-flavored; the
+            // compatible form only fires for non-trivial embedded v4
+            // addresses, so the segment guards here must accept the v6
+            // unspecified/loopback cases falling through to `is_blocked_v6`.
+            // 1.3.7 adversarial review (gpt-5.2 CRITICAL).
+            let seg = v6.segments();
+            let first_96_bits_zero = seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0;
+            if first_96_bits_zero && !v6.is_unspecified() && !v6.is_loopback() {
+                if let Some(v4) = v6.to_ipv4() {
+                    return is_blocked_v4(v4);
+                }
+            }
             is_blocked_v6(v6)
         }
     }
@@ -147,8 +168,14 @@ pub fn is_blocked_ip(ip: IpAddr) -> Option<&'static str> {
 
 fn is_blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
     let octets = v4.octets();
-    if v4.is_unspecified() {
-        return Some("unspecified (0.0.0.0/8)");
+    // Unspecified / "this network" per RFC1122 — the whole 0.0.0.0/8
+    // block. `Ipv4Addr::is_unspecified()` only matches the single
+    // address 0.0.0.0; historically Linux treated every address in
+    // the /8 as loopback, and some legacy stacks still do. Block
+    // the whole range to match the doc table. 1.3.7 adversarial
+    // review (gpt-5.2 CRITICAL).
+    if octets[0] == 0 {
+        return Some("unspecified / this-network (0.0.0.0/8)");
     }
     if v4.is_loopback() {
         return Some("loopback (127.0.0.0/8)");
@@ -327,6 +354,26 @@ mod tests {
         assert!(block("0.0.0.0").is_some());
     }
 
+    /// The doc-table entry for "Unspecified" is `0.0.0.0/8`, not just
+    /// `0.0.0.0`. Historically, Linux kernels treated connects to the
+    /// whole `0.0.0.0/8` block as loopback (the behavior was narrowed
+    /// over time but not uniformly across distros / older kernels).
+    /// `Ipv4Addr::is_unspecified()` only matches the single address
+    /// `0.0.0.0`, so anything else in the `/8` silently slipped the
+    /// filter. 1.3.7 adversarial review (`gpt-5.2` CRITICAL).
+    #[test]
+    fn blocks_entire_zero_slash_8() {
+        assert!(
+            block("0.0.0.1").is_some(),
+            "0.0.0.1 in 0.0.0.0/8 must block"
+        );
+        assert!(
+            block("0.255.255.255").is_some(),
+            "top of 0.0.0.0/8 must block"
+        );
+        assert!(block("1.0.0.0").is_none(), "just above 0.0.0.0/8 is public");
+    }
+
     #[test]
     fn blocks_broadcast_v4() {
         assert!(block("255.255.255.255").is_some());
@@ -387,6 +434,37 @@ mod tests {
             reason.contains("loopback"),
             "should report loopback not v6; got: {reason}"
         );
+    }
+
+    /// IPv4-compatible IPv6 (RFC4291 § 2.5.5.1) — the deprecated
+    /// `::a.b.c.d` form where the first 96 bits are zero and the last
+    /// 32 bits embed an IPv4. Distinct from the *-mapped* form
+    /// (`::ffff:a.b.c.d`, first 80 zero + 16 all-ones + v4). Most
+    /// stacks won't route compatible addresses today, but some
+    /// libraries / older kernels accept them. The std helper
+    /// `to_ipv4_mapped()` explicitly does NOT cover this form —
+    /// `Ipv6Addr::to_ipv4()` does. 1.3.7 adversarial review
+    /// (`gpt-5.2` CRITICAL).
+    #[test]
+    fn blocks_ipv4_compatible_v6_loopback() {
+        // `::7f00:1` == `::127.0.0.1`
+        let reason = block("::7f00:1").expect("v4-compatible loopback must block");
+        assert!(
+            reason.contains("loopback") || reason.contains("IPv4-compatible"),
+            "should unwrap+report loopback; got: {reason}"
+        );
+    }
+
+    #[test]
+    fn blocks_ipv4_compatible_v6_imds() {
+        // `::a9fe:a9fe` == `::169.254.169.254` (AWS IMDS).
+        assert!(block("::a9fe:a9fe").is_some());
+    }
+
+    #[test]
+    fn blocks_ipv4_compatible_v6_rfc1918() {
+        // `::a00:1` == `::10.0.0.1`.
+        assert!(block("::a00:1").is_some());
     }
 
     #[test]
@@ -554,6 +632,31 @@ mod tests {
         assert!(
             matches!(err, RejectReason::BlockedIp(_)),
             "loopback must stay blocked even with flag=true; got {err:?}"
+        );
+    }
+
+    /// 1.3.7 adversarial review (gemini-3.1-pro WARNING #2): link-local
+    /// IPv6 literals with zone IDs (`%eth0` / `%25eth0`). The `url`
+    /// crate rejects zone IDs at the parse layer for `http`/`https`
+    /// schemes — `[fe80::1]` parses cleanly and routes into
+    /// `is_blocked_ip` as fe80::/10, but `[fe80::1%eth0]` and
+    /// `[fe80::1%25eth0]` fail parse with `InvalidIpv6Address`,
+    /// landing in the deny-by-default branch. Pin the guarantee.
+    #[test]
+    fn validate_url_rejects_ipv6_zone_id() {
+        for s in ["http://[fe80::1%eth0]/", "http://[fe80::1%25eth0]/"] {
+            let res = validate_url_with(s, true);
+            assert!(
+                res.is_err(),
+                "IPv6 zone-id literal must not parse through: {s} => {res:?}"
+            );
+        }
+        // Sanity: plain `[fe80::1]` (no zone id) parses and is blocked
+        // as link-local — no change from prior behavior.
+        let err = validate_url_with("http://[fe80::1]/", true).unwrap_err();
+        assert!(
+            matches!(err, RejectReason::BlockedIp(_)),
+            "plain fe80::1 must be BlockedIp; got {err:?}"
         );
     }
 }
