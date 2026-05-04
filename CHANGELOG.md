@@ -2,6 +2,36 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.7] — 2026-05-04
+
+Final cross-provider adversarial audit (Claude opus + GPT-5.2 + Gemini-3.1-pro + Grok-4.20-thinking). Closes two live SSRF gaps, one audit-log TOCTOU, and hardens the release pipeline end-to-end.
+
+### Fixed
+
+- **SSRF: IPv4-compatible IPv6 (`::a.b.c.d`) bypass**. `is_blocked_ip` only unwrapped *mapped* IPv6 (`::ffff:a.b.c.d`) via `to_ipv4_mapped()`, not the deprecated *compatible* form (RFC4291 § 2.5.5.1). `::7f00:1` → loopback, `::a9fe:a9fe` → IMDS, `::a00:1` → RFC1918 all passed through. Fixed by adding a post-mapped-check that detects first-96-bits-zero + non-trivial IPv4 tail and recurses into `is_blocked_v4`. Red tests: `blocks_ipv4_compatible_v6_{loopback, imds, rfc1918}`. Source: gpt-5.2 CRITICAL.
+- **SSRF: `0.0.0.0/8` (this-network) was only partially blocked**. The `net.rs` doc table claimed `0.0.0.0/8` blocked, but `Ipv4Addr::is_unspecified()` matches only `0.0.0.0`. `0.0.0.1` through `0.255.255.255` slipped through. Historically Linux routes the whole `/8` to loopback; some legacy stacks still do. Fixed by matching on `octets[0] == 0`. Red test: `blocks_entire_zero_slash_8`. Source: gpt-5.2 CRITICAL.
+- **Audit-log TOCTOU via symlinked `$HOME` ancestor**. `std::fs::create_dir_all(parent)` transparently follows symlinks in any already-existing ancestor. An attacker with write access to `$HOME` could pre-plant `~/.claude` as a symlink to an arbitrary directory; the prior leaf-only `symlink_metadata(parent)` check ran *after* `create_dir_all` materialized the attacker's target, so it saw a real directory. Added `ancestor_chain_has_symlink` walking every existing ancestor under `$HOME` (same discipline as `mcp::safe_read::path_contains_symlink`) and rejecting the write before `create_dir_all` runs. Red test: `ancestor_chain_has_symlink_catches_planted_ancestor`. Source: gemini-3.1-pro CRITICAL.
+- **`safe_fetch` echoes back userinfo / fragment to the model**. `FetchOutcome.final_url` rendered `resp.url().to_string()` verbatim, which embedded username, password, and fragment into the `<untrusted-content source="...">` wrapper the model consumes. `https://user:pass@host/p#tok=abc` → the model saw `user`, `pass`, and `tok=abc`. Added `redact_url_credentials` helper that strips userinfo and fragment while preserving query params. Red tests: `redact_url_credentials_{strips_userinfo_and_fragment, no_op_on_plain_url}`. Source: gpt-5.2 SUGGESTION (upgraded to WARNING severity on verification).
+
+### Added
+
+- **Release binaries are now signed via Sigstore build-provenance attestations** (`.github/workflows/release.yml`). Keyless via GitHub OIDC — no external key material. Verification: `gh attestation verify <tarball> --repo jdidion/barbican`. README install section now advertises attestation verification as the authenticity gate; `sha256` demoted to integrity-only. An attacker who compromises the release can no longer swap tarball + `.sha256` together. Source: Claude WARNING #1 + grok-4-20-thinking SUGGESTION 1.
+- **`hooks::MAX_STDIN_BYTES` shared constant (8 MiB).** `pre_bash`, `post_edit`, and `post_mcp` previously read stdin unbounded, letting a prompt-injected `tool_input.command` force arbitrary RSS. Now all four hooks (audit already had it) route through `take(MAX_STDIN_BYTES)`. Over-cap payloads truncate silently and land in the existing deny-by-default / early-return branches. Source: Claude WARNING #7, #8.
+- **Hardened IPv6 zone-ID test** (`validate_url_rejects_ipv6_zone_id`). Pins the existing `url` crate behavior that rejects `[fe80::1%eth0]` / `[fe80::1%25eth0]` at parse time, so a future `url` upgrade that accepts zone IDs surfaces as a failing test. Source: gemini-3.1-pro WARNING #2.
+
+### Changed
+
+- **Release workflow supply chain**: every `uses:` SHA-pinned with tagged-version comment. Runners pinned to `macos-14` / `ubuntu-24.04` (no more `*-latest`). `build` job permissions narrowed to `contents: read`; release-write permissions remain only on `attach-to-release`, which additionally gains `id-token: write` + `attestations: write` for signing. `actions/checkout` gets `persist-credentials: false`. `workflow_dispatch` now rejects dispatched tags that aren't an ancestor of `origin/main` (blocks attacker-branch tag-push + dispatch path). Applied the same SHA-pinning to `ci.yml` and `fuzz.yml`. Source: Claude WARNING #1, #2, #3 + gemini-3.1-pro WARNING #2.
+- **README install flow** shows `gh attestation verify` as the authenticity gate, with explicit note that `sha256`-only verification is *not* a substitute. Status line synced: README said "1.3.1" through all of 1.3.2-1.3.6 (doc-drift regression caught by Claude WARNING #4).
+
+### Documented
+
+- **`SECURITY.md § Out of scope`** expanded under *Untrusted-launch environment*: HOME-empty / HOME-unset contexts (minimal cron, `systemd-run`, non-interactive sudo) degrade `safe_read`'s home-relative deny prefixes and disable the ancestor-symlink anti-laundering walk. Run with HOME set. Source: Claude WARNING #5.
+
+### Removed
+
+- Ad-hoc scratch files `test_ip.rs` / `test_ansi.rs` in the repo root (grok-4-20-thinking SUGGESTION 2). They were confirming `is_unspecified()` / command-name-quoting behavior that is now covered by proper unit tests in `net.rs` / `cmd.rs`.
+
 ## [1.3.6] — 2026-05-04
 
 Fourth and fifth tree-sitter-bash Linux crash classes closed + release binaries finally ship.
