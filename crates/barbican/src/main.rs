@@ -55,6 +55,13 @@ enum Command {
         #[arg(long)]
         home: Option<std::path::PathBuf>,
     },
+    /// Test-harness: read stdin as UTF-8 bash, run `classify_command`,
+    /// exit 0 on Allow, 2 on Deny, non-zero on any panic / signal. Used
+    /// by the 1.3.6 proptest invariants so each case runs in a fresh
+    /// subprocess and doesn't accumulate tree-sitter-bash FFI state on
+    /// Linux. Hidden from `--help`; not part of the stable CLI.
+    #[command(hide = true)]
+    ClassifyProbe,
 }
 
 fn main() -> Result<()> {
@@ -89,6 +96,29 @@ fn main() -> Result<()> {
                 keep_files,
             })
         }
+        Command::ClassifyProbe => classify_probe(),
+    }
+}
+
+/// Test-harness: read stdin as UTF-8 bash, run `classify_command`,
+/// exit 0 on Allow, 2 on Deny. Non-UTF-8 stdin → 2. Any panic or
+/// signal is a test failure surfaced by the parent proptest runner.
+/// Never reads env, never writes to the filesystem, never touches
+/// stderr — keeps the interface clean for the proptest wrapper.
+fn classify_probe() -> Result<()> {
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(4096);
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
+    let s = match std::str::from_utf8(&buf) {
+        Ok(s) => s,
+        // Non-UTF-8 input is a deny per CLAUDE.md rule #1.
+        Err(_) => std::process::exit(2),
+    };
+    match barbican::__fuzz::classify_command(s) {
+        barbican::__fuzz::Decision::Allow => std::process::exit(0),
+        barbican::__fuzz::Decision::Deny { .. } => std::process::exit(2),
     }
 }
 
