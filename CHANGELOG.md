@@ -2,6 +2,23 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.4] — 2026-05-04
+
+Third Linux tree-sitter-bash SIGSEGV class closed via dense prefix-bisect of `linux_crash_03.bin`. A fourth class surfaced after the fix landed; pinned for future work.
+
+### Fixed
+
+- **`{` + U+31F80..U+31FBF (CJK Extension H, different row from 1.3.3) tree-sitter-bash SIGSEGV on Linux** (#42). Bisected via forked-subprocess prefix sweep: the 642-byte `linux_crash_03.bin` capture narrowed to the [135, 142) byte window, which is exactly U+31F88 (`F0 B1 BE 88`) at byte 135. Isolated probe `{` + U+31F88 returned SIGSEGV at 5 bytes, confirming the 1.3.1-style adjacency-required shape. `parser::preflight_known_crashers`'s `CRASHER_PREFIXES` table grew from 2 to 3 rows: `F0 B1 A1` (Ext G, 1.3.1), `F0 B1 AF` (Ext H sub-row 1, 1.3.3), `F0 B1 BE` (Ext H sub-row 2, 1.3.4).
+
+### Added
+
+- **Pinning for the 3rd class**: `preflight_denies_openbrace_plus_u31f88`, `preflight_denies_entire_u31f80_row`, negative control kept intentional about not asserting untested codepoints.
+- **Fourth captured crasher pinned for future bisect** (#42): `tests/data/linux_crash_04.bin` (198 bytes) surfaced during this lane's CI AFTER the U+31F80 preflight landed. Contains NO `{` character — different shape from classes 1-3. All 12 forked-subprocess prefix probes of this capture returned `exit-2-deny` cleanly, suggesting the crash needs proptest-state accumulation across many inputs rather than a single deterministic trigger. Prefix ladder + `zzz_full_input_captured_crasher_04` checked in for 1.3.5+ investigation.
+
+### Known
+
+- Proptest properties in `tests/fuzz_properties.rs` remain Linux-gated. The three known classes are all preflight-denied (verified on Ubuntu CI), but the 4th class would re-surface SIGSEGVs if gates were removed. Gate-removal deferred to 1.3.5 once class 4 is bisected or a fork-based signal-catching wrapper replaces the prefix table.
+
 ## [1.3.3] — 2026-05-03
 
 Second tree-sitter-bash Linux crash class closed. A third class surfaced during the same lane and is pinned for future bisect.
