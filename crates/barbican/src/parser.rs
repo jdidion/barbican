@@ -255,6 +255,19 @@ fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
         if bytes[i] != b'{' {
             continue;
         }
+        // 2-byte lead-pair check first — coarser, covers whole blocks
+        // (2^12 codepoints each). The 1.3.8 bisect proved `F0 B0`
+        // crashes across multiple rows, so checking the 3-byte table
+        // for entries under the same lead pair would be redundant.
+        let lead_pair = &bytes[i + 1..i + 3];
+        if crate::tables::PARSER_CRASHER_LEAD_PAIRS
+            .iter()
+            .any(|p| lead_pair == p.as_slice())
+        {
+            return Err(ParseError::Malformed);
+        }
+        // 3-byte row check — narrower, for leads where only specific
+        // rows crash (1.3.1/1.3.3/1.3.4/1.3.6 `F0 B1 XX` rows).
         let window = &bytes[i + 1..i + 4];
         if crate::tables::PARSER_CRASHER_PREFIXES
             .iter()
@@ -1025,17 +1038,30 @@ mod tests {
         // CI (1.3.7 audit-fix PR, 8192-case proptest sweep). `{` +
         // U+30225 (CJK Ext G row U+30200..U+3023F) is the 5-byte
         // minimal reproducer extracted from the 995-byte proptest
-        // input (see `tests/data/linux_crash_06.bin`). This is the
-        // first preflight entry with lead byte `0xB0` — all previous
-        // classes shared `0xB1`.
+        // input (see `tests/data/linux_crash_06.bin`). The PR #50
+        // bisect confirmed the whole `F0 B0` lead pair crashes,
+        // widening the mitigation to a 2-byte block-level deny.
         let input = "{\u{30225}";
         assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
     }
 
     #[test]
-    fn preflight_denies_entire_u30200_row() {
-        // Row U+30200..U+3023F shares prefix `F0 B0 88`.
-        for cp in ['\u{30200}', '\u{30225}', '\u{3023F}'] {
+    fn preflight_denies_entire_f0_b0_block() {
+        // 1.3.8 PR #50 bisect: the whole `F0 B0` lead pair crashes
+        // (U+30000..U+33FFF, the lower swath of CJK Ext G/H). Probe
+        // codepoints drawn from rows spanning the block boundary, not
+        // all in one row.
+        for cp in [
+            '\u{30000}', // Ext G start
+            '\u{30100}', // row above crash06
+            '\u{301FF}', // just below crash06 row
+            '\u{30200}', // crash06 row start
+            '\u{30225}', // crash06 minimal
+            '\u{3023F}', // crash06 row end
+            '\u{30240}', // just above crash06 row
+            '\u{30300}', // row well above
+            '\u{30FFF}', // `F0 B0` lead-pair end
+        ] {
             let input = format!("{{{cp}");
             assert_eq!(
                 preflight_known_crashers(&input),
