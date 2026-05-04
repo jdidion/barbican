@@ -16,7 +16,7 @@ A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a 
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
-Status: **1.3.1**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure has already caught and 1.3.1 fixed real-world bugs. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
+Status: **1.3.7**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure plus the 1.3.1–1.3.6 Linux tree-sitter-bash preflight lane have already caught and fixed real-world bugs, and 1.3.7 closes two more SSRF gaps from a final cross-provider audit. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
 
 ## Is Barbican right for you?
 
@@ -61,25 +61,33 @@ See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the 
 
 ## Install
 
-Download the binary for your platform from the [latest release](https://github.com/jdidion/barbican/releases/latest), verify the checksum, then run `./barbican install`:
+Download the binary for your platform from the [latest release](https://github.com/jdidion/barbican/releases/latest), verify both the checksum and the build-provenance attestation, then run `./barbican install`:
 
 ```sh
 # Example: macOS arm64. Substitute the tarball name for your target.
-TAG=v1.3.6
+TAG=v1.3.7
 TARGET=aarch64-apple-darwin   # or: x86_64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
 TARBALL="barbican-${TAG#v}-${TARGET}.tar.gz"
 
 curl -LO "https://github.com/jdidion/barbican/releases/download/${TAG}/${TARBALL}"
 curl -LO "https://github.com/jdidion/barbican/releases/download/${TAG}/${TARBALL}.sha256"
 
-# Verify — if this fails, stop. The tarball is not what the maintainer tagged.
+# Integrity: the sha256 only proves the tarball wasn't corrupted in transit.
 shasum -a 256 -c "${TARBALL}.sha256"
+
+# Authenticity: Sigstore-backed build-provenance attestation, generated
+# keylessly via GitHub OIDC by the `release.yml` workflow. Confirms the
+# tarball was built by THIS workflow on a commit that lives on THIS repo.
+# Requires `gh` >= 2.49 (every modern install has it).
+gh attestation verify "${TARBALL}" --repo jdidion/barbican
 
 tar -xzf "${TARBALL}"
 cd "barbican-${TAG#v}-${TARGET}"
 ./barbican install           # backs up ~/.claude/settings.json and wires hooks
 ./barbican install --dry-run # preview, no filesystem changes
 ```
+
+If `gh attestation verify` fails, **do not run the binary** — the tarball is either corrupted, from a different build, or malicious. `sha256`-only verification is *not* a substitute: an attacker who compromises the release can swap both the tarball and its `.sha256` in one upload.
 
 To remove:
 
