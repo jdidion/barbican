@@ -43,7 +43,7 @@ jobs:
       matrix:
         target: [parse, classify, validate_url]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install nightly toolchain
         run: |
@@ -65,7 +65,7 @@ jobs:
       # crates/barbican/fuzz/corpus/<target>/ — they'll still be
       # there after the checkout; the download merges on top.
       - name: Warm corpus from prior run (best-effort)
-        uses: dawidd6/action-download-artifact@v6
+        uses: dawidd6/action-download-artifact@20319c5641d495c8a52e688b7dc5fada6c3a9fbc # v8
         continue-on-error: true
         with:
           workflow: fuzz.yml
@@ -97,7 +97,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: crates/barbican/fuzz/artifacts/${{ matrix.target }}/
@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload warmed corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: crates/barbican/fuzz/corpus/${{ matrix.target }}/
