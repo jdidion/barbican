@@ -83,6 +83,18 @@ impl SecretKind {
 ///   matching on pathological inputs; real keys have tight length
 ///   ranges but documented upper bounds aren't always published, so
 ///   each pattern caps at a generous but finite length.
+///
+/// Word-boundary / overlap notes (1.4.0 crew review, Claude WARNING-5):
+///
+/// The patterns below are prefix-anchored but NOT word-boundary-
+/// anchored. A run like `"notasecretbutlongsk-<32-chars>"` that
+/// happens to contain `sk-…` in the middle will match. This is
+/// **deliberate**: for a secret redactor, over-redaction is strictly
+/// safer than under-redaction — an over-redacted benign blob is
+/// annoying; an under-redacted secret is a breach. We also keep the
+/// anthropic → openai ordering inside the alternation (anthropic's
+/// `sk-ant-` prefix is longer and wins on leftmost-longest). Changing
+/// the order changes tiebreaking, so don't.
 fn combined_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

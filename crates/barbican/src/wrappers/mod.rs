@@ -305,9 +305,45 @@ fn synthesize_classifier_input(dialect: Dialect, body: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{interp} {flag} '{escaped}'"))
 }
 
+/// Resolve which interpreter binary the wrapper will exec.
+///
+/// Policy:
+/// - If the per-dialect env var (e.g. `BARBICAN_SHELL`) is set, it
+///   MUST be an absolute path. A bare basename (`BARBICAN_SHELL=bash`)
+///   would go through `$PATH` lookup, which the caller controls —
+///   `PATH=/tmp/evil:/usr/bin` then `barbican-shell …` would exec
+///   the attacker's planted `/tmp/evil/bash`. The env var is a power
+///   tool for sysadmins pointing at a specific interpreter; users
+///   who just want "whatever bash is on PATH" should leave it unset.
+/// - If unset, fall back to the default basename (`bash`, `python3`,
+///   etc.). `Command::new("bash")` does go through `$PATH`, but the
+///   default path is a trust boundary set by the install environment
+///   (Homebrew, distro packaging), not by a Claude Code session
+///   mid-run. SECURITY.md documents this explicitly as "caller
+///   controls `$PATH` is out of scope — run Barbican under a trusted
+///   parent shell" (1.4.0 crew review, Claude WARNING-4).
+///
+/// On absolute-path-violation, we log to stderr and exit 2 (same
+/// code as classifier deny) so the failure is visible to the caller
+/// and no interpreter is spawned.
 fn resolve_interpreter(dialect: Dialect) -> String {
-    std::env::var(dialect.interpreter_env_var())
-        .unwrap_or_else(|_| dialect.default_interpreter().to_string())
+    let env_var = dialect.interpreter_env_var();
+    match std::env::var(env_var) {
+        Ok(v) => {
+            let path = std::path::Path::new(&v);
+            if !path.is_absolute() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}: ${env_var}=`{v}` must be an absolute path; \
+                     refusing to resolve via $PATH (1.4.0 crew review)",
+                    dialect.wrapper_name()
+                );
+                std::process::exit(EXIT_DENY);
+            }
+            v
+        }
+        Err(_) => dialect.default_interpreter().to_string(),
+    }
 }
 
 /// Spawn `interpreter flag body [-- extra_args...]` with piped stdout
@@ -393,8 +429,14 @@ fn spawn_with_redaction(
     // outputs. Line-buffered: redaction is line-scoped so a secret
     // spanning two lines is not redacted. Real secrets don't span
     // newlines in practice.
-    let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>();
-    let (tx_err, rx_err) = mpsc::channel::<Vec<u8>>();
+    // 1.4.0 crew review (gpt-5.2 WARNING): unbounded `mpsc::channel`
+    // let a fast-writing child grow the wrapper's RSS unboundedly if
+    // the terminal forwarder couldn't keep up. Use bounded
+    // `sync_channel(64)` — 64 buffered chunks × ~8KB typical line
+    // = ~512KB of in-flight per stream, which is plenty for realistic
+    // human-scale output and a hard cap against a DoS child.
+    let (tx_out, rx_out) = mpsc::sync_channel::<Vec<u8>>(64);
+    let (tx_err, rx_err) = mpsc::sync_channel::<Vec<u8>>(64);
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -471,7 +513,7 @@ fn spawn_with_redaction(
 /// terminated — a child that writes `printf 'x'` must see its output
 /// reach our stdout as exactly `x`, not `x\n`.
 #[allow(clippy::needless_pass_by_value)] // must own `tx` so it drops at fn exit and closes the channel
-fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::Sender<Vec<u8>>) {
+fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::SyncSender<Vec<u8>>) {
     let mut reader = BufReader::new(pipe);
     let mut buf = Vec::with_capacity(4096);
     loop {
