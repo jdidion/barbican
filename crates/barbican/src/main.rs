@@ -111,10 +111,9 @@ fn classify_probe() -> Result<()> {
     std::io::stdin()
         .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
-    let s = match std::str::from_utf8(&buf) {
-        Ok(s) => s,
-        // Non-UTF-8 input is a deny per CLAUDE.md rule #1.
-        Err(_) => std::process::exit(2),
+    // Non-UTF-8 input is a deny per CLAUDE.md rule #1.
+    let Ok(s) = std::str::from_utf8(&buf) else {
+        std::process::exit(2);
     };
     match barbican::__fuzz::classify_command(s) {
         barbican::__fuzz::Decision::Allow => std::process::exit(0),
