@@ -51,7 +51,6 @@
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
@@ -345,17 +344,6 @@ fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
-/// `~/.claude/barbican/audit.log` path. Returns None if HOME is
-/// unset or non-absolute — matches `crate::hooks::audit`'s logic.
-fn audit_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    if home.as_os_str().is_empty() || !home.is_absolute() {
-        return None;
-    }
-    Some(home.join(".claude").join("barbican").join("audit.log"))
-}
-
 fn write_audit_entry(
     dialect: Dialect,
     decision: &str,
@@ -363,12 +351,14 @@ fn write_audit_entry(
     body_sha256: &str,
     exit_code: Option<i32>,
 ) {
-    let Some(path) = audit_log_path() else {
+    let Some(path) = crate::audit_io::audit_log_path() else {
         return;
     };
-    let ts = iso8601_utc_now();
-    // Hand-roll the JSON — same approach `audit.rs` takes to avoid
-    // pulling in serialization ceremony for a single-line record.
+    let ts = crate::audit_io::iso8601_utc_now();
+    // Hand-roll the JSON to avoid serialization ceremony for a
+    // single-line record. Every string field that could carry
+    // attacker-controllable content goes through `sanitize_field`
+    // (ANSI-strip + truncate) before it lands in the log.
     let mut line = String::with_capacity(256);
     line.push_str("{\"ts\":\"");
     line.push_str(&ts);
@@ -380,36 +370,23 @@ fn write_audit_entry(
     line.push_str(body_sha256);
     line.push('"');
     if let Some(r) = reason {
+        // Classifier reasons can embed path fragments and other
+        // attacker-influenced substrings; strip ANSI and cap length
+        // before embedding. `serde_json::to_string` on a &str only
+        // fails on OOM; the `unwrap_or` is defensive.
+        let cleaned = crate::audit_io::sanitize_field(r, crate::audit_io::MAX_STRING_CHARS);
         line.push_str(",\"reason\":");
-        line.push_str(&serde_json::to_string(r).unwrap_or_else(|_| "\"\"".to_string()));
+        line.push_str(
+            &serde_json::to_string(&cleaned)
+                .unwrap_or_else(|_| "\"<serialize error>\"".to_string()),
+        );
     }
     if let Some(e) = exit_code {
         line.push_str(",\"exit\":");
         line.push_str(&e.to_string());
     }
     line.push_str("}\n");
-    let _ = append_audit_line(&path, &line);
-}
-
-fn append_audit_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
-    use std::fs::{File, OpenOptions};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file: File = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    // Same fd-based chmod as audit.rs — paranoid-safe.
-    let mut perms = file.metadata()?.permissions();
-    if perms.mode() & 0o777 != 0o600 {
-        perms.set_mode(0o600);
-        file.set_permissions(perms)?;
-    }
-    file.write_all(line.as_bytes())?;
-    Ok(())
+    let _ = crate::audit_io::append_jsonl_line(&path, &line);
 }
 
 /// Hex-encoded sha256 of `bytes`. Used to fingerprint the wrapper's
@@ -423,44 +400,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-fn iso8601_utc_now() -> String {
-    // Reuse the same civil-date algorithm audit.rs uses; inline here
-    // to avoid exposing audit.rs's internals publicly.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let days_since_epoch = i64::try_from(secs / 86_400).unwrap_or(0);
-    let secs_in_day = (secs % 86_400) as u32;
-    let hour = secs_in_day / 3600;
-    let minute = (secs_in_day / 60) % 60;
-    let second = secs_in_day % 60;
-    let shifted = days_since_epoch + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097) as u32;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
-    let year_i64 = i64::from(year_of_era) + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_shifted = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_shifted + 2) / 5 + 1;
-    let month = if month_shifted < 10 {
-        month_shifted + 3
-    } else {
-        month_shifted - 9
-    };
-    let year_i64 = if month <= 2 { year_i64 + 1 } else { year_i64 };
-    let year = u32::try_from(year_i64).unwrap_or(0);
-    (year, month, day, hour, minute, second)
 }
 
 #[cfg(test)]

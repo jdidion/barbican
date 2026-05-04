@@ -247,3 +247,50 @@ fn python_wrapper_allow_hello_if_python3_available() {
     assert_eq!(exit, 0);
     assert!(out.contains("ok"), "output: {out}");
 }
+
+// ---- symlinked-ancestor audit-log TOCTOU regression ----
+//
+// 1.4.0 adversarial review (Claude CRITICAL-1, GPT-5.2 CRITICAL): the
+// wrapper's audit-log writer previously reimplemented append logic
+// without the 1.3.7 ancestor-symlink hardening. Pin the shared
+// `audit_io::append_jsonl_line` behavior at the integration level
+// (wrapper end-to-end) so a future refactor that bypasses the shared
+// module resurfaces here.
+
+#[test]
+fn wrapper_refuses_to_write_audit_under_symlinked_home_ancestor() {
+    // Fake HOME with a planted `~/.claude` symlink.
+    let base = tempfile::tempdir().expect("tempdir");
+    let home = base.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Attacker-controlled target dir the planted symlink points at.
+    let plant = base.path().join("plant");
+    std::fs::create_dir_all(&plant).unwrap();
+    std::os::unix::fs::symlink(&plant, home.join(".claude")).expect("symlink .claude -> plant");
+
+    // Invoke the wrapper with the poisoned HOME. Allow path so
+    // `write_audit_entry` actually runs.
+    let out = Command::new(bin_shell())
+        .arg("-c")
+        .arg("true")
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("wrapper spawn");
+    // Wrapper itself succeeds — the audit write is best-effort; the
+    // expectation is that NO file is written into the symlink target.
+    assert_eq!(out.status.code(), Some(0));
+
+    // Neither the symlink nor its target should have a barbican/
+    // directory materialized under them. `ancestor_chain_has_symlink`
+    // in `audit_io` must refuse before `create_dir_all` runs.
+    assert!(
+        !plant.join("barbican").exists(),
+        "audit write must refuse to materialize a subtree under a planted \
+         `~/.claude` symlink — the 1.3.7 ancestor-chain hardening must \
+         protect the wrapper audit path too"
+    );
+}

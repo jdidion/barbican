@@ -3,6 +3,7 @@
 //! Public so integration tests and the `barbican` binary can share
 //! implementations.
 
+pub mod audit_io;
 pub mod cmd;
 pub mod hooks;
 pub mod installer;
