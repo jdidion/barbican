@@ -2,6 +2,33 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.3.8] — 2026-05-04
+
+Three new tree-sitter-bash Linux SIGSEGV classes closed in one cycle — and two assumptions from the 1.3.1 lane reversed. The preflight is now 8 lines with no tables.
+
+### Fixed
+
+- **Class 6** — `{` + U+30225 (CJK Ext G, UTF-8 prefix `F0 B0 88`). First class with lead byte `0xB0`; all 1.3.1-1.3.6 classes had been `F0 B1 XX` rows. Bisect probed 9 codepoints across 5 rows of the `F0 B0` block and all SIGSEGV'd, so the preflight widened to the whole `F0 B0` lead pair.
+- **Class 7** — `{` + U+314CD (CJK Ext G, UTF-8 prefix `F0 B1 93`). A row NOT in any of the 4 previously-pinned `F0 B1 XX` rows, captured after the `F0 B0` widening. With 5 non-adjacent rows across `F0 B1` confirmed crashing, the block-level widening extended to `F0 B1` as well.
+- **Class 8** — `{` + U+1F8C1 (SMP emoji/symbols, UTF-8 prefix `F0 9F`). Captured after the `F0 B0`+`F0 B1` widening. The 10 `{` + astral pairs in that 3540-byte capture span 6 different UTF-8 lead pairs (`F0 9F`, `F0 9E`, `F0 9D`, `F3 A0`, `F0 9B`, `F0 90`) — proving the upstream bug is NOT limited to CJK Extensions G/H. The preflight collapsed to a single byte-class check: any 4-byte UTF-8 lead (`0xF0..=0xF7`).
+- **Class 9** — `{5` + U+31F88 non-adjacent (6 bytes total). Proved the original 1.3.1 "adjacency required" assumption wrong. The parser enters a broken state after any `{` and the broken state persists across intermediate bytes. The preflight now denies if input contains any `{` followed ANYWHERE later by a 4-byte UTF-8 lead.
+
+### Changed
+
+- **Preflight collapsed to a byte-class check**. `parser::preflight_known_crashers` is now 8 lines: scan for `{`, then deny on any subsequent `0xF0..=0xF7` byte. Zero tables, zero lookups.
+- **`PARSER_CRASHER_PREFIXES` and `PARSER_CRASHER_LEAD_PAIRS` retired** from `src/tables.rs`. The 1.3.1-1.3.8 evidence trail is in upstream `tree-sitter/tree-sitter-bash#337` and the commit history; keeping empty structural placeholders in `tables.rs` would be cruft.
+- **Test inversion**: `preflight_allows_openbrace_plus_crasher_non_adjacent` (pinning the 1.3.1 "adjacency required" assumption) became `preflight_denies_openbrace_plus_crasher_non_adjacent`. `preflight_allows_openbrace_plus_other_astral_codepoints` became `preflight_allows_openbrace_plus_bmp_codepoints` — now only BMP (1/2/3-byte UTF-8) codepoints after `{` pass; every 4-byte codepoint denies.
+
+### Verified
+
+- Best-effort `linux-fuzz-repro` CI lane ran to completion across all 8192 proptest cases with **zero crashes** for the first time since the lane shipped in 1.3.0.
+- Upstream `tree-sitter/tree-sitter-bash#337` updated with classes 5-9 evidence and the collapsed mitigation.
+
+### Known limits
+
+- `F0 B2` / `F0 B3` lead pairs have not been directly probed; we haven't surfaced a capture in those ranges. The blanket 4-byte-lead check covers them preemptively.
+- Legitimate `{` + astral uses (emoji in braces, CJK Ext G/H in brace-quoted strings) are blocked. `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1` is the documented escape hatch — rare use case, near-zero false-positive rate on real bash.
+
 ## [1.3.7] — 2026-05-04
 
 Final cross-provider adversarial audit (Claude opus + GPT-5.2 + Gemini-3.1-pro + Grok-4.20-thinking). Closes two live SSRF gaps, one audit-log TOCTOU, and hardens the release pipeline end-to-end.

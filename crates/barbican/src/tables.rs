@@ -237,32 +237,16 @@ pub static EXFIL_NETWORK_TOOLS: Set<&'static str> = phf_set! {
     "ssh",
 };
 
-/// 3-byte UTF-8 prefixes of codepoint rows known to crash the
-/// `tree-sitter-bash` FFI on Linux when byte-adjacent to `{`.
-///
-/// See [`crate::parser::preflight_known_crashers`] for the scan that
-/// consumes this table. Each entry is the first 3 UTF-8 bytes of a
-/// 4-byte codepoint; the 4th byte is any continuation byte, relying on
-/// `&str` input guaranteeing well-formed UTF-8 at the buffer level.
-///
-/// | Row              | Prefix       | Block                     | CI run id     |
-/// |------------------|-------------:|---------------------------|---------------|
-/// | Row              | Prefix       | Block                     | CI context    |
-/// |------------------|-------------:|---------------------------|---------------|
-/// | U+316C0..U+316FF | `F0 B1 9B`   | CJK Ext G sub-row 2       | 1.3.6 PR #47  |
-/// | U+31840..U+3187F | `F0 B1 A1`   | CJK Ext G                 | 25264060820   |
-/// | U+31BC0..U+31BFF | `F0 B1 AF`   | CJK Ext H sub-row 1       | 25284064905   |
-/// | U+31F80..U+31FBF | `F0 B1 BE`   | CJK Ext H sub-row 2       | 25299266828   |
-///
-/// Add new rows as the per-probe classifier sweep in
-/// `tests/linux_crash_bisect.rs::aaa_classifier_probes` identifies
-/// them. Upstream: <https://github.com/tree-sitter/tree-sitter-bash/issues/337>
-pub const PARSER_CRASHER_PREFIXES: &[[u8; 3]] = &[
-    [0xF0, 0xB1, 0x9B],
-    [0xF0, 0xB1, 0xA1],
-    [0xF0, 0xB1, 0xAF],
-    [0xF0, 0xB1, 0xBE],
-];
+// (1.3.1-1.3.8 had two tables here — `PARSER_CRASHER_PREFIXES` for
+// 3-byte row prefixes and `PARSER_CRASHER_LEAD_PAIRS` for 2-byte
+// block prefixes. They grew incrementally as CI bisects surfaced new
+// crash classes. 1.3.8 final widening collapsed both into a single
+// byte-class test in `parser::preflight_known_crashers`: any `{`
+// followed anywhere by a 4-byte UTF-8 lead byte (0xF0..=0xF7). The
+// tables are retired — see `parser::preflight_known_crashers` for
+// the current check and upstream
+// https://github.com/tree-sitter/tree-sitter-bash/issues/337 for
+// the full bisect trail.)
 
 #[cfg(test)]
 mod tests {
@@ -308,27 +292,5 @@ mod tests {
     fn obfuscation_tools_covers_h2() {
         assert!(OBFUSCATION_TOOLS.contains("base64"));
         assert!(OBFUSCATION_TOOLS.contains("xxd"));
-    }
-
-    #[test]
-    fn parser_crasher_prefixes_are_3_bytes_and_match_known_rows() {
-        // Centralizing the prefix table here means regressions elsewhere
-        // (e.g. an accidental edit to the first bytes) surface as a test
-        // failure rather than as a Linux SIGSEGV caught only by CI.
-        for prefix in PARSER_CRASHER_PREFIXES {
-            assert_eq!(prefix.len(), 3, "crasher prefixes are 3-byte: {prefix:?}");
-            assert_eq!(
-                prefix[0], 0xF0,
-                "all known crashers start with 4-byte UTF-8 lead byte 0xF0"
-            );
-        }
-        // Known rows by prefix — these are the bisected findings from
-        // 1.3.1 / 1.3.3 / 1.3.4. Changing the table without also
-        // updating `parser::preflight_known_crashers` tests would let
-        // a Linux regression slip through.
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0x9B]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xA1]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xAF]));
-        assert!(PARSER_CRASHER_PREFIXES.contains(&[0xF0, 0xB1, 0xBE]));
     }
 }

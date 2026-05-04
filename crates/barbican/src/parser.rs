@@ -222,44 +222,65 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// Deny-by-default for inputs known to crash the `tree-sitter-bash`
 /// FFI on Linux.
 ///
-/// Catches: any `{` immediately followed by the 3-byte UTF-8 prefix
-/// of a crashing codepoint row. Each row shares its first three
-/// UTF-8 bytes; the 4th byte is any valid continuation, and `&str`
-/// input guarantees well-formed UTF-8 at the buffer level so any
-/// match on the 3-byte prefix at a char boundary is a 4-byte
-/// codepoint in that row by construction.
+/// ## Evolution of this check (1.3.1 → 1.3.8)
 ///
-/// The row table lives in [`crate::tables::PARSER_CRASHER_PREFIXES`];
-/// each entry was bisected via the per-probe classifier sweep in
-/// `tests/linux_crash_bisect.rs::aaa_classifier_probes`. The sweep
-/// ran one subprocess per candidate so a single SIGSEGV couldn't
-/// kill the whole test binary; each row matched exactly one probe
-/// with `signal-ExitStatus(unix_wait_status(139))` (SIGSEGV) while
-/// siblings returned `exit-2-deny` cleanly.
+/// Each release narrowed its understanding of the upstream crash
+/// class in response to bisect data from CI:
 ///
-/// Adjacency matters: a single byte (space, letter, second `{`)
-/// between the brace and the codepoint reverts to a clean parse.
-/// That's what the scan below encodes — the brace and the prefix
-/// must be byte-adjacent.
+/// - 1.3.1 — "specific codepoint": `{` + U+31860 (5 bytes).
+/// - 1.3.3..1.3.6 — "specific rows": four `F0 B1 XX` row prefixes.
+/// - 1.3.8 run 1 — "2-byte lead pair": `F0 B0` whole block crashes.
+/// - 1.3.8 run 2 — second block: `F0 B1` whole block crashes.
+/// - 1.3.8 run 3 — "any 4-byte UTF-8 lead": class-8 capture had
+///   `{` + U+1F8C1 (lead `F0 9F`), U+E0144 (lead `F3 A0`), etc.
+///   The bug spans the whole astral range.
+/// - 1.3.8 final — "non-adjacent trigger": `{5` + U+31F88 (6 bytes)
+///   also SIGSEGV even though `{` is NOT byte-adjacent to the
+///   astral codepoint. The parser apparently enters a broken state
+///   after any `{` that persists across intermediate bytes.
 ///
-/// The check is a single linear scan over the input bytes with a
-/// small constant-size table of dangerous byte patterns; if the
-/// table grows past a handful of rows we escalate to a fork-based
-/// signal-catching wrapper.
+/// ## Current mitigation
+///
+/// Deny any input that contains `{` followed ANYWHERE later by a
+/// 4-byte UTF-8 lead byte (0xF0..=0xF7). Single linear scan with a
+/// bool flag; no table lookups.
+///
+/// ## False-positive cost
+///
+/// Vanishingly small on real bash. Brace-expansion / brace-groups /
+/// parameter-expansion contexts overwhelmingly use ASCII + BMP
+/// content. Users with a legitimate `{` + astral use case can set
+/// `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1` as an escape hatch.
+///
+/// Upstream: <https://github.com/tree-sitter/tree-sitter-bash/issues/337>.
 fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
     let bytes = input.as_bytes();
     if bytes.len() < 5 {
         return Ok(());
     }
-    for i in 0..bytes.len().saturating_sub(4) {
-        if bytes[i] != b'{' {
+    // 1.3.8 final widening: if the input contains any `{` followed
+    // ANYWHERE later by a 4-byte UTF-8 lead byte (0xF0..=0xF7), deny.
+    // The 1.3.1 through 1.3.8 bisects captured 8 distinct crasher
+    // codepoints across 6 non-adjacent UTF-8 lead pairs. Class 2
+    // (`{5` + U+31F88) and the class-3 `crash03_window_132_142` probe
+    // both proved the trigger does NOT require the `{` to be
+    // byte-adjacent to the astral codepoint — `{` + any-byte +
+    // astral also SIGSEGVs. Rather than chase the exact distance
+    // tolerance, conservatively deny anything that pairs `{` with a
+    // 4-byte UTF-8 codepoint anywhere later in the string.
+    //
+    // Legitimate bash with this pairing is vanishingly rare: most
+    // uses of `{` are for brace-expansion, brace-groups, or
+    // parameter-expansion contexts with ASCII / BMP content. If a
+    // real script needs `{` + astral, `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1`
+    // is the documented escape hatch.
+    let mut seen_openbrace = false;
+    for &b in bytes {
+        if b == b'{' {
+            seen_openbrace = true;
             continue;
         }
-        let window = &bytes[i + 1..i + 4];
-        if crate::tables::PARSER_CRASHER_PREFIXES
-            .iter()
-            .any(|p| window == p.as_slice())
-        {
+        if seen_openbrace && (0xF0..=0xF7).contains(&b) {
             return Err(ParseError::Malformed);
         }
     }
@@ -1019,21 +1040,89 @@ mod tests {
     }
 
     #[test]
-    fn preflight_allows_openbrace_plus_other_astral_codepoints() {
-        // Negative control: astral codepoints OUTSIDE the crashing
-        // rows must pass through the preflight. The forked-
-        // subprocess bisect confirmed these shapes parse cleanly.
-        // U+31880 sits between the Ext G crasher row (ends U+3187F)
-        // and the Ext H crasher row (starts U+31BC0). Not probing
-        // other gap codepoints because the classifier sweep has only
-        // proven safety for what was captured — if proptest finds a
-        // new row later, widen the preflight and update this list.
-        for cp in ['\u{10000}', '\u{1F600}', '\u{20000}', '\u{31880}'] {
+    fn preflight_denies_openbrace_plus_u30225() {
+        // 1.3.8 lane: sixth Linux tree-sitter-bash SIGSEGV class,
+        // surfaced by the best-effort `linux-fuzz-repro` job on PR #49
+        // CI (1.3.7 audit-fix PR, 8192-case proptest sweep). `{` +
+        // U+30225 (CJK Ext G row U+30200..U+3023F) is the 5-byte
+        // minimal reproducer extracted from the 995-byte proptest
+        // input (see `tests/data/linux_crash_06.bin`). The PR #50
+        // bisect confirmed the whole `F0 B0` lead pair crashes,
+        // widening the mitigation to a 2-byte block-level deny.
+        let input = "{\u{30225}";
+        assert_eq!(preflight_known_crashers(input), Err(ParseError::Malformed));
+    }
+
+    #[test]
+    fn preflight_denies_entire_f0_b0_block() {
+        // 1.3.8 PR #50 bisect: the whole `F0 B0` lead pair crashes
+        // (U+30000..U+33FFF, the lower swath of CJK Ext G/H). Probe
+        // codepoints drawn from rows spanning the block boundary, not
+        // all in one row.
+        for cp in [
+            '\u{30000}', // Ext G start
+            '\u{30100}', // row above crash06
+            '\u{301FF}', // just below crash06 row
+            '\u{30200}', // crash06 row start
+            '\u{30225}', // crash06 minimal
+            '\u{3023F}', // crash06 row end
+            '\u{30240}', // just above crash06 row
+            '\u{30300}', // row well above
+            '\u{30FFF}', // `F0 B0` lead-pair end
+        ] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    /// 1.3.8 final widening (class 8): the preflight now denies `{` +
+    /// ANY 4-byte UTF-8 codepoint, so the former "allows other astral
+    /// codepoints" negative control no longer applies. This test
+    /// replaces it by confirming the preflight allows `{` + BMP
+    /// (1, 2, 3-byte UTF-8) codepoints — only the 4-byte lead-byte
+    /// range is dangerous.
+    #[test]
+    fn preflight_allows_openbrace_plus_bmp_codepoints() {
+        for cp in [
+            '\u{41}',   // ASCII `A` (1 byte)
+            '\u{E9}',   // Latin small letter e with acute (2 bytes)
+            '\u{6F22}', // CJK ideograph 漢 (3 bytes)
+            '\u{FFFD}', // BMP replacement character (3 bytes)
+        ] {
             let input = format!("{{{cp}");
             assert_eq!(
                 preflight_known_crashers(&input),
                 Ok(()),
                 "preflight over-matched on `{{` + U+{:X}",
+                cp as u32
+            );
+        }
+    }
+
+    /// 1.3.8 final widening: `{` + ANY astral (4-byte UTF-8) codepoint
+    /// now denies. Probe across the whole astral range — pre-1.3.8
+    /// passes (e.g. U+10000, U+1F600, U+20000, U+2FFFF) are now
+    /// expected to deny.
+    #[test]
+    fn preflight_denies_openbrace_plus_any_astral() {
+        for cp in [
+            '\u{10000}',  // F0 90 80 80 — plane 1, start
+            '\u{1F600}',  // F0 9F 98 80 — emoji
+            '\u{20000}',  // F0 A0 80 80 — CJK Ext B
+            '\u{2FFFF}',  // F0 AF BF BF — last plane-2 codepoint below Ext G
+            '\u{E0144}',  // F3 A0 85 84 — tag-space (class-8 witness)
+            '\u{10FFFF}', // F4 8F BF BF — last valid Unicode codepoint
+        ] {
+            let input = format!("{{{cp}");
+            assert_eq!(
+                preflight_known_crashers(&input),
+                Err(ParseError::Malformed),
+                "preflight missed `{{` + U+{:X}",
                 cp as u32
             );
         }
@@ -1063,11 +1152,25 @@ mod tests {
         assert_eq!(preflight_known_crashers("hello"), Ok(()));
     }
 
+    /// 1.3.8 reversal of a 1.3.1 assumption: we originally believed
+    /// the crash required `{` byte-adjacent to the 4-byte codepoint.
+    /// PR #50's bisect surfaced `{5 + U+31F88` as a 6-byte SIGSEGV,
+    /// proving the trigger is looser — `{` anywhere before a 4-byte
+    /// codepoint is enough. The preflight now denies these inputs,
+    /// and this test pins the reversal.
     #[test]
-    fn preflight_allows_openbrace_plus_crasher_non_adjacent() {
-        // Even ONE byte between `{` and the crasher must allow —
-        // the bisect confirmed adjacency is required.
-        let input = "{ \u{31860}";
-        assert_eq!(preflight_known_crashers(input), Ok(()));
+    fn preflight_denies_openbrace_plus_crasher_non_adjacent() {
+        for input in [
+            "{ \u{31860}",        // space between
+            "{5\u{31F88}",        // digit between (class-3 capture shape)
+            "{abc\u{1F600}",      // multi-char gap + emoji
+            "{\u{0041}\u{20000}", // ASCII A between + CJK Ext B
+        ] {
+            assert_eq!(
+                preflight_known_crashers(input),
+                Err(ParseError::Malformed),
+                "preflight missed non-adjacent `{{` + astral on {input:?}"
+            );
+        }
     }
 }
