@@ -112,8 +112,12 @@ fn combined_regex() -> &'static Regex {
             // numeric segments + token body. The token body varies in
             // length; 10+ is defensive (real bot tokens are ~50+).
             r"|(?P<slack>xox[abprs]-[A-Za-z0-9-]{10,200})",
-            // Atlassian API token: ATATT3x + body. Fairly distinctive.
-            r"|(?P<atlassian>ATATT3x[A-Za-z0-9_-]{200,400}[A-F0-9]{8})",
+            // Atlassian API token: ATATT3x + URL-safe-base64 body +
+            // 8-char CRC32 checksum. Real Atlassian tokens use
+            // LOWERCASE hex for the CRC; the earlier `[A-F0-9]{8}`
+            // anchor missed every live token. Accept both cases.
+            // 1.4.0 crew review (Claude WARNING-1).
+            r"|(?P<atlassian>ATATT3x[A-Za-z0-9_-]{200,400}[A-Fa-f0-9]{8})",
             // JWT: three Base64URL segments separated by dots, starting
             // with `eyJ` (which decodes to `{"`, the JSON object lead).
             // Length floors are very conservative; real JWTs are
@@ -272,6 +276,21 @@ mod tests {
         let k = format!("ATATT3x{body}DEADBEEF");
         let out = redact(&k);
         assert_eq!(out, "<redacted:atlassian-token>");
+    }
+
+    /// 1.4.0 crew review (Claude WARNING-1): real Atlassian API
+    /// tokens use a LOWERCASE hex CRC32 checksum. The initial
+    /// pattern's `[A-F0-9]{8}` anchor missed every live token. Red
+    /// test pinning the fix to `[A-Fa-f0-9]{8}`.
+    #[test]
+    fn redacts_atlassian_api_token_with_lowercase_hex_crc() {
+        let body = "A".repeat(205);
+        let k = format!("ATATT3x{body}deadbeef");
+        let out = redact(&k);
+        assert_eq!(
+            out, "<redacted:atlassian-token>",
+            "lowercase-hex CRC must still match"
+        );
     }
 
     #[test]

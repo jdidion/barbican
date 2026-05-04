@@ -840,15 +840,12 @@ fn install_refuses_symlinked_wrapper_source() {
     fs::write(&secret, b"super-secret-contents").unwrap();
 
     // Plant barbican-shell as a symlink to that secret.
-    std::os::unix::fs::symlink(&secret, src_parent.join("barbican-shell"))
-        .expect("symlink plant");
+    std::os::unix::fs::symlink(&secret, src_parent.join("barbican-shell")).expect("symlink plant");
 
     // Install must fail, AND the destination wrapper must not exist
     // (we cannot check the secret's contents weren't copied — because
     // the install failed — but we can pin that no wrapper landed).
-    let err = installer::install(&o).expect_err(
-        "install must refuse a symlinked wrapper source",
-    );
+    let err = installer::install(&o).expect_err("install must refuse a symlinked wrapper source");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("symlink") || msg.contains("symlinked"),

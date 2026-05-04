@@ -225,9 +225,24 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 /// Parse wrapper argv into `(BODY, extra_args)`. Errors if the inline
 /// flag is missing or has no BODY. Any args after BODY are returned
 /// verbatim — the interpreter interprets them as positional args.
+///
+/// Handles three shapes:
+/// - Space-separated: `barbican-shell -c "ls"` → BODY="ls"
+/// - Attached: `barbican-shell -c"ls"` → BODY="ls"
+/// - Bundled short options (shell only): `barbican-shell -ce "ls"` →
+///   BODY="ls". Bash / sh / zsh parse `-ce` as `-c -e`; the wrapper
+///   has to do the same or `-ce` misparses as `-cBODY=e`. Detected
+///   by: token starts with `-`, is longer than `-<flag_letter>`,
+///   contains the flag letter, and does NOT strip cleanly into a
+///   `-c<body>` form that would be a valid non-empty BODY. Non-shell
+///   dialects (python/node/ruby/perl) don't bundle `-e` in practice,
+///   so we don't apply the bundled-option heuristic there.
+///
+/// 1.4.0 crew review (gpt-5.2 WARNING).
 fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>), String> {
     let flag = dialect.inline_flag();
-    // Skip argv[0].
+    let flag_letter = flag.as_bytes()[1]; // `-c` → b'c', `-e` → b'e'
+                                          // Skip argv[0].
     let mut iter = argv.iter().skip(1);
     while let Some(arg) = iter.next() {
         if arg == flag {
@@ -236,6 +251,25 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
                 .ok_or_else(|| format!("missing argument after {flag}"))?;
             let rest: Vec<String> = iter.cloned().collect();
             return Ok((body.clone(), rest));
+        }
+        // Bundled shell short-options: `-ce`, `-ec`, `-cex`, etc.
+        // Shape: starts with `-`, not just `--`, contains flag_letter,
+        // and every char after `-` is a single-letter short option
+        // (ASCII alphabetic). Only applies to shell; other dialects
+        // don't mix flag letters with BODY in a single token.
+        if dialect == Dialect::Shell && arg.starts_with('-') && arg.len() >= 3 {
+            let after_dash = &arg.as_bytes()[1..];
+            let is_bundle = !arg.starts_with("--")
+                && after_dash.iter().all(u8::is_ascii_alphabetic)
+                && after_dash.contains(&flag_letter);
+            if is_bundle {
+                // BODY is the next arg.
+                let body = iter
+                    .next()
+                    .ok_or_else(|| format!("missing argument after {arg}"))?;
+                let rest: Vec<String> = iter.cloned().collect();
+                return Ok((body.clone(), rest));
+            }
         }
         // Attached form: `-cBODY` / `-eBODY`.
         if let Some(body) = arg.strip_prefix(flag) {
@@ -536,6 +570,53 @@ mod tests {
         let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
         assert_eq!(body, "ls -la");
         assert!(rest.is_empty());
+    }
+
+    /// 1.4.0 crew review (gpt-5.2 WARNING): `bash -ce 'cmd'` is a
+    /// common shell-compatibility shape. The naive attached-form
+    /// parser misreads `-ce` as `-cBODY=e`; the real BODY in the
+    /// next arg goes unclassified. Pin the bundle-aware handling.
+    #[test]
+    fn parse_argv_handles_bundled_ce_flag_for_shell() {
+        let argv = vec!["barbican-shell".into(), "-ce".into(), "ls -la".into()];
+        let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
+        assert_eq!(body, "ls -la");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn parse_argv_handles_bundled_ec_flag_for_shell() {
+        let argv = vec!["barbican-shell".into(), "-ec".into(), "ls -la".into()];
+        let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
+        assert_eq!(body, "ls -la");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn parse_argv_handles_bundled_multi_flag_for_shell() {
+        // `-cex` = `-c -e -x`; BODY in next arg.
+        let argv = vec!["barbican-shell".into(), "-cex".into(), "echo hi".into()];
+        let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
+        assert_eq!(body, "echo hi");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn parse_argv_does_not_bundle_non_shell_dialects() {
+        // For python/node/ruby/perl, `-el` is NOT a bundled-option
+        // form; `-e` is always attached-to-BODY. The heuristic must
+        // not fire and consume the next arg as BODY.
+        let argv = vec![
+            "barbican-node".into(),
+            "-el".into(),
+            "console.log(1)".into(),
+        ];
+        // `-el` tries attached form → BODY="l", extra=["console.log(1)"].
+        // This is harmless — the classifier sees "l", node gets
+        // `-e l console.log(1)` which is a node error. Pin that the
+        // wrapper does NOT interpret `-el` as bundled + consume next.
+        let (body, _rest) = parse_argv(&argv, Dialect::Node).unwrap();
+        assert_eq!(body, "l", "non-shell must not apply bundle heuristic");
     }
 
     #[test]
