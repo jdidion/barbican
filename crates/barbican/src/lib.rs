@@ -9,6 +9,7 @@ pub mod installer;
 pub mod mcp;
 pub mod net;
 pub mod parser;
+pub mod redact;
 pub mod sanitize;
 pub mod scan;
 pub mod tables;
