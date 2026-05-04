@@ -28,11 +28,20 @@
 //!
 //! ## Signal handling
 //!
-//! The wrapper stays in the process group so Ctrl-C reaches both
-//! wrapper and child. The wrapper ignores SIGINT itself (so the
-//! terminal keeps sending it to the child only) until after the
-//! child exits. This matches how `time(1)`, `sudo(1)`, and similar
-//! transparent front-ends behave.
+//! Before spawning the child, the wrapper installs `SIG_IGN` for
+//! SIGINT, SIGTERM, and SIGHUP in its own process. It passes a
+//! `pre_exec` hook that resets those three signals to `SIG_DFL` in
+//! the child before `execve` so the child's usual handling is
+//! preserved. This matches how `time(1)`, `sudo(1)`, and similar
+//! transparent front-ends behave: SIGINT from the terminal reaches
+//! both processes (they're in the same pgrp), but only the child
+//! acts on it — the wrapper survives to `wait()`, capture the
+//! child's exit code, and write the audit entry.
+//!
+//! After `wait()` returns, the wrapper restores `SIG_DFL` for the
+//! same three signals (cosmetic, since it's about to exit anyway).
+//! An explicit SIGKILL to the wrapper still terminates it; SIGKILL
+//! cannot be ignored.
 //!
 //! ## Audit log shape
 //!
@@ -50,7 +59,7 @@
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
@@ -301,6 +310,39 @@ fn spawn_with_redaction(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // 1.4.0 adversarial review (all three reviewers): the module docs
+    // claim "wrapper ignores SIGINT so the terminal keeps sending it
+    // to the child only" — but without the call we're about to make,
+    // that's a lie. Ctrl-C in the foreground process group reaches
+    // both wrapper and child; the wrapper dies first (default SIGINT
+    // handler), the child is orphaned, `wait()` never returns, and
+    // the allow-path audit entry is never written.
+    //
+    // Fix: set SIGINT (and SIGTERM/SIGHUP for symmetry) to SIG_IGN
+    // in the wrapper, and use `pre_exec` to reset them to SIG_DFL in
+    // the child. POSIX preserves SIG_IGN across `execve`; without
+    // the pre_exec reset, the child would also inherit the
+    // ignore-handler and become uninterruptible.
+    //
+    // SAFETY: `pre_exec` runs between `fork` and `execve` in the
+    // child, a context where only async-signal-safe calls are
+    // permitted. `libc::signal` is listed as async-signal-safe by
+    // POSIX.1-2008. In the wrapper itself, `libc::signal` is the
+    // POSIX signal-handler installer — safe to call from any thread
+    // at any time.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -363,6 +405,18 @@ fn spawn_with_redaction(
     }
     let _ = fwd_out.join();
     let _ = fwd_err.join();
+
+    // Restore default signal handlers now that the child has exited.
+    // The wrapper is about to exit itself; this is cosmetic (nothing
+    // re-reads SIGINT after this), but keeps the process clean.
+    //
+    // SAFETY: async-signal-safe, same rationale as the pre-spawn block.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+    }
 
     status.code().unwrap_or_else(|| {
         // Signal-killed; synthesize 128 + signal as shells do.

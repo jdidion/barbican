@@ -20,7 +20,13 @@ repository = "https://github.com/jdidion/barbican"
 description = "Rust port of Narthex: a safety layer for Claude Code hooks and MCP tools."
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# 1.4.0: the wrapper binaries need `libc::signal(SIGINT, SIG_IGN)` +
+# matching `pre_exec` SIG_DFL reset to implement transparent-frontend
+# SIGINT handling (tested async-signal-safe code; opted in
+# module-locally via `#[allow(unsafe_code)]` with a rationale). The
+# rest of the crate still denies unsafe; downgrade from `forbid` to
+# `deny` so the narrow, justified opt-out compiles.
+unsafe_code = "deny"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
