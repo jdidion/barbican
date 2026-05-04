@@ -97,6 +97,27 @@ To remove:
 ./barbican uninstall --dry-run
 ```
 
+## Wrappers (1.4.0+)
+
+Barbican 1.4.0 ships a second gate for interpreter invocations that Claude Code's hook pipeline can't see: **five classifier-gated wrapper binaries** that drop in for the interpreters they shadow.
+
+| Wrapper            | Shadows            | Override env var   |
+|--------------------|--------------------|--------------------|
+| `barbican-shell`   | `bash -c BODY`     | `BARBICAN_SHELL`   |
+| `barbican-python`  | `python3 -c BODY`  | `BARBICAN_PYTHON`  |
+| `barbican-node`    | `node -e BODY`     | `BARBICAN_NODE`    |
+| `barbican-ruby`    | `ruby -e BODY`     | `BARBICAN_RUBY`    |
+| `barbican-perl`    | `perl -e BODY`     | `BARBICAN_PERL`    |
+
+Each one:
+1. Parses `-c BODY` (or `-e BODY` for node/ruby/perl), looks up the same classifier rules as the `PreToolUse` hook, and exits 2 with the deny reason on disallowed shellouts.
+2. On allow, execs the underlying interpreter (overridable per-dialect via env var) and streams its stdout/stderr through a secret-token redactor — `<redacted:github-token>` etc. — so API keys that appear in logs don't survive to your terminal, the scrollback, or the audit log.
+3. Appends one JSONL line per invocation to `~/.claude/barbican/audit.log` (same file, same `0o600` mode as the main hook). The audit line includes the sha256 of the body, not the body itself.
+
+The wrappers install to `~/.claude/barbican/` next to the main binary. Use them as the allow-list target in any rule that can't route through `Bash(bash:*)` — for example, in a Claude Code `allow` entry or a CI runner that shells out with a fixed interpreter path.
+
+**Limits.** The classifier decides on the body *statically*. Runtime-dynamic constructs — variable indirection, `eval`, `exec`-to-another-shell — still execute in the child. The wrappers block every pattern the `pre_bash` hook blocks, and no more.
+
 ## Build from source
 
 ```sh

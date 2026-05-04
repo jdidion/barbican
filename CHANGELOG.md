@@ -2,6 +2,27 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-05-04
+
+First minor since 1.0: adds a classifier-gated wrapper family and a streaming secret-token redactor. The hook-based deny path still runs in every session; the wrappers are an *opt-in* second floor for tools (like Claude Code's `allow` list) that want to invoke a shell from a rule that can't route through `Bash(...)`.
+
+### Added
+
+- **Five wrapper binaries** — drop-in gates for `bash -c BODY`, `python3 -c BODY`, `node -e BODY`, `ruby -e BODY`, `perl -e BODY`. Each reuses the existing `pre_bash::classify_command` decision engine: allow → exec the real interpreter with the same body, propagating the child's exit code; deny → write the reason to stderr and exit 2. Binary names: `barbican-shell`, `barbican-python`, `barbican-node`, `barbican-ruby`, `barbican-perl`. All five ship in the release tarball and land in `~/.claude/barbican/` next to the main binary on `barbican install`. Override the underlying interpreter per dialect via `BARBICAN_SHELL` / `BARBICAN_PYTHON` / `BARBICAN_NODE` / `BARBICAN_RUBY` / `BARBICAN_PERL`.
+- **Secret-token redactor** (`src/redact.rs`) — post-processes the wrapper child's stdout/stderr through a prefix-anchored regex bank covering Anthropic API keys (`sk-ant-…`), OpenAI (`sk-proj-…`, `sk-…`), GitHub PATs (`ghp_…`, `github_pat_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…`), GitLab (`glpat-…`), AWS access keys (`AKIA…`, `ASIA…`), Slack (`xox[abprs]-…`), Atlassian (`ATATT3x…`), and JWTs (`eyJ…` three-segment). Every match is rewritten to `<redacted:<kind>>`. Line-scoped, streamed via two mpsc channels so the wrapper never buffers full command output in memory. Generic-entropy detection (AWS secret access keys, bare base64) is explicitly out of scope — the false-positive rate on git SHAs / UUIDs is too high for a safety tool. 24 unit tests, 15 integration tests.
+- **Wrapper audit log** — each wrapper invocation appends one JSONL record to `~/.claude/barbican/audit.log` (same file the main hook writes to, same `0o600` mode): `{"ts":"…","event":"wrapper","dialect":"shell","decision":"allow","body_sha256":"…","exit":0}`. The body text itself is NEVER persisted — only its sha256. Secrets that appear in inline `-c` bodies don't survive to the audit log.
+- **Classifier exposed in public API** — `barbican::hooks::pre_bash::{classify_command, Decision}` is now `pub` so the wrapper binaries (and any third-party Rust integration) can reuse the same rules the hook uses. No new behavior; the rules themselves are unchanged.
+
+### Changed
+
+- **Release workflow** builds `--bins` (was main-binary-only) and stages all five wrappers into each per-target tarball. Sigstore build-provenance attestation now covers the wrappers too.
+- **`barbican install`** copies each wrapper from `<main-binary-source-parent>/barbican-<lang>` into `~/.claude/barbican/`. Missing wrappers are logged + skipped (dev builds that ran `cargo build` without `--bins` still install cleanly).
+
+### Known limits
+
+- The shell classifier makes its allow/deny call on the BODY *statically*. The underlying interpreter still interprets runtime-dynamic constructs — shell variable indirection, `eval`, `exec`-into-another-shell — at its own runtime. The wrappers are a classifier-gated *front end*, not a sandbox; they stop every static shellout pattern the `pre_bash` hook stops, and no more.
+- Line-scoped redaction will miss a secret that spans a newline. Real secrets don't wrap lines in practice, but pipe-to-file followed by `base64 -w 64` could split a token. Acceptable cost-vs.-complexity trade for the streaming design.
+
 ## [1.3.8] — 2026-05-04
 
 Three new tree-sitter-bash Linux SIGSEGV classes closed in one cycle — and two assumptions from the 1.3.1 lane reversed. The preflight is now 8 lines with no tables.
