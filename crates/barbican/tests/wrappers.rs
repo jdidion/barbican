@@ -323,6 +323,64 @@ fn wrapper_survives_sigint_without_dying_at_130() {
     }
 }
 
+// ---- bounded memory on no-newline output (second crew review CRITICAL) ----
+//
+// After CRITICAL-C switched `split` → `read_until`, a child that
+// writes large amounts of data without newlines (tight printf loop,
+// binary blob) would grow the reader's intermediate buffer without
+// bound before any flush. The `mpsc::sync_channel(64)` bound only
+// limits the inter-thread queue depth, not the per-line buffer.
+// Pin the new MAX_LINE_BYTES cap by writing > 1 MiB without `\n`
+// and asserting the wrapper doesn't hang or OOM.
+
+#[test]
+fn shell_passes_non_utf8_bytes_through_without_corruption() {
+    // 1.4.0 second crew review (Gemini CRITICAL + gpt-5.2 WARNING):
+    // `from_utf8_lossy` replaced invalid bytes with U+FFFD, corrupting
+    // binary output. Switch to `regex::bytes` preserves arbitrary
+    // bytes. Pin with a command that emits a byte outside valid UTF-8.
+    //
+    // `printf '\xff'` emits 0xFF, which is never a valid UTF-8 lead.
+    // The wrapper must forward exactly one 0xFF byte.
+    use std::os::unix::process::ExitStatusExt;
+    let out = Command::new(bin_shell())
+        .arg("-c")
+        .arg(r"printf '\xff'")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("wrapper spawn");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = out.status.signal();
+    assert_eq!(
+        out.stdout, vec![0xFF],
+        "wrapper must forward 0xFF as-is, not corrupt to U+FFFD (3-byte EF BF BD); \
+         got: {:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn shell_caps_output_without_newlines_to_bounded_memory() {
+    // Child writes 2 MiB of 'a' with no newline — 2× the per-line
+    // cap. The wrapper must flush twice (at 1 MiB + at EOF) and
+    // forward the full 2 MiB, not hang or OOM.
+    let (exit, out, _err) = run_wrapper(
+        bin_shell(),
+        "-c",
+        r"yes a | tr -d '\n' | head -c 2097152",
+        &[],
+    );
+    assert_eq!(exit, 0, "wrapper must exit 0 on bounded-no-newline output");
+    assert_eq!(
+        out.len(),
+        2 * 1024 * 1024,
+        "wrapper must forward all 2 MiB without truncation; got {} bytes",
+        out.len()
+    );
+}
+
 // ---- newline preservation (CRITICAL-C from 1.4 crew review) ----
 //
 // `pipe_to_redacted_chunks` previously used `BufRead::split(b'\n')`

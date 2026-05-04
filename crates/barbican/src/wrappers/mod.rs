@@ -58,13 +58,13 @@
 //! new exfil target. Only the sha256 digest survives.
 
 use std::borrow::Cow;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use crate::hooks::pre_bash::{classify_command, Decision};
-use crate::redact::redact_secrets;
+use crate::redact::redact_secrets_bytes;
 
 /// Which interpreter this wrapper gates. Controls (a) which inline-
 /// code flag to pick out of argv, (b) how to synthesize the classifier
@@ -512,26 +512,59 @@ fn spawn_with_redaction(
 /// the caller unable to tell whether the last chunk was newline-
 /// terminated — a child that writes `printf 'x'` must see its output
 /// reach our stdout as exactly `x`, not `x\n`.
+/// Hard cap on bytes buffered before a forced flush. A child that
+/// writes without newlines (e.g. a long `printf` or tight binary
+/// loop) would otherwise grow `buf` unboundedly — the `sync_channel`
+/// bound only controls inter-thread queue depth, not intra-buffer
+/// growth. 1 MiB is generous for any realistic line and keeps a
+/// pathological child from blowing wrapper RSS.
+///
+/// 1.4.0 second crew review (gpt-5.2 CRITICAL): discovered as a
+/// regression of CRITICAL-C's `read_until` switch — the unbounded
+/// grow-until-newline loop was a new DoS vector.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 #[allow(clippy::needless_pass_by_value)] // must own `tx` so it drops at fn exit and closes the channel
 fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::SyncSender<Vec<u8>>) {
     let mut reader = BufReader::new(pipe);
     let mut buf = Vec::with_capacity(4096);
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            // EOF (Ok(0)) or I/O error: pipe closed, the forwarder
-            // sees the channel close when `tx` drops at fn exit.
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        // `read_until` preserves the delimiter if present; the final
-        // chunk before EOF may have no `\n`. Either way we forward
-        // the bytes verbatim (modulo redaction), so wrapper output
-        // is byte-identical to the child's output on the happy path.
-        let text = String::from_utf8_lossy(&buf);
-        let redacted = redact_secrets(&text);
-        if tx.send(redacted.as_bytes().to_vec()).is_err() {
-            break;
+        // Manual line-accumulate with a byte cap. We can't use
+        // `read_until(…, &mut buf)` directly because that will
+        // happily grow `buf` past `MAX_LINE_BYTES` if the child
+        // never emits a newline. Read one byte at a time; flush
+        // when we see `\n` OR when the cap is reached.
+        //
+        // The per-byte overhead is masked by `BufReader`'s internal
+        // 8KB buffer — we're really reading from the buffer, not the
+        // pipe, 99% of the time.
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                // EOF — flush any trailing partial line (no \n) and
+                // exit. The send may fail if the forwarder already
+                // disconnected; ignore.
+                if !buf.is_empty() {
+                    let redacted = redact_secrets_bytes(&buf);
+                    let _ = tx.send(redacted.into_owned());
+                }
+                break;
+            }
+            Ok(_) => {
+                buf.push(byte[0]);
+                let at_newline = byte[0] == b'\n';
+                let at_cap = buf.len() >= MAX_LINE_BYTES;
+                if at_newline || at_cap {
+                    let redacted = redact_secrets_bytes(&buf);
+                    if tx.send(redacted.into_owned()).is_err() {
+                        break;
+                    }
+                    buf.clear();
+                }
+            }
+            // I/O error — pipe broken. Let EOF on the reader thread's
+            // next iteration close the channel naturally.
+            Err(_) => break,
         }
     }
 }

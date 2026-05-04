@@ -38,6 +38,7 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
+use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 
 /// Kind of secret the redactor recognized. Surfaced in the
@@ -95,13 +96,10 @@ impl SecretKind {
 /// anthropic → openai ordering inside the alternation (anthropic's
 /// `sk-ant-` prefix is longer and wins on leftmost-longest). Changing
 /// the order changes tiebreaking, so don't.
-fn combined_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Order inside the alternation matters only when two patterns
-        // could match overlapping text; we've designed them to be
-        // disjoint, so order is just readability.
-        let pattern = concat!(
+/// The pattern source, factored out so both the string and
+/// byte-oriented regexes can share it.
+fn combined_pattern() -> &'static str {
+    concat!(
             // Anthropic: sk-ant-api03-…, sk-ant-admin01-…, and any
             // future sk-ant-<kind>NN- suffix shape. The trailing
             // identifier is URL-safe base64 (A-Z, a-z, 0-9, -, _).
@@ -135,9 +133,64 @@ fn combined_regex() -> &'static Regex {
             // Length floors are very conservative; real JWTs are
             // 100-2000+ bytes.
             r"|(?P<jwt>eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
-        );
-        Regex::new(pattern).expect("redact secret-pattern regex must compile")
+    )
+}
+
+fn combined_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(combined_pattern()).expect("redact secret-pattern regex must compile")
     })
+}
+
+fn combined_bytes_regex() -> &'static BytesRegex {
+    static RE: OnceLock<BytesRegex> = OnceLock::new();
+    RE.get_or_init(|| {
+        BytesRegex::new(combined_pattern())
+            .expect("redact secret-pattern bytes regex must compile")
+    })
+}
+
+/// Byte-oriented variant of [`redact_secrets`]. Scans raw bytes for
+/// the same ASCII-token patterns and replaces matches with
+/// `<redacted:<kind>>`. Used by the wrapper output path so non-UTF-8
+/// bytes (binary, partial codepoints at a buffer boundary) pass
+/// through unmodified — `from_utf8_lossy` + re-encode would corrupt
+/// them with `U+FFFD`.
+///
+/// 1.4.0 second crew review (Gemini CRITICAL + gpt-5.2 WARNING): the
+/// original `String::from_utf8_lossy` path corrupted binary output.
+#[must_use]
+pub fn redact_secrets_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let re = combined_bytes_regex();
+    if !re.is_match(bytes) {
+        return Cow::Borrowed(bytes);
+    }
+    Cow::Owned(
+        re.replace_all(bytes, |caps: &regex::bytes::Captures<'_>| {
+            let kind = if caps.name("anthropic").is_some() {
+                SecretKind::AnthropicApiKey
+            } else if caps.name("openai").is_some() {
+                SecretKind::OpenaiApiKey
+            } else if caps.name("github").is_some() {
+                SecretKind::GithubToken
+            } else if caps.name("gitlab").is_some() {
+                SecretKind::GitlabPat
+            } else if caps.name("aws").is_some() {
+                SecretKind::AwsAccessKey
+            } else if caps.name("slack").is_some() {
+                SecretKind::SlackToken
+            } else if caps.name("atlassian").is_some() {
+                SecretKind::AtlassianApiToken
+            } else if caps.name("jwt").is_some() {
+                SecretKind::Jwt
+            } else {
+                return b"<redacted:unknown>".to_vec();
+            };
+            format!("<redacted:{}>", kind.tag()).into_bytes()
+        })
+        .into_owned(),
+    )
 }
 
 /// Scan `s` for any recognized secret token and return a redacted
