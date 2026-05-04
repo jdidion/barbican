@@ -79,6 +79,7 @@ pub enum Dialect {
 impl Dialect {
     /// Binary name used as the wrapper command — for error messages
     /// and audit-log entries.
+    #[must_use]
     pub fn wrapper_name(self) -> &'static str {
         match self {
             Self::Shell => "barbican-shell",
@@ -92,6 +93,7 @@ impl Dialect {
     /// The `-c`/`-e` flag name the underlying interpreter uses. The
     /// wrapper accepts exactly this flag and hands BODY to the
     /// interpreter under the same flag.
+    #[must_use]
     pub fn inline_flag(self) -> &'static str {
         match self {
             // Every shell + python uses `-c`.
@@ -106,6 +108,7 @@ impl Dialect {
     /// `BARBICAN_RUBY`, `BARBICAN_PERL`. Respecting `$SHELL` for the
     /// shell dialect would make attack shapes depend on the caller's
     /// environment, so we don't do that.
+    #[must_use]
     pub fn default_interpreter(self) -> &'static str {
         match self {
             Self::Shell => "bash",
@@ -117,6 +120,7 @@ impl Dialect {
     }
 
     /// Env var whose value (if set) overrides the default interpreter.
+    #[must_use]
     pub fn interpreter_env_var(self) -> &'static str {
         match self {
             Self::Shell => "BARBICAN_SHELL",
@@ -155,8 +159,8 @@ const EXIT_DENY: i32 = 2;
 /// `inline_flag` (e.g. `-c` or `-e`); the immediately-following
 /// argument is BODY. Any args after BODY are passed through to the
 /// interpreter unchanged (`bash -c BODY -- $0 $1 …` positional form).
-pub fn run(dialect: Dialect, argv: Vec<String>) -> ! {
-    let (body, extra_args) = match parse_argv(&argv, dialect) {
+pub fn run(dialect: Dialect, argv: &[String]) -> ! {
+    let (body, extra_args) = match parse_argv(argv, dialect) {
         Ok(parts) => parts,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "{}: {e}", dialect.wrapper_name());
@@ -172,11 +176,7 @@ pub fn run(dialect: Dialect, argv: Vec<String>) -> ! {
     let body_sha256 = sha256_hex(body.as_bytes());
 
     if let Decision::Deny { reason } = decision {
-        let _ = writeln!(
-            std::io::stderr(),
-            "{}: {reason}",
-            dialect.wrapper_name(),
-        );
+        let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name(),);
         write_audit_entry(dialect, "deny", Some(&reason), &body_sha256, None);
         std::process::exit(EXIT_DENY);
     }
@@ -228,16 +228,14 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
 /// standard `'...'` + `\'` escape. The classifier's parser accepts
 /// any valid quoting; we don't need to be particularly clever here.
 fn synthesize_classifier_input(dialect: Dialect, body: &str) -> Cow<'_, str> {
-    match dialect {
-        Dialect::Shell => Cow::Borrowed(body),
-        _ => {
-            let interp = dialect.default_interpreter();
-            let flag = dialect.inline_flag();
-            // POSIX single-quote escape: ' -> '\''
-            let escaped = body.replace('\'', "'\\''");
-            Cow::Owned(format!("{interp} {flag} '{escaped}'"))
-        }
+    if matches!(dialect, Dialect::Shell) {
+        return Cow::Borrowed(body);
     }
+    let interp = dialect.default_interpreter();
+    let flag = dialect.inline_flag();
+    // POSIX single-quote escape: ' -> '\''
+    let escaped = body.replace('\'', "'\\''");
+    Cow::Owned(format!("{interp} {flag} '{escaped}'"))
 }
 
 fn resolve_interpreter(dialect: Dialect) -> String {
@@ -249,12 +247,7 @@ fn resolve_interpreter(dialect: Dialect) -> String {
 /// stderr. Every chunk is streamed through [`redact_secrets`] before
 /// being forwarded to our own stdout / stderr. Returns the child's
 /// exit code.
-fn spawn_with_redaction(
-    interpreter: &str,
-    flag: &str,
-    body: &str,
-    extra_args: &[String],
-) -> i32 {
+fn spawn_with_redaction(interpreter: &str, flag: &str, body: &str, extra_args: &[String]) -> i32 {
     let mut cmd = Command::new(interpreter);
     cmd.arg(flag).arg(body);
     for a in extra_args {
@@ -329,7 +322,7 @@ fn spawn_with_redaction(
 
     status.code().unwrap_or_else(|| {
         // Signal-killed; synthesize 128 + signal as shells do.
-        status.signal().map(|s| 128 + s).unwrap_or(1)
+        status.signal().map_or(1, |s| 128 + s)
     })
 }
 
@@ -337,6 +330,7 @@ fn spawn_with_redaction(
 /// line, and push the (possibly-rewritten) line onto `tx`. When the
 /// pipe reaches EOF the sender is dropped and the forwarder thread
 /// exits.
+#[allow(clippy::needless_pass_by_value)] // must own `tx` so it drops at fn exit and closes the channel
 fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::Sender<Vec<u8>>) {
     let reader = BufReader::new(pipe);
     for line in reader.split(b'\n') {
@@ -424,7 +418,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
-    for byte in digest.iter() {
+    for byte in &digest {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
@@ -475,11 +469,7 @@ mod tests {
 
     #[test]
     fn parse_argv_finds_space_separated_body() {
-        let argv = vec![
-            "barbican-shell".into(),
-            "-c".into(),
-            "ls -la".into(),
-        ];
+        let argv = vec!["barbican-shell".into(), "-c".into(), "ls -la".into()];
         let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
         assert_eq!(body, "ls -la");
         assert!(rest.is_empty());
@@ -551,7 +541,8 @@ mod tests {
         let h = sha256_hex(b"hello");
         assert_eq!(h.len(), 64);
         assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "got {h}"
         );
         // Known: sha256("hello").

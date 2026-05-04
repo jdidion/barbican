@@ -155,7 +155,7 @@ pub fn redact_secrets(s: &str) -> Cow<'_, str> {
             } else {
                 // Unreachable if the alternation is disjoint; bail to
                 // the whole-match replacement as a defensive fallback.
-                return format!("<redacted:unknown>");
+                return "<redacted:unknown>".to_string();
             };
             format!("<redacted:{}>", kind.tag())
         })
@@ -256,7 +256,11 @@ mod tests {
     fn redacts_slack_all_prefixes() {
         for prefix in ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"] {
             let k = format!("{prefix}abcdefghij1234567890");
-            assert_eq!(redact(&k), "<redacted:slack-token>", "prefix {prefix} missed");
+            assert_eq!(
+                redact(&k),
+                "<redacted:slack-token>",
+                "prefix {prefix} missed"
+            );
         }
     }
 

@@ -3,5 +3,5 @@
 
 fn main() -> ! {
     let argv: Vec<String> = std::env::args().collect();
-    barbican::wrappers::run(barbican::wrappers::Dialect::Ruby, argv);
+    barbican::wrappers::run(barbican::wrappers::Dialect::Ruby, &argv);
 }
