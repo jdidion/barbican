@@ -279,6 +279,19 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
             let rest: Vec<String> = iter.cloned().collect();
             return Ok((body.to_string(), rest));
         }
+        // 1.4.0 second crew review (Gemini WARNING-3): an arg before
+        // the inline flag is either dropped (old behavior — broke
+        // transparency) or passed through to the interpreter
+        // (dangerous — `bash --init-file /tmp/evil.sh -c BODY` would
+        // source an attacker-chosen init file before classified BODY
+        // runs). Deny-by-default: refuse unrecognized pre-flag tokens.
+        // The classifier cannot reason about pre-flag interpreter
+        // flags, so the safe default is to reject the invocation.
+        return Err(format!(
+            "unrecognized argument before {flag}: `{arg}`; the wrapper only \
+             accepts `[{flag} BODY] [ARGS…]` — use the underlying interpreter \
+             directly if you need its pre-BODY flags"
+        ));
     }
     Err(format!(
         "no {flag} BODY found in argv; usage: {} {flag} '<code>' [args…]",
@@ -336,6 +349,21 @@ fn resolve_interpreter(dialect: Dialect) -> String {
                     std::io::stderr(),
                     "{}: ${env_var}=`{v}` must be an absolute path; \
                      refusing to resolve via $PATH (1.4.0 crew review)",
+                    dialect.wrapper_name()
+                );
+                std::process::exit(EXIT_DENY);
+            }
+            // 1.4.0 second crew review (Claude SUG-2): `is_absolute`
+            // accepts `/usr/bin/../../tmp/evil/bash`. Reject any `..`
+            // component so a caller who manages to set an
+            // attacker-chosen env value can't escape via traversal.
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}: ${env_var}=`{v}` contains `..` path components; refusing",
                     dialect.wrapper_name()
                 );
                 std::process::exit(EXIT_DENY);

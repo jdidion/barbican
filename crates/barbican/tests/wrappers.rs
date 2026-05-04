@@ -146,7 +146,37 @@ fn shell_no_flag_prints_usage_and_exits_2() {
     let out = Command::new(bin_shell()).arg("ls").output().expect("spawn");
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("no -c BODY"), "stderr: {err}");
+    // 1.4.0 second crew review (Gemini WARNING-3): pre-flag args
+    // are now rejected rather than silently dropped. `ls` without a
+    // preceding `-c` / `-e` surfaces as an unrecognized-token error.
+    assert!(
+        err.contains("unrecognized argument before -c") || err.contains("no -c BODY"),
+        "stderr must explain why parse failed; got: {err}"
+    );
+}
+
+#[test]
+fn shell_rejects_init_file_smuggling_before_c() {
+    // `bash --init-file /tmp/evil.sh -c BODY` would source the init
+    // file BEFORE BODY runs, bypassing the classifier. The wrapper
+    // must reject this.
+    let out = Command::new(bin_shell())
+        .arg("--init-file")
+        .arg("/tmp/nope")
+        .arg("-c")
+        .arg("echo hi")
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "pre-flag `--init-file` must be rejected with exit 2"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unrecognized argument before -c"),
+        "stderr must explain the rejection; got: {err}"
+    );
 }
 
 // ---- audit log ----
