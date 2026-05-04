@@ -229,15 +229,8 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// match on the 3-byte prefix at a char boundary is a 4-byte
 /// codepoint in that row by construction.
 ///
-/// Known rows (add to `CRASHER_PREFIXES` as new ones surface):
-///
-/// | Row              | Prefix     | Block                    | CI run id     |
-/// |------------------|-----------:|--------------------------|---------------|
-/// | U+31840..U+3187F | `F0 B1 A1` | CJK Ext G                | 25264060820   |
-/// | U+31BC0..U+31BFF | `F0 B1 AF` | CJK Ext H                | 25284064905   |
-/// | U+31F80..U+31FBF | `F0 B1 BE` | CJK Ext H (different row)| 25299266828   |
-///
-/// Both rows were bisected via the per-probe classifier sweep in
+/// The row table lives in [`crate::tables::PARSER_CRASHER_PREFIXES`];
+/// each entry was bisected via the per-probe classifier sweep in
 /// `tests/linux_crash_bisect.rs::aaa_classifier_probes`. The sweep
 /// ran one subprocess per candidate so a single SIGSEGV couldn't
 /// kill the whole test binary; each row matched exactly one probe
@@ -254,18 +247,6 @@ pub fn parse(input: &str) -> Result<Script, ParseError> {
 /// table grows past a handful of rows we escalate to a fork-based
 /// signal-catching wrapper.
 fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
-    // First 3 bytes of each crashing codepoint row. Order doesn't
-    // matter — scan returns on the first match.
-    const CRASHER_PREFIXES: &[[u8; 3]] = &[
-        // U+31840..U+3187F — CJK Ext G (1.3.1).
-        [0xF0, 0xB1, 0xA1],
-        // U+31BC0..U+31BFF — CJK Ext H (1.3.3).
-        [0xF0, 0xB1, 0xAF],
-        // U+31F80..U+31FBF — CJK Ext H (1.3.4). Different row within
-        // the same block as 1.3.3; bisect confirmed it's a separate
-        // crash state (CI run 25299266828).
-        [0xF0, 0xB1, 0xBE],
-    ];
     let bytes = input.as_bytes();
     if bytes.len() < 5 {
         return Ok(());
@@ -275,7 +256,10 @@ fn preflight_known_crashers(input: &str) -> Result<(), ParseError> {
             continue;
         }
         let window = &bytes[i + 1..i + 4];
-        if CRASHER_PREFIXES.iter().any(|p| window == p.as_slice()) {
+        if crate::tables::PARSER_CRASHER_PREFIXES
+            .iter()
+            .any(|p| window == p.as_slice())
+        {
             return Err(ParseError::Malformed);
         }
     }

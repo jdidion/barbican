@@ -15,9 +15,7 @@
 //! `cargo-fuzz` crate under `crates/barbican/fuzz/`. See
 //! `docs/fuzzing.md` for the full story.
 
-#[cfg(not(target_os = "linux"))]
 use std::io::Write;
-#[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use barbican::__fuzz::path_in_attacker_writable_dir;
@@ -29,27 +27,26 @@ use barbican::parser::{parse, ParseError};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------
-// Invariant 1 — parser::parse
+// Invariant 1 — parser::parse (in-process)
 // ---------------------------------------------------------------------
 
-// These parser-touching properties are Linux-gated. tree-sitter-bash
-// on Ubuntu SIGSEGVs on arbitrary UTF-8 proptest input across many
-// distinct crash classes. Known classes, all preflight-denied by
-// `parser::preflight_known_crashers`:
+// Invariant 1 and 2 are Linux-gated because they drive the tree-sitter-
+// bash FFI in-process. tree-sitter-bash on Ubuntu has exhibited
+// multiple distinct SIGSEGV classes on arbitrary UTF-8 proptest input;
+// known classes, all preflight-denied by `parser::preflight_known_crashers`:
 //
 //   1. `{` + U+31840..U+3187F row (CJK Ext G) — pinned 1.3.1.
 //   2. `{` + U+31BC0..U+31BFF row (CJK Ext H) — pinned 1.3.3.
 //   3. `{` + U+31F80..U+31FBF row (CJK Ext H, different row) —
 //      pinned 1.3.4.
 //
-// UNRESOLVED class (1.3.4): CI run for the 1.3.4 preflight widening
-// captured a 198-byte input (`tests/data/linux_crash_04.bin`) that
-// SIGSEGVs on Linux WITHOUT containing any `{` character. The shape
-// is different from classes 1-3; the per-probe classifier sweep has
-// new candidates pinned but the crash trigger is not yet identified.
-// Gates stay in place until class 4 is bisected and added to
-// `CRASHER_PREFIXES` (or a fork-based signal-catching wrapper
-// replaces the prefix table entirely).
+// An additional non-deterministic class (captured as
+// `tests/data/linux_crash_04.bin`) surfaced during the 1.3.4 lane:
+// 198 bytes, no `{` character, NOT reproducible as a single forked-
+// subprocess input but crashes the in-process proptest runner after
+// state accumulation across many inputs. 1.3.5 resolves this by
+// relying on the per-case subprocess isolation that Invariant 3 uses
+// (see below) rather than chasing state accumulation across classes.
 //
 // Upstream: https://github.com/tree-sitter/tree-sitter-bash/issues/337
 #[cfg(not(target_os = "linux"))]
@@ -127,7 +124,12 @@ proptest! {
 /// Run `barbican pre-bash` with `stdin_bytes` on stdin; return the
 /// exit code and how long the call took. A `None` exit code indicates
 /// the process was terminated by signal (we assert that never happens).
-#[cfg(not(target_os = "linux"))]
+///
+/// This property runs on Linux too — each invocation is a fresh
+/// subprocess, so tree-sitter-bash's in-process state-accumulation
+/// crash class (captured as `linux_crash_04.bin`) cannot fire here.
+/// Deterministic single-input crashers from classes 1-3 are all
+/// preflight-denied before the FFI is touched.
 fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     let bin = env!("CARGO_BIN_EXE_barbican");
     let start = std::time::Instant::now();
@@ -147,7 +149,6 @@ fn run_pre_bash(stdin_bytes: &[u8]) -> (Option<i32>, std::time::Duration) {
     (status.code(), start.elapsed())
 }
 
-#[cfg(not(target_os = "linux"))]
 proptest! {
     // Shell-out strategies keep the per-test budget narrow so the
     // aggregate `cargo test` runtime stays reasonable. 32 cases per
