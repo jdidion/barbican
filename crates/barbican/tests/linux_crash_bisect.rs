@@ -477,6 +477,27 @@ fn aaa_classifier_probes() {
             "crash04_prefix_0195",
             include_bytes!("data/probe-crash04_prefix_0195.bin"),
         ),
+        // 1.3.6 lane: probe the last 4 bytes of linux_crash_04.bin
+        // that the earlier sweep missed. `probe-crash04_prefix_0195`
+        // was actually 194 bytes (UTF-8 char-boundary truncation);
+        // the full input is 198 bytes. These probes test 197 bytes
+        // (before the trailing `?`) and 198 bytes (full) as single
+        // forked subprocesses. If the full file crashes as a
+        // single-subprocess input, the crash IS deterministic from
+        // this capture — our earlier "state accumulation" hypothesis
+        // was wrong and we just hadn't probed the full input.
+        (
+            "crash04_prefix_0197",
+            include_bytes!("data/probe-crash04_prefix_0197.bin"),
+        ),
+        (
+            "crash04_prefix_0198",
+            include_bytes!("data/probe-crash04_prefix_0198.bin"),
+        ),
+        (
+            "crash04_full",
+            include_bytes!("data/probe-crash04_full.bin"),
+        ),
     ];
     let bin = env!("CARGO_BIN_EXE_barbican");
     for (name, bytes) in probes {
