@@ -255,7 +255,7 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let final_url = resp.url().to_string();
+        let final_url = redact_url_credentials(resp.url());
 
         // Stream the body with a cap. Reading up to `max_bytes + 1`
         // lets us flag truncation without buffering the tail.
@@ -275,6 +275,27 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
             sanitizer_notes: notes,
         });
     }
+}
+
+/// Return the URL as a string, with userinfo (username / password) and
+/// fragment stripped. `final_url` is surfaced to the model inside the
+/// `<untrusted-content source="...">` wrapper; if a caller passed a URL
+/// like `https://user:pass@host/path` or appended `#token=...`, echoing
+/// it back to the model would leak the secret. Query parameters are
+/// preserved — they're part of the URL identity and often carry
+/// non-secret values the model may legitimately want to see.
+///
+/// 1.3.7 adversarial review (gpt-5.2 SUGGESTION, gemini-3.1-pro
+/// informational).
+fn redact_url_credentials(url: &url::Url) -> String {
+    let mut cloned = url.clone();
+    // Username / password. `set_username("")` / `set_password(None)`
+    // may Err on URLs that "can't have a base"; for http/https we've
+    // already validated the scheme, so the ignore is safe.
+    let _ = cloned.set_username("");
+    let _ = cloned.set_password(None);
+    cloned.set_fragment(None);
+    cloned.to_string()
 }
 
 async fn read_capped(resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, FetchError> {
@@ -614,6 +635,30 @@ mod tests {
             s.contains(OPAQUE_FETCH_ERROR),
             "error body must be the opaque message; got: {s}"
         );
+    }
+
+    /// 1.3.7 adversarial review (gpt-5.2 SUGGESTION): the `final_url`
+    /// we echo back to the model must strip userinfo and fragment so
+    /// an attacker who tricks the caller into passing
+    /// `https://user:pass@host/path#token=xyz` can't get the
+    /// credentials laundered back through the `<untrusted-content
+    /// source="...">` wrapper.
+    #[test]
+    fn redact_url_credentials_strips_userinfo_and_fragment() {
+        let u = url::Url::parse("https://alice:s3cret@example.com/p?q=1#tok=abc").unwrap();
+        let out = redact_url_credentials(&u);
+        assert!(!out.contains("alice"), "username must be stripped: {out}");
+        assert!(!out.contains("s3cret"), "password must be stripped: {out}");
+        assert!(!out.contains("tok=abc"), "fragment must be stripped: {out}");
+        assert!(out.contains("q=1"), "query must be preserved: {out}");
+        assert!(out.contains("example.com"), "host must be preserved: {out}");
+    }
+
+    #[test]
+    fn redact_url_credentials_no_op_on_plain_url() {
+        let u = url::Url::parse("https://example.com/p?q=1").unwrap();
+        let out = redact_url_credentials(&u);
+        assert_eq!(out, "https://example.com/p?q=1");
     }
 
     // --- Regression test for 1.2.1 MEDIUM: DNS-reachability side channel ---
