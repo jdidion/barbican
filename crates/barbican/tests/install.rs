@@ -825,6 +825,44 @@ fn install_copies_wrapper_binaries_when_present_next_to_source() {
 }
 
 #[test]
+fn install_refuses_symlinked_wrapper_source() {
+    // 1.4.0 adversarial review (Claude CRITICAL-3): if an attacker
+    // can plant `target/release/barbican-shell` as a symlink to
+    // `/etc/shadow`, `fs::read(src)` would follow the link, read the
+    // target, and copy its contents into `~/.claude/barbican/barbican-shell`
+    // at mode 0o755. The installer must refuse.
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    let src_parent = o.binary_source.parent().unwrap();
+
+    // Plant a "secret" the attacker wants to exfiltrate.
+    let secret = src_parent.join("secret-contents");
+    fs::write(&secret, b"super-secret-contents").unwrap();
+
+    // Plant barbican-shell as a symlink to that secret.
+    std::os::unix::fs::symlink(&secret, src_parent.join("barbican-shell"))
+        .expect("symlink plant");
+
+    // Install must fail, AND the destination wrapper must not exist
+    // (we cannot check the secret's contents weren't copied — because
+    // the install failed — but we can pin that no wrapper landed).
+    let err = installer::install(&o).expect_err(
+        "install must refuse a symlinked wrapper source",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("symlink") || msg.contains("symlinked"),
+        "error must mention the symlink refusal; got: {msg}"
+    );
+
+    let dst = home.join("barbican").join("barbican-shell");
+    assert!(
+        !dst.exists(),
+        "symlinked wrapper source must not produce an installed wrapper"
+    );
+}
+
+#[test]
 fn install_succeeds_when_wrapper_binaries_are_absent() {
     let (_dir, home) = fake_home();
     let o = opts(&home);

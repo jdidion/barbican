@@ -270,6 +270,17 @@ pub(crate) const WRAPPER_BINARIES: &[&str] = &[
 /// `barbican_dir`. Missing wrappers are logged + skipped (not fatal)
 /// so a dev-build install that only built the main binary still
 /// succeeds.
+///
+/// 1.4.0 adversarial review (Claude CRITICAL-3): `fs::read` follows
+/// symlinks at the source. `copy_binary`'s destination-side
+/// O_NOFOLLOW + atomic-rename closes the write side, but a
+/// pre-planted `target/release/barbican-shell → /etc/shadow` symlink
+/// would be read and the target file would be copied into
+/// `~/.claude/barbican/barbican-shell`. `current_exe()`'s directory
+/// is trusted for a packaged install but not for a dev build where
+/// `target/release/` may be writable by other tooling. Check with
+/// `symlink_metadata` and refuse any source that is itself a
+/// symlink.
 fn copy_wrapper_binaries(main_binary_src: &Path, barbican_dir: &Path) -> Result<()> {
     let Some(src_parent) = main_binary_src.parent() else {
         return Ok(());
@@ -277,14 +288,35 @@ fn copy_wrapper_binaries(main_binary_src: &Path, barbican_dir: &Path) -> Result<
     for name in WRAPPER_BINARIES {
         let src = src_parent.join(name);
         let dst = barbican_dir.join(name);
-        if src.exists() {
-            copy_binary(&src, &dst)?;
-        } else {
-            log(&format!(
-                "wrapper {name} not present at {} — skipping \
-                 (dev build without `cargo build --bins`?)",
-                src.display()
-            ));
+        match fs::symlink_metadata(&src) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "wrapper source `{}` is a symlink; refusing to install (1.4.0 \
+                     adversarial review CRITICAL-3 — a symlinked wrapper source \
+                     would redirect `fs::read` to an attacker-controlled target)",
+                    src.display()
+                );
+            }
+            Ok(meta) if meta.file_type().is_file() => {
+                copy_binary(&src, &dst)?;
+            }
+            Ok(_) => {
+                // Not a regular file and not a symlink (directory,
+                // socket, etc.) — refuse, don't try to read.
+                anyhow::bail!(
+                    "wrapper source `{}` exists but is not a regular file; \
+                     refusing to install",
+                    src.display()
+                );
+            }
+            Err(_) => {
+                // Source doesn't exist — dev build without --bins.
+                log(&format!(
+                    "wrapper {name} not present at {} — skipping \
+                     (dev build without `cargo build --bins`?)",
+                    src.display()
+                ));
+            }
         }
     }
     Ok(())
