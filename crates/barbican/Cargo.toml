@@ -41,6 +41,10 @@ rmcp = { version = "1.5", default-features = false, features = ["server", "macro
 schemars = { version = "1.0", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+# Used by the 1.4.0 wrapper binaries to fingerprint `-c BODY` contents
+# for audit-log entries without storing the body text (which may carry
+# secrets). `sha2` is a pure-Rust implementation; no C toolchain dep.
+sha2 = "0.10"
 # Tokio was already pulled in by rmcp; add `net` so we can bind local
 # TcpListeners in integration tests and safe_fetch.
 tokio = { version = "1.47", default-features = false, features = ["macros", "net", "rt", "io-std", "io-util", "time", "sync"] }

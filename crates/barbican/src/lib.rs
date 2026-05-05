@@ -3,15 +3,18 @@
 //! Public so integration tests and the `barbican` binary can share
 //! implementations.
 
+pub mod audit_io;
 pub mod cmd;
 pub mod hooks;
 pub mod installer;
 pub mod mcp;
 pub mod net;
 pub mod parser;
+pub mod redact;
 pub mod sanitize;
 pub mod scan;
 pub mod tables;
+pub mod wrappers;
 
 /// Internal, unstable surface exposed only so the 1.3.0 fuzzing
 /// infrastructure (proptest properties in `tests/fuzz_properties.rs`

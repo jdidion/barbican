@@ -2,6 +2,53 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-05-04
+
+First minor since 1.0: adds a classifier-gated wrapper family and a streaming secret-token redactor. The hook-based deny path still runs in every session; the wrappers are an *opt-in* second floor for tools (like Claude Code's `allow` list) that want to invoke a shell from a rule that can't route through `Bash(...)`.
+
+Shipped after a full three-provider adversarial crew review (Claude Opus + GPT-5.2 + Gemini-3.1-pro, deep mode). Five CRITICAL and five WARNING findings were fixed in-place before the release tag.
+
+### Fixed (1.4.0 crew-review findings)
+
+- **CRITICAL-A** — Wrapper audit writer re-opened the 1.3.7 gemini CRITICAL-1 symlink-ancestor TOCTOU + the 1.2.0 HIGH-1 symlink-parent hole + missed L1 ANSI stripping. Hoisted `append_jsonl_line`, `ancestor_chain_has_symlink`, `o_nofollow`, `sanitize_field`, `audit_log_path`, `iso8601_utc_now` into new `crate::audit_io`; both hook and wrapper audit writers now delegate there. Red test pinning the ancestor-symlink refusal at the wrapper level. Reviewers: Claude + GPT-5.2 agreement.
+- **CRITICAL-B** — Flag-smuggling past the static classifier. `node -e BODY -e OTHER`, `perl -e BODY -e OTHER`, and `ruby -e BODY -e OTHER` all re-parse the second script; the wrapper passed `extra_args` verbatim. Insert a literal `--` between BODY and extra_args for node/ruby/perl (bash/python don't need it — verified shell-side). Red tests per dialect. Reviewers: Claude (shell-verified single-source).
+- **CRITICAL-C** — Output-newline corruption. `pipe_to_redacted_chunks` used `BufRead::split(b'\n')` and unconditionally appended `\n`, so `printf 'x'` emitted `x\n`. Swapped to `read_until(b'\n', …)`; bytes now match the child exactly. Reviewers: all three (one CRITICAL, two WARNING).
+- **CRITICAL-D** — Docstring claimed "wrapper ignores SIGINT" but no handler was wired. Now installs `SIG_IGN` for SIGINT/SIGTERM/SIGHUP pre-spawn + resets to `SIG_DFL` in the child via `pre_exec`. Workspace `unsafe_code` lint downgraded from `forbid` to `deny` for the three narrow opt-outs (with rationale + SAFETY comments). Reviewers: all three.
+- **CRITICAL-E** — Installer followed symlinks at wrapper source paths. `fs::read(src)` followed a planted `target/release/barbican-shell → /etc/shadow` symlink and would have copied the target into the install dir at mode 0o755. Now `symlink_metadata` checks each wrapper source and refuses symlinked sources. Red test: `install_refuses_symlinked_wrapper_source`. Reviewers: Claude (single-source, same shape as 1.2.0 GPT HIGH-16).
+- **WARNING-1** — Atlassian redactor regex required uppercase hex CRC; real tokens use lowercase. Widened to `[A-Fa-f0-9]{8}`. Reviewer: Claude.
+- **WARNING-2** — Bundled shell options (`bash -ce 'cmd'`) misparsed as `-cBODY=e`. `parse_argv` now recognizes bundled-letter short-option runs containing `c` (shell only) and consumes the next arg as BODY. Reviewer: gpt-5.2.
+- **WARNING-3** — Unbounded `mpsc::channel` on the wrapper's output path allowed memory growth under a fast-writing child. Switched to `mpsc::sync_channel(64)` — ~512KB per stream hard cap with natural backpressure. Reviewer: gpt-5.2.
+- **WARNING-4** — `$BARBICAN_SHELL` et al. env overrides could be bare basenames and resolve via `$PATH`. Now required to be absolute paths; non-absolute is rejected with exit 2. Unset-env-var default path documented as out-of-scope in SECURITY.md. Reviewer: Claude.
+- **WARNING-5** — Documented the redactor regex's deliberate over-matching tradeoff (prefix-anchored without word boundaries; over-redaction > under-redaction for a secret scanner). Reviewer: Claude.
+
+### Fixed (1.4.0 second crew-review pass)
+
+After the first-pass fixes landed, a second three-provider pass (Claude + GPT-5.2 + Gemini-3.1-pro) found three more release-blockers and two must-fix warnings:
+
+- **Bounded per-line buffer** — `pipe_to_redacted_chunks` used `read_until(b'\n', …)` which grew its buffer without bound on children that emit without newlines. The `mpsc::sync_channel(64)` bound only covered inter-thread queue depth. Added a `MAX_LINE_BYTES = 1 MiB` cap with byte-at-a-time fill and mid-line flush. Red test: `shell_caps_output_without_newlines_to_bounded_memory`. Reviewer: GPT-5.2 CRITICAL.
+- **Byte-oriented redactor for the wrapper output path** — `String::from_utf8_lossy` corrupted non-UTF-8 child output (binary piped through the wrapper, partial codepoints at a flush boundary) with `U+FFFD`. New `redact::redact_secrets_bytes` uses `regex::bytes` and forwards raw bytes unchanged on the no-match hot path. Red test: `shell_passes_non_utf8_bytes_through_without_corruption`. Reviewers: Gemini CRITICAL + GPT-5.2 WARNING.
+- **Installer source-side TOCTOU** — `copy_binary`'s `fs::read(src)` followed symlinks; the new `copy_wrapper_binaries` `symlink_metadata` pre-check had a race window between probe and read. Opened source with `O_NOFOLLOW` via `OpenOptions::custom_flags` so any symlinked source path fails at the syscall level. Reviewer: Gemini CRITICAL.
+- **Pre-flag argument rejection** — args before the inline flag (`barbican-shell --init-file /tmp/x -c BODY`) were silently dropped, which broke transparency and would have re-opened a classifier-bypass path if the wrapper ever decided to forward them. Now rejected with exit 2 and a clear error. Red test: `shell_rejects_init_file_smuggling_before_c`. Reviewer: Gemini WARNING.
+- **`..` path-traversal in `$BARBICAN_*` env overrides** — `is_absolute()` accepted `/usr/bin/../../tmp/evil/bash`. Added `ParentDir` component rejection. Reviewer: Claude SUG (escalated from first pass's WARNING-4).
+- **Clippy + version-string drift** — first-pass test didn't run `-D warnings`; the CI-matching clippy caught a dead `BufRead` import (left over from the `read_until` → manual byte-read switch) and a spurious trailing comma. README status line and Cargo.toml version both pinned to 1.3.8 while the CHANGELOG claimed 1.4.0. Reviewer: Claude.
+
+### Added
+
+- **Five wrapper binaries** — drop-in gates for `bash -c BODY`, `python3 -c BODY`, `node -e BODY`, `ruby -e BODY`, `perl -e BODY`. Each reuses the existing `pre_bash::classify_command` decision engine: allow → exec the real interpreter with the same body, propagating the child's exit code; deny → write the reason to stderr and exit 2. Binary names: `barbican-shell`, `barbican-python`, `barbican-node`, `barbican-ruby`, `barbican-perl`. All five ship in the release tarball and land in `~/.claude/barbican/` next to the main binary on `barbican install`. Override the underlying interpreter per dialect via `BARBICAN_SHELL` / `BARBICAN_PYTHON` / `BARBICAN_NODE` / `BARBICAN_RUBY` / `BARBICAN_PERL`.
+- **Secret-token redactor** (`src/redact.rs`) — post-processes the wrapper child's stdout/stderr through a prefix-anchored regex bank covering Anthropic API keys (`sk-ant-…`), OpenAI (`sk-proj-…`, `sk-…`), GitHub PATs (`ghp_…`, `github_pat_…`, `gho_…`, `ghu_…`, `ghs_…`, `ghr_…`), GitLab (`glpat-…`), AWS access keys (`AKIA…`, `ASIA…`), Slack (`xox[abprs]-…`), Atlassian (`ATATT3x…`), and JWTs (`eyJ…` three-segment). Every match is rewritten to `<redacted:<kind>>`. Line-scoped, streamed via two mpsc channels so the wrapper never buffers full command output in memory. Generic-entropy detection (AWS secret access keys, bare base64) is explicitly out of scope — the false-positive rate on git SHAs / UUIDs is too high for a safety tool. 24 unit tests, 15 integration tests.
+- **Wrapper audit log** — each wrapper invocation appends one JSONL record to `~/.claude/barbican/audit.log` (same file the main hook writes to, same `0o600` mode): `{"ts":"…","event":"wrapper","dialect":"shell","decision":"allow","body_sha256":"…","exit":0}`. The body text itself is NEVER persisted — only its sha256. Secrets that appear in inline `-c` bodies don't survive to the audit log.
+- **Classifier exposed in public API** — `barbican::hooks::pre_bash::{classify_command, Decision}` is now `pub` so the wrapper binaries (and any third-party Rust integration) can reuse the same rules the hook uses. No new behavior; the rules themselves are unchanged.
+
+### Changed
+
+- **Release workflow** builds `--bins` (was main-binary-only) and stages all five wrappers into each per-target tarball. Sigstore build-provenance attestation now covers the wrappers too.
+- **`barbican install`** copies each wrapper from `<main-binary-source-parent>/barbican-<lang>` into `~/.claude/barbican/`. Missing wrappers are logged + skipped (dev builds that ran `cargo build` without `--bins` still install cleanly).
+
+### Known limits
+
+- The shell classifier makes its allow/deny call on the BODY *statically*. The underlying interpreter still interprets runtime-dynamic constructs — shell variable indirection, `eval`, `exec`-into-another-shell — at its own runtime. The wrappers are a classifier-gated *front end*, not a sandbox; they stop every static shellout pattern the `pre_bash` hook stops, and no more.
+- Line-scoped redaction will miss a secret that spans a newline. Real secrets don't wrap lines in practice, but pipe-to-file followed by `base64 -w 64` could split a token. Acceptable cost-vs.-complexity trade for the streaming design.
+
 ## [1.3.8] — 2026-05-04
 
 Three new tree-sitter-bash Linux SIGSEGV classes closed in one cycle — and two assumptions from the 1.3.1 lane reversed. The preflight is now 8 lines with no tables.

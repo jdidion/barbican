@@ -117,10 +117,21 @@ pub fn install(opts: &InstallOptions) -> Result<()> {
             opts.binary_source.display(),
             installed_binary.display()
         ));
+        for wrapper_name in WRAPPER_BINARIES {
+            let wrapper_dst = barbican_dir.join(wrapper_name);
+            log(&format!(
+                "would copy wrapper -> {} (if present next to source)",
+                wrapper_dst.display()
+            ));
+        }
     } else {
         fs::create_dir_all(&barbican_dir)
             .with_context(|| format!("create {}", barbican_dir.display()))?;
         copy_binary(&opts.binary_source, &installed_binary)?;
+        // 1.4.0 wrapper binaries — copied alongside the main binary
+        // when present. Release tarballs always include them; a
+        // development `cargo install` may not (we log + skip).
+        copy_wrapper_binaries(&opts.binary_source, &barbican_dir)?;
     }
 
     let settings_path = opts.claude_home.join("settings.json");
@@ -234,11 +245,114 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     // binary on the next install. Route binary staging through the
     // same O_NOFOLLOW + O_EXCL + fsync + rename discipline the JSON
     // writers use; set mode 0o755 on open rather than chmod-after.
-    let bytes = fs::read(src).with_context(|| format!("read source binary {}", src.display()))?;
+    //
+    // 1.4.0 second crew review (Gemini CRITICAL): the *source* side
+    // was vulnerable to a TOCTOU between the caller's `symlink_metadata`
+    // check and the read. Open the source with `O_NOFOLLOW` directly —
+    // a symlink at the source path fails the open with ELOOP, no
+    // separate check required.
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(o_nofollow_source())
+        .open(src)
+        .with_context(|| format!("open source binary {}", src.display()))?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .with_context(|| format!("read source binary {}", src.display()))?;
     let tmp = tmp_path(dst);
     write_bytes_atomic_with_mode(&tmp, dst, &bytes, 0o755)
         .with_context(|| format!("install binary to {}", dst.display()))?;
     log(&format!("installed binary to {}", dst.display()));
+    Ok(())
+}
+
+/// POSIX `O_NOFOLLOW` flag for the installer's source-open path.
+/// Shares the per-OS values with `audit_io::o_nofollow` but doesn't
+/// re-use it so the installer doesn't take a dependency on an
+/// unrelated module's internal constant.
+const fn o_nofollow_source() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        0x0100
+    }
+    #[cfg(target_os = "linux")]
+    {
+        0x20000
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+/// 1.4.0 wrapper binaries that ship alongside `barbican`. The installer
+/// copies each one into `~/.claude/barbican/` (next to the main binary)
+/// when the source file is present next to the main binary's source
+/// path. Release tarballs always include them; a development `cargo
+/// install` without `--bin` may not.
+pub(crate) const WRAPPER_BINARIES: &[&str] = &[
+    "barbican-shell",
+    "barbican-python",
+    "barbican-node",
+    "barbican-ruby",
+    "barbican-perl",
+];
+
+/// Copy each wrapper binary that sits next to `main_binary_src` into
+/// `barbican_dir`. Missing wrappers are logged + skipped (not fatal)
+/// so a dev-build install that only built the main binary still
+/// succeeds.
+///
+/// 1.4.0 adversarial review (Claude CRITICAL-3): `fs::read` follows
+/// symlinks at the source. `copy_binary`'s destination-side
+/// O_NOFOLLOW + atomic-rename closes the write side, but a
+/// pre-planted `target/release/barbican-shell → /etc/shadow` symlink
+/// would be read and the target file would be copied into
+/// `~/.claude/barbican/barbican-shell`. `current_exe()`'s directory
+/// is trusted for a packaged install but not for a dev build where
+/// `target/release/` may be writable by other tooling. Check with
+/// `symlink_metadata` and refuse any source that is itself a
+/// symlink.
+fn copy_wrapper_binaries(main_binary_src: &Path, barbican_dir: &Path) -> Result<()> {
+    let Some(src_parent) = main_binary_src.parent() else {
+        return Ok(());
+    };
+    for name in WRAPPER_BINARIES {
+        let src = src_parent.join(name);
+        let dst = barbican_dir.join(name);
+        match fs::symlink_metadata(&src) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "wrapper source `{}` is a symlink; refusing to install (1.4.0 \
+                     adversarial review CRITICAL-3 — a symlinked wrapper source \
+                     would redirect `fs::read` to an attacker-controlled target)",
+                    src.display()
+                );
+            }
+            Ok(meta) if meta.file_type().is_file() => {
+                copy_binary(&src, &dst)?;
+            }
+            Ok(_) => {
+                // Not a regular file and not a symlink (directory,
+                // socket, etc.) — refuse, don't try to read.
+                anyhow::bail!(
+                    "wrapper source `{}` exists but is not a regular file; \
+                     refusing to install",
+                    src.display()
+                );
+            }
+            Err(_) => {
+                // Source doesn't exist — dev build without --bins.
+                log(&format!(
+                    "wrapper {name} not present at {} — skipping \
+                     (dev build without `cargo build --bins`?)",
+                    src.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

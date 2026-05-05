@@ -776,3 +776,104 @@ fn install_refuses_to_follow_binary_dst_symlink() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 1.4.0 wrapper binaries — `barbican install` copies each wrapper
+// (barbican-shell/python/node/ruby/perl) that sits next to the main
+// binary into ~/.claude/barbican/. Missing wrappers are skipped.
+// ---------------------------------------------------------------------
+
+const WRAPPER_NAMES: &[&str] = &[
+    "barbican-shell",
+    "barbican-python",
+    "barbican-node",
+    "barbican-ruby",
+    "barbican-perl",
+];
+
+#[test]
+fn install_copies_wrapper_binaries_when_present_next_to_source() {
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    // Drop a fake wrapper binary next to the main binary source — the
+    // installer looks for `<bin-src-parent>/barbican-<lang>`.
+    let src_parent = o.binary_source.parent().unwrap();
+    for name in WRAPPER_NAMES {
+        let p = src_parent.join(name);
+        fs::write(&p, format!("#!/bin/sh\necho {name}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&p, perms).unwrap();
+        }
+    }
+
+    installer::install(&o).expect("install");
+
+    for name in WRAPPER_NAMES {
+        let dst = home.join("barbican").join(name);
+        assert!(dst.is_file(), "wrapper {name} should be copied to {dst:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "wrapper {name} should be 0o755, got {mode:o}");
+        }
+    }
+}
+
+#[test]
+fn install_refuses_symlinked_wrapper_source() {
+    // 1.4.0 adversarial review (Claude CRITICAL-3): if an attacker
+    // can plant `target/release/barbican-shell` as a symlink to
+    // `/etc/shadow`, `fs::read(src)` would follow the link, read the
+    // target, and copy its contents into `~/.claude/barbican/barbican-shell`
+    // at mode 0o755. The installer must refuse.
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    let src_parent = o.binary_source.parent().unwrap();
+
+    // Plant a "secret" the attacker wants to exfiltrate.
+    let secret = src_parent.join("secret-contents");
+    fs::write(&secret, b"super-secret-contents").unwrap();
+
+    // Plant barbican-shell as a symlink to that secret.
+    std::os::unix::fs::symlink(&secret, src_parent.join("barbican-shell")).expect("symlink plant");
+
+    // Install must fail, AND the destination wrapper must not exist
+    // (we cannot check the secret's contents weren't copied — because
+    // the install failed — but we can pin that no wrapper landed).
+    let err = installer::install(&o).expect_err("install must refuse a symlinked wrapper source");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("symlink") || msg.contains("symlinked"),
+        "error must mention the symlink refusal; got: {msg}"
+    );
+
+    let dst = home.join("barbican").join("barbican-shell");
+    assert!(
+        !dst.exists(),
+        "symlinked wrapper source must not produce an installed wrapper"
+    );
+}
+
+#[test]
+fn install_succeeds_when_wrapper_binaries_are_absent() {
+    let (_dir, home) = fake_home();
+    let o = opts(&home);
+    // Do NOT create any wrapper files next to the source; the installer
+    // must log + skip each missing wrapper instead of aborting.
+    installer::install(&o).expect("install must still succeed without wrappers");
+
+    let main_bin = home.join("barbican").join("barbican");
+    assert!(main_bin.is_file(), "main binary should still land");
+    for name in WRAPPER_NAMES {
+        let dst = home.join("barbican").join(name);
+        assert!(
+            !dst.exists(),
+            "wrapper {name} must not be fabricated when source is missing"
+        );
+    }
+}
