@@ -43,6 +43,15 @@ missing_panics_doc = "allow"
 # formatting rule.
 doc_markdown = "allow"
 
+# Keep `target/` from ballooning: line tables still give file:line panics
+# and backtraces, but skip step-through variable info. Typically 40-60%
+# smaller `target/` for dev+test builds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 strip = "symbols"
 lto = "fat"
