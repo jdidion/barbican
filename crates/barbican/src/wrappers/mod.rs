@@ -317,6 +317,7 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
 /// Quoting: we wrap BODY in a POSIX single-quote string using the
 /// standard `'...'` + `\'` escape. The classifier's parser accepts
 /// any valid quoting; we don't need to be particularly clever here.
+#[must_use]
 pub fn synthesize_classifier_input(dialect: Dialect, body: &str) -> Cow<'_, str> {
     if matches!(dialect, Dialect::Shell) {
         return Cow::Borrowed(body);

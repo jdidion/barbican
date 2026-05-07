@@ -340,6 +340,11 @@ fn classify_script(script: &Script) -> Decision {
     classify_script_with_depth(script, 0)
 }
 
+// Long by design: this is the classifier dispatch table — each `if let`
+// is one policy. Splitting just for the line count would hide the
+// readable "here are all the classifiers in order" view. The 1.5.0
+// `detail` strings pushed it over the 100-line pedantic cap.
+#[allow(clippy::too_many_lines)]
 fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
     if depth > M1_MAX_DEPTH {
         return DenyReason::with_detail(
@@ -3493,6 +3498,12 @@ fn lex_normalize_chmod_path(path: &str) -> String {
 /// blunt `has_curl` check.
 ///
 /// 1.2.0 5th-pass adversarial review (Claude SEVERE S-2).
+// Long by design: four distinct deny arms share a per-dialect inline-
+// code extractor. Splitting the arms into helpers would hide the
+// parallel structure and force each helper to re-run the extractor or
+// re-derive the basename. 1.5.0 added detail strings which tipped it
+// past the 100-line pedantic cap.
+#[allow(clippy::too_many_lines)]
 fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);

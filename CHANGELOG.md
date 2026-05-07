@@ -2,6 +2,22 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.0] — 2026-05-07
+
+Adds a diagnostic `barbican explain` subcommand and widens deny reasons with an optional long-form `detail` paragraph. No behavior change for the hook or wrapper allow/deny decisions — every command that was allowed in 1.4.0 is still allowed, every command that was denied is still denied. The only change on the wire is that denies now may emit a second `detail: …` line on stderr and a `detail` field in the audit JSONL.
+
+### Added
+
+- **`barbican explain [--stdin | --dialect <d> | --json] COMMAND`** — classifies a command the same way the `PreToolUse` hook and wrapper binaries do, prints the verdict (`allow` / `deny`), and exits 0 on allow, 2 on deny. Matches the hook's exit-code contract so shell scripts can just check `$?`. `--dialect shell|python|node|ruby|perl` reuses the wrapper synthesis step so you can see what `barbican-python -c '…'` etc. would do without running the interpreter. `--stdin` reads the command from stdin (handy for long commands, heredocs, or piping from a file); `--json` emits one-line machine-readable output. Hidden commands like `classify-probe` stay hidden; `explain` is the stable user-facing entry point.
+- **`Decision::Deny { reason, detail: Option<String> }`** — the classifier's return type gains an optional long-form paragraph alongside the existing short reason. The hook prints `detail: …` under the existing `barbican: …` line on stderr; wrappers do the same; the audit JSONL records it as a separate `detail` field. Backwards-compatible on the wire (clients that only read the first line still get the existing short reason).
+- **Enriched reasons for the 8 most-visible classifiers** — H1 (`curl | bash`), H2 (staged decode to exec), M2 reverse-shell / env-dump / secret-or-base64-to-network / substitution-exfil / staged-payload-to-exec-target, and scripting_lang_shellout (all 4 internal arms) now carry a `detail` paragraph that explains what tripped, why it matters, and how to rework the command.
+- **Parse-failure paths get detail too** — `Malformed`, `ParserInit`, `wrapped-command-parse-failed`, and `M1_MAX_DEPTH-exceeded` all now name the common causes (unterminated quotes, heredoc without closing marker, unbalanced brackets, binary bytes, nesting deeper than 8 layers) so the generic "could not be parsed safely" reason is actionable.
+
+### Known limits
+
+- Niche classifiers (tar `--to-command`, rsync `-e`, `pip install -e vcs://`, scheduler persistence, chmod-attacker-path, persistence-write-to-rc, git-config-injection, shell-with-heredoc-or-herestring, shell-with-stdin-script, shell-with-network-substitution, network-with-shell-sink-substitution, xargs-arbitrary-amplifier, m2_git_hard_deny) keep their existing one-line reasons and emit `detail: None` for now. These fire rarely enough that the short reason is usually enough context; enriching them is tracked as a follow-up.
+- `detail` prose routinely mentions the patterns it's explaining (e.g. "`curl | bash`", "`/dev/tcp/*`"). The `post-edit` injection scanner doesn't distinguish prose from live commands and will flag edits that add these strings as files. Known side-effect of shipping prose-heavy details; noted in `SECURITY.md`.
+
 ## [1.4.0] — 2026-05-04
 
 First minor since 1.0: adds a classifier-gated wrapper family and a streaming secret-token redactor. The hook-based deny path still runs in every session; the wrappers are an *opt-in* second floor for tools (like Claude Code's `allow` list) that want to invoke a shell from a rule that can't route through `Bash(...)`.
