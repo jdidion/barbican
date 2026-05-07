@@ -187,7 +187,10 @@ fn explain(
                 .read_to_end(&mut raw)
                 .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
             String::from_utf8(raw).map_err(|e| {
-                anyhow::anyhow!("stdin contained non-UTF-8 bytes at offset {}", e.utf8_error().valid_up_to())
+                anyhow::anyhow!(
+                    "stdin contained non-UTF-8 bytes at offset {}",
+                    e.utf8_error().valid_up_to()
+                )
             })?
         }
     };
@@ -214,8 +217,10 @@ fn explain(
                 if let Some(d) = detail {
                     obj.insert("detail".into(), serde_json::Value::String(d));
                 }
-                let line = serde_json::to_string(&serde_json::Value::Object(obj))
-                    .unwrap_or_else(|_| r#"{"verdict":"deny","error":"serialize failed"}"#.to_string());
+                let line =
+                    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| {
+                        r#"{"verdict":"deny","error":"serialize failed"}"#.to_string()
+                    });
                 println!("{line}");
             } else {
                 println!("Verdict: deny");
