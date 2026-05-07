@@ -154,8 +154,13 @@ fn main() -> Result<()> {
 /// Diagnostic: classify a command the same way the hook / wrappers do
 /// and print the verdict + reason + detail. Exit 0 on allow, 2 on deny;
 /// exit 1 on CLI misuse (both `command` and `--stdin`, neither given,
-/// non-UTF-8 stdin) so scripts can distinguish "barbican denied" from
-/// "explain was invoked wrong."
+/// empty `--stdin`, non-UTF-8 stdin) so scripts can distinguish
+/// "barbican denied" from "explain was invoked wrong."
+///
+/// Intentionally does NOT write to the audit log — `explain` is a
+/// read-only diagnostic with no side effects, so there's no forensic
+/// value in an entry per call. Polluting the audit log with one entry
+/// per `barbican explain foo | grep …` would dilute it.
 fn explain(
     command: Option<String>,
     from_stdin: bool,
@@ -182,26 +187,47 @@ fn explain(
         }
         (Some(c), false) => c,
         (None, true) => {
+            // Cap stdin at MAX_STDIN_BYTES (8 MiB) — same guardrail
+            // pre_bash / audit / post_mcp use. 1.5.0 crew review
+            // (Claude WARNING, Gemini CRITICAL, GPT-5.2 WARNING):
+            // without a cap, `cat /dev/zero | barbican explain --stdin`
+            // spikes RSS until OOM.
             let mut raw = Vec::new();
             std::io::stdin()
+                .take(barbican::hooks::MAX_STDIN_BYTES)
                 .read_to_end(&mut raw)
                 .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
-            String::from_utf8(raw).map_err(|e| {
+            let s = String::from_utf8(raw).map_err(|e| {
                 anyhow::anyhow!(
                     "stdin contained non-UTF-8 bytes at offset {}",
                     e.utf8_error().valid_up_to()
                 )
-            })?
+            })?;
+            // Empty stdin → misuse, not "classify the empty string."
+            // 1.5.0 crew review (GPT-5.2 SUGGESTION #3).
+            if s.trim().is_empty() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "barbican explain: --stdin was empty; provide a command"
+                );
+                std::process::exit(1);
+            }
+            s
         }
     };
 
     // Reuse the wrappers' synthesis step so `--dialect python` etc.
     // classifies the same string `barbican-python -c BODY` would.
     let input = barbican::wrappers::synthesize_classifier_input(dialect, &body);
-    let decision = barbican::__fuzz::classify_command(&input);
+    // Use the public classifier surface (1.4.0 widened
+    // pre_bash::classify_command to `pub`) rather than the hidden
+    // `__fuzz` shim — the shim is documented as non-stable API and
+    // exists only for proptest / cargo-fuzz. 1.5.0 crew review
+    // (Gemini WARNING #2).
+    let decision = barbican::hooks::pre_bash::classify_command(&input);
 
     match decision {
-        barbican::__fuzz::Decision::Allow => {
+        barbican::hooks::pre_bash::Decision::Allow => {
             if json {
                 println!(r#"{{"verdict":"allow"}}"#);
             } else {
@@ -209,7 +235,23 @@ fn explain(
             }
             std::process::exit(0);
         }
-        barbican::__fuzz::Decision::Deny { reason, detail } => {
+        barbican::hooks::pre_bash::Decision::Deny { reason, detail } => {
+            // For terminal rendering, normalize control characters in
+            // `detail` so a newline embedded by a future classifier
+            // can't smear across lines and look like extra hook
+            // output. JSON carries the full string unchanged.
+            // 1.5.0 crew review (GPT-5.2 SUGGESTION #4).
+            let flatten = |s: String| -> String {
+                s.chars()
+                    .map(|c| {
+                        if matches!(c, '\n' | '\r' | '\t' | '\x0b' | '\x0c') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            };
             if json {
                 let mut obj = serde_json::Map::new();
                 obj.insert("verdict".into(), serde_json::Value::String("deny".into()));
@@ -224,9 +266,9 @@ fn explain(
                 println!("{line}");
             } else {
                 println!("Verdict: deny");
-                println!("Reason:  {reason}");
+                println!("Reason:  {}", flatten(reason));
                 if let Some(d) = detail {
-                    println!("Detail:  {d}");
+                    println!("Detail:  {}", flatten(d));
                 }
             }
             std::process::exit(2);
