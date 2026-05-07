@@ -63,16 +63,76 @@ struct ToolInput {
 }
 
 /// The classifier's output. A `Deny` carries a short human-readable
-/// reason surfaced on stderr so the user sees why the call was blocked.
+/// `reason` surfaced on stderr so the user sees why the call was
+/// blocked, plus an optional `detail` with more context (what
+/// specifically tripped, why it matters, how to rework the command).
 ///
 /// Widened from `pub(crate)` to `pub` in 1.4.0 so the new wrapper
 /// binaries (`barbican-shell` / `barbican-python` / etc.) can
 /// classify an arbitrary `-c` body without going through the hook-
-/// JSON envelope.
+/// JSON envelope. The `detail` field was added in 1.5.0 to support
+/// the new `barbican explain` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+/// What a single classifier returns when it fires. `reason` is the
+/// short headline (one line, ~60 chars); `detail` is an optional
+/// longer paragraph that explains what tripped and how to rework the
+/// command. Introduced in 1.5.0 so we don't have to thread
+/// `(String, Option<String>)` tuples through every classifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DenyReason {
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+impl DenyReason {
+    /// Short-reason-only constructor: no detail. Used for classifiers
+    /// that haven't yet been enriched with a long-form explanation.
+    #[allow(dead_code)] // Adopted incrementally as each classifier enriches its reason.
+    pub(crate) fn short(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: None,
+        }
+    }
+
+    /// Reason + detail constructor.
+    pub(crate) fn with_detail(reason: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+impl From<DenyReason> for Decision {
+    fn from(r: DenyReason) -> Self {
+        Decision::Deny {
+            reason: r.reason,
+            detail: r.detail,
+        }
+    }
+}
+
+impl From<String> for Decision {
+    /// Adopt a bare reason string as a short (no-detail) Deny. Used by
+    /// classifiers that still return `Option<String>` — the callsite
+    /// just `.into()`s the unwrapped reason. Later commits enrich
+    /// individual classifiers by switching them to `Option<DenyReason>`
+    /// and routing through the `DenyReason -> Decision` impl above.
+    fn from(reason: String) -> Self {
+        Decision::Deny {
+            reason,
+            detail: None,
+        }
+    }
 }
 
 /// Run the `pre-bash` subcommand.
@@ -177,10 +237,13 @@ pub fn run() -> Result<()> {
 
     match classify_command(command) {
         Decision::Allow => std::process::exit(EXIT_ALLOW),
-        Decision::Deny { reason } => {
+        Decision::Deny { reason, detail } => {
             // Write the reason to stderr so Claude Code surfaces it
             // to the user, then exit with Claude Code's block code.
             let _ = writeln!(std::io::stderr(), "barbican: {reason}");
+            if let Some(d) = detail {
+                let _ = writeln!(std::io::stderr(), "detail: {d}");
+            }
             std::process::exit(EXIT_DENY);
         }
     }
@@ -205,11 +268,15 @@ pub mod __fuzz {
     pub enum Decision {
         /// The command passed every shipped classifier.
         Allow,
-        /// At least one classifier denied; `reason` is the human-
-        /// readable string the real hook writes to stderr.
+        /// At least one classifier denied; `reason` is the short
+        /// human-readable string the real hook writes to stderr, and
+        /// `detail` is an optional longer paragraph (added 1.5.0).
         Deny {
             /// Short reason string surfaced on `barbican: {reason}`.
             reason: String,
+            /// Optional long-form explanation. `None` for classifiers
+            /// that haven't yet been enriched with a detail string.
+            detail: Option<String>,
         },
     }
 
@@ -221,7 +288,7 @@ pub mod __fuzz {
     pub fn classify_command(command: &str) -> Decision {
         match super::classify_command(command) {
             super::Decision::Allow => Decision::Allow,
-            super::Decision::Deny { reason } => Decision::Deny { reason },
+            super::Decision::Deny { reason, detail } => Decision::Deny { reason, detail },
         }
     }
 
@@ -244,12 +311,26 @@ pub mod __fuzz {
 #[must_use]
 pub fn classify_command(command: &str) -> Decision {
     match parser::parse(command) {
-        Err(ParseError::Malformed) => Decision::Deny {
-            reason: "command could not be parsed safely (deny by default)".to_string(),
-        },
-        Err(ParseError::ParserInit) => Decision::Deny {
-            reason: "bash parser failed to initialize (deny by default)".to_string(),
-        },
+        Err(ParseError::Malformed) => DenyReason::with_detail(
+            "command could not be parsed safely (deny by default)",
+            "tree-sitter-bash rejected the input as incomplete or invalid. \
+             Common causes: unterminated quotes or backticks, a heredoc without \
+             its closing marker, an unbalanced `$(` / `${` / `(` / `{`, nesting \
+             deeper than Barbican's MAX_DEPTH, or binary bytes inside the \
+             script. Barbican denies by default rather than guess at a partial \
+             parse, since the untyped bytes might hide a dangerous composition. \
+             Rewrite the command with balanced quoting and try again.",
+        )
+        .into(),
+        Err(ParseError::ParserInit) => DenyReason::with_detail(
+            "bash parser failed to initialize (deny by default)",
+            "tree-sitter-bash could not set up its grammar — this is a build- \
+             or install-time issue with the Barbican binary, not a problem with \
+             your command. Reinstall Barbican (`barbican install`) and report \
+             the failure at https://github.com/jdidion/barbican/issues if it \
+             persists.",
+        )
+        .into(),
         Ok(script) => classify_script(&script),
     }
 }
@@ -261,9 +342,16 @@ fn classify_script(script: &Script) -> Decision {
 
 fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
     if depth > M1_MAX_DEPTH {
-        return Decision::Deny {
-            reason: "command re-entry nesting exceeded safe depth (deny by default)".to_string(),
-        };
+        return DenyReason::with_detail(
+            "command re-entry nesting exceeded safe depth (deny by default)",
+            "the command wraps itself in `bash -c` / `eval` / `xargs` / \
+             `find -exec` / `sudo` / `timeout` / … more than 8 layers deep. \
+             Real workflows never need that; deep nesting is a classic \
+             technique for hiding a dangerous inner command from static \
+             analysis. Flatten the command so each classifier can see every \
+             argument directly.",
+        )
+        .into();
     }
     for pipeline in &script.pipelines {
         // M1 marker — the inner string of a wrapper failed to parse.
@@ -274,74 +362,78 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
             .iter()
             .any(|s| s.basename == MALFORMED_REENTRY_MARKER)
         {
-            return Decision::Deny {
-                reason: "wrapped command could not be parsed safely \
-                         (deny by default)"
-                    .to_string(),
-            };
+            return DenyReason::with_detail(
+                "wrapped command could not be parsed safely (deny by default)",
+                "a wrapper like `bash -c '…'` / `eval '…'` / `find -exec sh -c '…'` \
+                 contains an inner command string that tree-sitter-bash rejected. \
+                 Same causes as the top-level parse-fail path: unterminated \
+                 quotes, unbalanced brackets, heredoc without closing marker, \
+                 or binary bytes. Fix the inner string's quoting and re-run.",
+            )
+            .into();
         }
-        if let Some(reason) = h1_pipeline_curl_to_shell(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = h1_pipeline_curl_to_shell(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = h2_staged_decode_to_exec(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = h2_staged_decode_to_exec(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_reverse_shell(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_reverse_shell(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_env_dump_to_network(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_env_dump_to_network(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_secret_or_base64_to_network(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_secret_or_base64_to_network(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_substitution_exfil(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_substitution_exfil(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_staged_payload_to_exec_target(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_staged_payload_to_exec_target(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = persistence_write_to_shell_startup(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = persistence_write_to_shell_startup(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_stdin_script(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_stdin_script(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_network_substitution(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_network_substitution(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = network_with_shell_sink_substitution(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = network_with_shell_sink_substitution(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = xargs_arbitrary_amplifier(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = xargs_arbitrary_amplifier(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = rsync_dash_e_inner(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = rsync_dash_e_inner(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = tar_command_exec(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = tar_command_exec(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = pip_editable_vcs_install(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = pip_editable_vcs_install(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = scheduler_persistence(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = scheduler_persistence(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = git_config_injection(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = git_config_injection(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = scripting_lang_shellout(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = scripting_lang_shellout(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = chmod_plus_x_attacker_path(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = chmod_plus_x_attacker_path(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_git_hard_deny(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_git_hard_deny(pipeline) {
+            return r.into();
         }
         // M1: if any stage is a re-entry wrapper, unwrap it into a
         // flattened pipeline whose stages are the wrapper's inner
@@ -349,16 +441,20 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         // M2) see through `sudo`, `timeout`, `bash -c`, `find -exec`,
         // `xargs bash -c`, etc.
         if let Some(unwrapped) = unwrap_wrappers_in_pipeline(pipeline) {
-            if let Decision::Deny { reason } = classify_script_with_depth(&unwrapped, depth + 1) {
-                return Decision::Deny { reason };
+            if let Decision::Deny { reason, detail } =
+                classify_script_with_depth(&unwrapped, depth + 1)
+            {
+                return Decision::Deny { reason, detail };
             }
         }
     }
     for pipeline in &script.pipelines {
         for stage in &pipeline.stages {
             for sub in &stage.substitutions {
-                if let Decision::Deny { reason } = classify_script_with_depth(sub, depth + 1) {
-                    return Decision::Deny { reason };
+                if let Decision::Deny { reason, detail } =
+                    classify_script_with_depth(sub, depth + 1)
+                {
+                    return Decision::Deny { reason, detail };
                 }
             }
         }
@@ -2223,7 +2319,7 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
                             .to_string(),
                     );
                 };
-                if let Decision::Deny { reason } =
+                if let Decision::Deny { reason, .. } =
                     classify_script_with_depth(&inner_script, depth + 1)
                 {
                     return Some(format!(
@@ -2472,7 +2568,7 @@ fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: tar `{flag}={stripped}` executes as a \
                      shell command — inner: {reason}",
@@ -2629,7 +2725,7 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
                     sh = stage.basename,
                 ));
             };
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh}` executes a \
                      heredoc / here-string body — inner: {reason}",
@@ -2747,7 +2843,7 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // script that would itself deny, we deny too. This catches
         // nested shapes like `printf 'base64 -d blob > ~/.bashrc' | sh -s`.
         if let Ok(inner) = parser::parse(&payload) {
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh} -s` reads its \
                      script from stdin — upstream payload classifies \

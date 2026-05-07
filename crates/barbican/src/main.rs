@@ -62,6 +62,51 @@ enum Command {
     /// Linux. Hidden from `--help`; not part of the stable CLI.
     #[command(hide = true)]
     ClassifyProbe,
+    /// Explain how Barbican would classify a command without running it.
+    ///
+    /// Reads a command (from argv or stdin), runs the same classifier
+    /// the PreToolUse hook and the wrapper binaries use, and prints the
+    /// verdict (`allow` / `deny`) plus the short reason and optional
+    /// detail paragraph. Exits 0 on allow, 2 on deny — matching the
+    /// hook's exit-code contract so scripts can just check `$?`.
+    Explain {
+        /// Command to classify. Mutually exclusive with `--stdin`.
+        command: Option<String>,
+        /// Read the command from stdin instead of an argv token. Useful
+        /// for long commands, heredocs, or piping from a file.
+        #[arg(long)]
+        stdin: bool,
+        /// Which wrapper's input to synthesize before classifying.
+        /// `shell` (the default) classifies the command as-is.
+        /// Other dialects wrap the command as `<interp> <-c|-e> 'BODY'`
+        /// so you can see what `barbican-python -c …` etc. would decide.
+        #[arg(long, default_value = "shell")]
+        dialect: ExplainDialect,
+        /// Emit machine-readable JSON instead of a human paragraph.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ExplainDialect {
+    Shell,
+    Python,
+    Node,
+    Ruby,
+    Perl,
+}
+
+impl From<ExplainDialect> for barbican::wrappers::Dialect {
+    fn from(d: ExplainDialect) -> Self {
+        match d {
+            ExplainDialect::Shell => Self::Shell,
+            ExplainDialect::Python => Self::Python,
+            ExplainDialect::Node => Self::Node,
+            ExplainDialect::Ruby => Self::Ruby,
+            ExplainDialect::Perl => Self::Perl,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -97,6 +142,90 @@ fn main() -> Result<()> {
             })
         }
         Command::ClassifyProbe => classify_probe(),
+        Command::Explain {
+            command,
+            stdin,
+            dialect,
+            json,
+        } => explain(command, stdin, dialect.into(), json),
+    }
+}
+
+/// Diagnostic: classify a command the same way the hook / wrappers do
+/// and print the verdict + reason + detail. Exit 0 on allow, 2 on deny;
+/// exit 1 on CLI misuse (both `command` and `--stdin`, neither given,
+/// non-UTF-8 stdin) so scripts can distinguish "barbican denied" from
+/// "explain was invoked wrong."
+fn explain(
+    command: Option<String>,
+    from_stdin: bool,
+    dialect: barbican::wrappers::Dialect,
+    json: bool,
+) -> Result<()> {
+    use std::io::{Read, Write};
+
+    // Exactly one of argv / stdin must be set.
+    let body = match (command, from_stdin) {
+        (Some(_), true) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican explain: pass either COMMAND or --stdin, not both"
+            );
+            std::process::exit(1);
+        }
+        (None, false) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican explain: provide a COMMAND argument or --stdin"
+            );
+            std::process::exit(1);
+        }
+        (Some(c), false) => c,
+        (None, true) => {
+            let mut raw = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut raw)
+                .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
+            String::from_utf8(raw).map_err(|e| {
+                anyhow::anyhow!("stdin contained non-UTF-8 bytes at offset {}", e.utf8_error().valid_up_to())
+            })?
+        }
+    };
+
+    // Reuse the wrappers' synthesis step so `--dialect python` etc.
+    // classifies the same string `barbican-python -c BODY` would.
+    let input = barbican::wrappers::synthesize_classifier_input(dialect, &body);
+    let decision = barbican::__fuzz::classify_command(&input);
+
+    match decision {
+        barbican::__fuzz::Decision::Allow => {
+            if json {
+                println!(r#"{{"verdict":"allow"}}"#);
+            } else {
+                println!("Verdict: allow");
+            }
+            std::process::exit(0);
+        }
+        barbican::__fuzz::Decision::Deny { reason, detail } => {
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("verdict".into(), serde_json::Value::String("deny".into()));
+                obj.insert("reason".into(), serde_json::Value::String(reason));
+                if let Some(d) = detail {
+                    obj.insert("detail".into(), serde_json::Value::String(d));
+                }
+                let line = serde_json::to_string(&serde_json::Value::Object(obj))
+                    .unwrap_or_else(|_| r#"{"verdict":"deny","error":"serialize failed"}"#.to_string());
+                println!("{line}");
+            } else {
+                println!("Verdict: deny");
+                println!("Reason:  {reason}");
+                if let Some(d) = detail {
+                    println!("Detail:  {d}");
+                }
+            }
+            std::process::exit(2);
+        }
     }
 }
 

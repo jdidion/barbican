@@ -208,9 +208,19 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     let body_sha256 = sha256_hex(body.as_bytes());
 
-    if let Decision::Deny { reason } = decision {
+    if let Decision::Deny { reason, detail } = decision {
         let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name(),);
-        write_audit_entry(dialect, "deny", Some(&reason), &body_sha256, None);
+        if let Some(d) = detail.as_deref() {
+            let _ = writeln!(std::io::stderr(), "detail: {d}");
+        }
+        write_audit_entry(
+            dialect,
+            "deny",
+            Some(&reason),
+            detail.as_deref(),
+            &body_sha256,
+            None,
+        );
         std::process::exit(EXIT_DENY);
     }
 
@@ -218,7 +228,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
     let interpreter = resolve_interpreter(dialect);
     let exit_code = spawn_with_redaction(dialect, &interpreter, &body, &extra_args);
 
-    write_audit_entry(dialect, "allow", None, &body_sha256, Some(exit_code));
+    write_audit_entry(dialect, "allow", None, None, &body_sha256, Some(exit_code));
     std::process::exit(exit_code);
 }
 
@@ -307,7 +317,7 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
 /// Quoting: we wrap BODY in a POSIX single-quote string using the
 /// standard `'...'` + `\'` escape. The classifier's parser accepts
 /// any valid quoting; we don't need to be particularly clever here.
-fn synthesize_classifier_input(dialect: Dialect, body: &str) -> Cow<'_, str> {
+pub fn synthesize_classifier_input(dialect: Dialect, body: &str) -> Cow<'_, str> {
     if matches!(dialect, Dialect::Shell) {
         return Cow::Borrowed(body);
     }
@@ -601,6 +611,7 @@ fn write_audit_entry(
     dialect: Dialect,
     decision: &str,
     reason: Option<&str>,
+    detail: Option<&str>,
     body_sha256: &str,
     exit_code: Option<i32>,
 ) {
@@ -629,6 +640,14 @@ fn write_audit_entry(
         // fails on OOM; the `unwrap_or` is defensive.
         let cleaned = crate::audit_io::sanitize_field(r, crate::audit_io::MAX_STRING_CHARS);
         line.push_str(",\"reason\":");
+        line.push_str(
+            &serde_json::to_string(&cleaned)
+                .unwrap_or_else(|_| "\"<serialize error>\"".to_string()),
+        );
+    }
+    if let Some(d) = detail {
+        let cleaned = crate::audit_io::sanitize_field(d, crate::audit_io::MAX_STRING_CHARS);
+        line.push_str(",\"detail\":");
         line.push_str(
             &serde_json::to_string(&cleaned)
                 .unwrap_or_else(|_| "\"<serialize error>\"".to_string()),
