@@ -1,8 +1,10 @@
 //! `cargo-fuzz` entry point for the full pre-bash classifier.
 //!
 //! Invariant: `classify_command` always returns `Decision::Allow` or
-//! `Decision::Deny { reason }`. Never panics. The deny-reason string
-//! is non-empty and NUL-free (mirrors the proptest property).
+//! `Decision::Deny { reason, detail }`. Never panics. The deny-reason
+//! string is non-empty and NUL-free (mirrors the proptest property);
+//! `detail` (added in 1.5.0) is either `None` or a non-empty, NUL-free
+//! string with the same treatment.
 //!
 //! Run (nightly):
 //!     cd crates/barbican && cargo +nightly fuzz run classify

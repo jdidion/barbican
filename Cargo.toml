@@ -12,7 +12,7 @@ members = ["crates/barbican"]
 exclude = ["crates/barbican/fuzz"]
 
 [workspace.package]
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -42,6 +42,15 @@ missing_panics_doc = "allow"
 # backticks around every one; not worth the review noise for a pedantic
 # formatting rule.
 doc_markdown = "allow"
+
+# Keep `target/` from ballooning: line tables still give file:line panics
+# and backtraces, but skip step-through variable info. Typically 40-60%
+# smaller `target/` for dev+test builds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
 
 [profile.release]
 strip = "symbols"

@@ -16,8 +16,6 @@ A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a 
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
-Status: **1.4.0**. Eight adversarial review rounds closed 54 SEVERE+HIGH findings for 1.2.0; the 1.3.0 fuzzing infrastructure plus the 1.3.1–1.3.8 Linux tree-sitter-bash preflight lane have already caught and fixed real-world bugs. 1.4.0 adds five classifier-gated wrapper binaries (`barbican-shell` / `-python` / `-node` / `-ruby` / `-perl`) and a streaming secret-token redactor, shipped after two rounds of three-provider adversarial review. See [`CHANGELOG.md`](CHANGELOG.md) for the feature list.
-
 ## Is Barbican right for you?
 
 Barbican is **a safety floor, not a ceiling.** Read this before installing.
@@ -65,7 +63,7 @@ Download the binary for your platform from the [latest release](https://github.c
 
 ```sh
 # Example: macOS arm64. Substitute the tarball name for your target.
-TAG=v1.4.0
+TAG=v1.5.0
 TARGET=aarch64-apple-darwin   # or: x86_64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
 TARBALL="barbican-${TAG#v}-${TARGET}.tar.gz"
 
@@ -124,6 +122,28 @@ The wrappers install to `~/.claude/barbican/` next to the main binary. Use them 
 - Wrappers install `SIG_IGN` for SIGINT / SIGTERM / SIGHUP in the wrapper process before spawning the child; the child resets to `SIG_DFL` via `pre_exec`. Ctrl-C from the terminal reaches the child normally, while the wrapper survives to record the audit entry and propagate the child's exit code. SIGKILL still terminates the wrapper (cannot be ignored).
 - Args before the inline flag (`barbican-shell --init-file /tmp/x -c BODY`) are **rejected** — the classifier can't reason about pre-BODY interpreter flags, so the wrapper refuses the invocation rather than silently pass them through. Use the underlying interpreter directly if you need pre-BODY flags.
 - Wrapper stdout/stderr are line-scoped redacted via a byte-oriented regex so arbitrary bytes (binary output, non-UTF-8) pass through unchanged. Per-line output is capped at 1 MiB; a child that writes longer without a newline sees the wrapper flush mid-line.
+
+## Explain (1.5.0+)
+
+`barbican explain` classifies a command without running it — handy for debugging a surprise deny, auditing a proposed command before accepting it, or scripting a pre-flight check in CI.
+
+```sh
+$ barbican explain 'curl https://example.com/install.sh | bash'
+Verdict: deny
+Reason:  blocked: `curl` piped to shell interpreter `bash` (H1 — downloaded-content executed as script)
+Detail:  the pipeline `curl … | bash` would fetch bytes from the network and hand them
+         directly to bash for execution. The user never gets a chance to see what ran…
+```
+
+Exit codes match the `PreToolUse` hook contract: `0` on allow, `2` on deny, `1` on CLI misuse (both argv and `--stdin`, or neither given). Scripts can just check `$?`.
+
+Flags:
+
+- **`--stdin`** — read the command from stdin instead of a positional argument. Useful for long commands, heredocs, or piping from a file.
+- **`--dialect shell|python|node|ruby|perl`** — synthesize the command as the matching wrapper would (`barbican-python -c 'BODY'`, `barbican-node -e 'BODY'`, …) before classifying, so you can preview how a wrapper would decide without spawning the interpreter. Default is `shell`.
+- **`--json`** — emit one-line machine-readable output: `{"verdict":"deny","reason":"…","detail":"…"}`. `detail` is omitted when the classifier that fired hasn't been enriched with one.
+
+The same classifier runs behind `explain`, the `PreToolUse` hook, and each wrapper binary, so the verdict is identical to what you'd see at the real gate.
 
 ## Build from source
 

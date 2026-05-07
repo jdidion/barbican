@@ -62,6 +62,51 @@ enum Command {
     /// Linux. Hidden from `--help`; not part of the stable CLI.
     #[command(hide = true)]
     ClassifyProbe,
+    /// Explain how Barbican would classify a command without running it.
+    ///
+    /// Reads a command (from argv or stdin), runs the same classifier
+    /// the PreToolUse hook and the wrapper binaries use, and prints the
+    /// verdict (`allow` / `deny`) plus the short reason and optional
+    /// detail paragraph. Exits 0 on allow, 2 on deny — matching the
+    /// hook's exit-code contract so scripts can just check `$?`.
+    Explain {
+        /// Command to classify. Mutually exclusive with `--stdin`.
+        command: Option<String>,
+        /// Read the command from stdin instead of an argv token. Useful
+        /// for long commands, heredocs, or piping from a file.
+        #[arg(long)]
+        stdin: bool,
+        /// Which wrapper's input to synthesize before classifying.
+        /// `shell` (the default) classifies the command as-is.
+        /// Other dialects wrap the command as `<interp> <-c|-e> 'BODY'`
+        /// so you can see what `barbican-python -c …` etc. would decide.
+        #[arg(long, default_value = "shell")]
+        dialect: ExplainDialect,
+        /// Emit machine-readable JSON instead of a human paragraph.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ExplainDialect {
+    Shell,
+    Python,
+    Node,
+    Ruby,
+    Perl,
+}
+
+impl From<ExplainDialect> for barbican::wrappers::Dialect {
+    fn from(d: ExplainDialect) -> Self {
+        match d {
+            ExplainDialect::Shell => Self::Shell,
+            ExplainDialect::Python => Self::Python,
+            ExplainDialect::Node => Self::Node,
+            ExplainDialect::Ruby => Self::Ruby,
+            ExplainDialect::Perl => Self::Perl,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -97,6 +142,137 @@ fn main() -> Result<()> {
             })
         }
         Command::ClassifyProbe => classify_probe(),
+        Command::Explain {
+            command,
+            stdin,
+            dialect,
+            json,
+        } => explain(command, stdin, dialect.into(), json),
+    }
+}
+
+/// Diagnostic: classify a command the same way the hook / wrappers do
+/// and print the verdict + reason + detail. Exit 0 on allow, 2 on deny;
+/// exit 1 on CLI misuse (both `command` and `--stdin`, neither given,
+/// empty `--stdin`, non-UTF-8 stdin) so scripts can distinguish
+/// "barbican denied" from "explain was invoked wrong."
+///
+/// Intentionally does NOT write to the audit log — `explain` is a
+/// read-only diagnostic with no side effects, so there's no forensic
+/// value in an entry per call. Polluting the audit log with one entry
+/// per `barbican explain foo | grep …` would dilute it.
+fn explain(
+    command: Option<String>,
+    from_stdin: bool,
+    dialect: barbican::wrappers::Dialect,
+    json: bool,
+) -> Result<()> {
+    use std::io::{Read, Write};
+
+    // Exactly one of argv / stdin must be set.
+    let body = match (command, from_stdin) {
+        (Some(_), true) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican explain: pass either COMMAND or --stdin, not both"
+            );
+            std::process::exit(1);
+        }
+        (None, false) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican explain: provide a COMMAND argument or --stdin"
+            );
+            std::process::exit(1);
+        }
+        (Some(c), false) => c,
+        (None, true) => {
+            // Cap stdin at MAX_STDIN_BYTES (8 MiB) — same guardrail
+            // pre_bash / audit / post_mcp use. 1.5.0 crew review
+            // (Claude WARNING, Gemini CRITICAL, GPT-5.2 WARNING):
+            // without a cap, `cat /dev/zero | barbican explain --stdin`
+            // spikes RSS until OOM.
+            let mut raw = Vec::new();
+            std::io::stdin()
+                .take(barbican::hooks::MAX_STDIN_BYTES)
+                .read_to_end(&mut raw)
+                .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
+            let s = String::from_utf8(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "stdin contained non-UTF-8 bytes at offset {}",
+                    e.utf8_error().valid_up_to()
+                )
+            })?;
+            // Empty stdin → misuse, not "classify the empty string."
+            // 1.5.0 crew review (GPT-5.2 SUGGESTION #3).
+            if s.trim().is_empty() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "barbican explain: --stdin was empty; provide a command"
+                );
+                std::process::exit(1);
+            }
+            s
+        }
+    };
+
+    // Reuse the wrappers' synthesis step so `--dialect python` etc.
+    // classifies the same string `barbican-python -c BODY` would.
+    let input = barbican::wrappers::synthesize_classifier_input(dialect, &body);
+    // Use the public classifier surface (1.4.0 widened
+    // pre_bash::classify_command to `pub`) rather than the hidden
+    // `__fuzz` shim — the shim is documented as non-stable API and
+    // exists only for proptest / cargo-fuzz. 1.5.0 crew review
+    // (Gemini WARNING #2).
+    let decision = barbican::hooks::pre_bash::classify_command(&input);
+
+    match decision {
+        barbican::hooks::pre_bash::Decision::Allow => {
+            if json {
+                println!(r#"{{"verdict":"allow"}}"#);
+            } else {
+                println!("Verdict: allow");
+            }
+            std::process::exit(0);
+        }
+        barbican::hooks::pre_bash::Decision::Deny { reason, detail } => {
+            // For terminal rendering, normalize control characters in
+            // `detail` so a newline embedded by a future classifier
+            // can't smear across lines and look like extra hook
+            // output. JSON carries the full string unchanged.
+            // 1.5.0 crew review (GPT-5.2 SUGGESTION #4).
+            let flatten = |s: String| -> String {
+                s.chars()
+                    .map(|c| {
+                        if matches!(c, '\n' | '\r' | '\t' | '\x0b' | '\x0c') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            };
+            if json {
+                let mut obj = serde_json::Map::new();
+                obj.insert("verdict".into(), serde_json::Value::String("deny".into()));
+                obj.insert("reason".into(), serde_json::Value::String(reason));
+                if let Some(d) = detail {
+                    obj.insert("detail".into(), serde_json::Value::String(d));
+                }
+                let line =
+                    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| {
+                        r#"{"verdict":"deny","error":"serialize failed"}"#.to_string()
+                    });
+                println!("{line}");
+            } else {
+                println!("Verdict: deny");
+                println!("Reason:  {}", flatten(reason));
+                if let Some(d) = detail {
+                    println!("Detail:  {}", flatten(d));
+                }
+            }
+            std::process::exit(2);
+        }
     }
 }
 
