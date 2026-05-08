@@ -2,6 +2,22 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Homebrew tap** at [`jdidion/homebrew-barbican`](https://github.com/jdidion/homebrew-barbican). Install via `brew install jdidion/barbican/barbican`. Inherits Barbican's existing Sigstore build-provenance attestation — the formula pins per-target SHA256s against the GitHub release tarballs — and sidesteps macOS Gatekeeper warnings that unsigned direct-download binaries trigger (Homebrew strips `com.apple.quarantine`).
+- **Auto-bump workflow** (`.github/workflows/update-homebrew-tap.yml`) opens a PR on the tap repo whenever a new release is published, pulling SHA256s from the release's `.sha256` sidecar files. Requires a `TAP_UPDATE_PAT` secret with `contents:write` + `pull-requests:write` on the tap repo.
+
+### Changed
+
+- **README `Install` section** promotes `brew install` as the preferred path on macOS / Linux. Direct-download remains documented as the fallback for scripted installs, offline use, or environments without Homebrew.
+
+### Roadmap
+
+- **Apple Developer ID codesign + notarization** tracked in #55 for users who download tarballs directly (Gatekeeper-warning fix).
+- **Windows builds + Authenticode signing** tracked in #56 for users on Windows (currently no Windows binaries ship).
+
 ## [1.5.0] — 2026-05-07
 
 Adds a diagnostic `barbican explain` subcommand and widens deny reasons with an optional long-form `detail` paragraph. No behavior change for the hook or wrapper allow/deny decisions — every command that was allowed in 1.4.0 is still allowed, every command that was denied is still denied. The only change on the wire is that denies now may emit a second `detail: …` line on stderr and a `detail` field in the audit JSONL.

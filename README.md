@@ -59,6 +59,32 @@ See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the 
 
 ## Install
 
+### Homebrew (recommended on macOS / Linux with `brew`)
+
+```sh
+brew install jdidion/barbican/barbican
+barbican install        # wires hooks + MCP server into ~/.claude
+```
+
+Then restart Claude Code so the MCP registration takes effect.
+
+Homebrew downloads the same release tarball the direct-download path uses and inherits Barbican's [Sigstore build-provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) for free. The tap itself lives at [`jdidion/homebrew-barbican`](https://github.com/jdidion/homebrew-barbican); its formula pins a SHA256 for each release.
+
+To uninstall just Barbican's hook wiring without removing the binary:
+
+```sh
+barbican uninstall
+```
+
+To fully remove:
+
+```sh
+barbican uninstall
+brew uninstall barbican
+```
+
+### Direct download (scripted installs, offline use, or no `brew`)
+
 Download the binary for your platform from the [latest release](https://github.com/jdidion/barbican/releases/latest), verify both the checksum and the build-provenance attestation, then run `./barbican install`:
 
 ```sh
