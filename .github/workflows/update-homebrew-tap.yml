@@ -178,7 +178,13 @@ jobs:
           # it makes the URL-embedded PAT the only credential source.
           # GH_TOKEN is redacted in logs and never lands on disk
           # outside this ephemeral runner.
-          git config --unset-all "http.https://github.com/.extraheader" || true
+          # Must be --local; actions/checkout@v4 writes the
+          # extraheader into the repo's LOCAL config
+          # (tap/.git/config), not the global config. Without
+          # --local, `git config --unset-all` searches the global
+          # config, finds nothing, and the local extraheader survives
+          # to override the origin URL. Observed on first fix attempt.
+          git config --local --unset-all "http.https://github.com/.extraheader" || true
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/jdidion/homebrew-barbican.git"
           git push -u origin "$BRANCH"
           gh pr create \
