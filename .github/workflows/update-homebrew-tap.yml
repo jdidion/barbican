@@ -73,7 +73,13 @@ jobs:
           done
 
       - name: Checkout tap
-        uses: actions/checkout@v4
+        # SHA-pinned to match the hardened release.yml / ci.yml pattern
+        # (1.5.1 crew-review, Claude W-5). Bumping via a version tag
+        # would let an attacker who compromises the actions/checkout
+        # repo repoint the tag at a malicious action, and this workflow
+        # holds a tap-scoped write PAT so the blast radius is wider
+        # than CI's read-only contexts.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: jdidion/homebrew-barbican
           token: ${{ secrets.TAP_UPDATE_PAT }}
