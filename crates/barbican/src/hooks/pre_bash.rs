@@ -4479,25 +4479,46 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
         // but the env-var mechanism is the same shape.
         "ZDOTDIR",
     ];
+    // Gate (1.5.1 Claude re-review scope expansion): the dangerous env
+    // var fires on any shell interpreter LATER reached in this
+    // pipeline, not just when argv[0] is itself a shell. This catches
+    // wrapper-smuggled forms like `sudo PROMPT_COMMAND=… bash -i` and
+    // `env PROMPT_COMMAND=… bash -c true`, where the assignment is
+    // attached to the wrapper stage; if we only gated on the wrapper's
+    // argv[0], M1 unwrap would drop the assignment on its way to the
+    // inner bash and the classifier would miss the attack.
+    let is_shell_bn = |bn: &str| matches!(bn, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash");
+    let pipeline_has_shell = pipeline.stages.iter().any(|s| {
+        let bn = stage_bn_lc(s);
+        if is_shell_bn(bn.as_str()) {
+            return true;
+        }
+        // Also scan args for a bare shell token (sudo bash, env bash,
+        // timeout 30 bash, etc.). Covers the M1 wrapper family without
+        // needing to enumerate them.
+        s.args.iter().any(|a| {
+            let a_bn = a.rsplit('/').next().unwrap_or(a).to_ascii_lowercase();
+            is_shell_bn(a_bn.as_str())
+        })
+    });
+    if !pipeline_has_shell {
+        return None;
+    }
 
     for stage in &pipeline.stages {
-        // Gate: the stage's argv[0] must be a shell interpreter for
-        // these env vars to matter. `PROMPT_COMMAND=… make` sets it
-        // for make's inherited env but make doesn't interpret it.
-        let bn = stage_bn_lc(stage);
-        if !matches!(bn.as_str(), "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
-            continue;
-        }
         for (name, value) in &stage.assignments {
             let upper = name.to_ascii_uppercase();
             if SHELL_STARTUP_EXEC_VARS.contains(&upper.as_str()) {
                 return Some(format!(
                     "blocked: `{name}={value}` is a shell startup / \
-                     prompt env var that {bn} executes as a shell \
-                     command string on next interactive prompt or \
-                     script startup. Direct RCE channel — the \
-                     shell's static argv shows only `{bn}` but the \
-                     dangerous code lives in the env value."
+                     prompt env var that a shell interpreter in this \
+                     pipeline executes as a command string on next \
+                     interactive prompt or script startup. Direct RCE \
+                     channel — the shell's static argv shows only the \
+                     binary name but the dangerous code lives in the \
+                     env value. Wrapper-smuggled forms like \
+                     `sudo PROMPT_COMMAND=… bash -i` are caught here \
+                     because wrappers pass the env through to the child."
                 ));
             }
         }
