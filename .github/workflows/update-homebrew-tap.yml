@@ -79,7 +79,7 @@ jobs:
         # repo repoint the tag at a malicious action, and this workflow
         # holds a tap-scoped write PAT so the blast radius is wider
         # than CI's read-only contexts.
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: jdidion/homebrew-barbican
           token: ${{ secrets.TAP_UPDATE_PAT }}
@@ -167,7 +167,7 @@ jobs:
           git add Formula/barbican.rb
           git commit -m "bump: barbican $VERSION"
           # Authenticate `git push` with the TAP_UPDATE_PAT. Two steps
-          # because actions/checkout@v4 persists an extraheader on
+          # because actions/checkout persists an extraheader on
           # http.https://github.com/.extraheader that embeds its own
           # (limited) GITHUB_TOKEN and takes precedence over the
           # origin URL's credentials. Unset that extraheader first,
@@ -178,7 +178,7 @@ jobs:
           # it makes the URL-embedded PAT the only credential source.
           # GH_TOKEN is redacted in logs and never lands on disk
           # outside this ephemeral runner.
-          # Must be --local; actions/checkout@v4 writes the
+          # Must be --local; actions/checkout writes the
           # extraheader into the repo's LOCAL config
           # (tap/.git/config), not the global config. Without
           # --local, `git config --unset-all` searches the global
