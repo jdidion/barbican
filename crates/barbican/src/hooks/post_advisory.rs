@@ -7,13 +7,11 @@
 //!   render `additionalContext` still see it);
 //! - append one JSONL entry to `~/.claude/barbican/audit.log`.
 
-use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use serde_json::json;
 
-use crate::sanitize::strip_ansi;
+use crate::sanitize::escape_for_prose;
 
 /// Shape of a single advisory emission.
 pub struct Finding<'a> {
@@ -34,19 +32,18 @@ pub struct Finding<'a> {
 }
 
 pub fn emit_advisory(f: &Finding<'_>) {
-    // Strip ANSI from every attacker-influenced string that reaches
-    // the terminal or the audit log. Matches the L1 hardening in
-    // hooks/audit.rs — a malicious MCP tool name or file path cannot
-    // rewrite the user's terminal via `less ~/.claude/barbican/audit.log`
-    // or the Claude Code transcript.
-    let tool = strip_ansi(f.tool).into_owned();
-    let path = f.path.map(|p| strip_ansi(p).into_owned());
-    let findings: Vec<String> = f
-        .findings
-        .iter()
-        .map(|s| strip_ansi(s).into_owned())
-        .collect();
-    let intro = strip_ansi(&f.advisory_intro).into_owned();
+    // 1.5.1 crew-review (GPT-5.2 CRITICAL-1): every attacker-influenced
+    // string that lands in the advisory prose goes through
+    // `escape_for_prose`, which neutralizes control characters (so an
+    // attacker can't splice `\n\nSYSTEM: …` into the trusted channel),
+    // strips zero-width / bidi overrides, strips ANSI, and caps length.
+    // Finding strings are the classifier's own output; they're safe.
+    let tool = escape_for_prose(f.tool);
+    let path = f.path.map(escape_for_prose);
+    let findings: Vec<String> = f.findings.iter().map(|s| escape_for_prose(s)).collect();
+    // `advisory_intro` is built by the caller from sanitized parts, so
+    // the ANSI-strip here is belt-and-suspenders.
+    let intro = escape_for_prose_long(&f.advisory_intro);
 
     // Stdout JSON → Claude Code renders this in the transcript.
     let out = json!({
@@ -75,120 +72,37 @@ pub fn emit_advisory(f: &Finding<'_>) {
     let _ = append_audit_jsonl(&sanitized);
 }
 
+/// Like `escape_for_prose` but without the 256-byte cap — the
+/// `advisory_intro` is Barbican-authored static-ish prose that contains
+/// legitimate newlines. All we need to do here is strip ANSI and
+/// invisibles; the intro's own newlines are supposed to survive.
+fn escape_for_prose_long(s: &str) -> String {
+    use crate::sanitize::{strip_ansi, strip_invisible};
+    let ansi_free = strip_ansi(s).into_owned();
+    strip_invisible(&ansi_free)
+}
+
 fn append_audit_jsonl(f: &Finding<'_>) -> std::io::Result<()> {
-    let Some(home) = std::env::var_os("HOME") else {
+    // 1.5.1 crew-review (GPT-5.2 CRITICAL-2, Claude N-1): delegate to
+    // the hardened writer in `audit_io` instead of duplicating the
+    // directory-creation / ancestor-symlink / mode / O_NOFOLLOW dance
+    // locally. The bespoke version in 1.5.0 and earlier checked only
+    // the immediate parent for a symlink, so a planted
+    // `~/.claude → /tmp/attacker` ancestor laundered advisory writes
+    // into an attacker-controlled directory. `audit_io` walks every
+    // ancestor under $HOME.
+    let Some(path) = crate::audit_io::audit_log_path() else {
         return Ok(());
     };
-    let home = std::path::PathBuf::from(home);
-    if !home.is_absolute() {
-        return Ok(());
-    }
-    let log = home.join(".claude").join("barbican").join("audit.log");
-    let parent = log.parent().unwrap();
-    // DirBuilder with mode(0o700) sets the mode atomically at creation
-    // time — no race between create_dir_all and a subsequent chmod.
-    // Also handles the already-exists case gracefully (returns Ok).
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)?;
-    // 1.2.0 second-pass adversarial review (HIGH #1): if the parent
-    // dir is a symlink, short-circuit the entire advisory-write.
-    // Without this the subsequent OpenOptions open traverses the
-    // symlink and writes into the attacker's target dir even though
-    // O_NOFOLLOW on the leaf blocks a symlinked log-file entry.
-    match std::fs::symlink_metadata(parent) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            // Upgrade a would-be success to a clean early return;
-            // post_advisory is best-effort anyway (it does not block
-            // the hook if the log can't be written).
-            return Ok(());
-        }
-        Ok(meta) if meta.file_type().is_dir() => {
-            let current_mode = std::fs::metadata(parent)
-                .map(|m| m.permissions().mode() & 0o777)
-                .unwrap_or(0);
-            if current_mode != 0o700 {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        _ => {}
-    }
 
     let entry = json!({
-        "ts": iso8601_now(),
+        "ts": crate::audit_io::iso8601_utc_now(),
         "event": f.event,
         "tool": f.tool,
         "path": f.path,
         "session": f.session_id,
         "findings": f.findings,
     });
-    let line = entry.to_string();
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(o_nofollow())
-        .open(&log)?;
-    let mut perms = file.metadata()?.permissions();
-    if perms.mode() & 0o777 != 0o600 {
-        perms.set_mode(0o600);
-        file.set_permissions(perms)?;
-    }
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    Ok(())
-}
-
-const fn o_nofollow() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        0x0100
-    }
-    #[cfg(target_os = "linux")]
-    {
-        0x20000
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
-}
-
-fn iso8601_now() -> String {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let days_since_epoch = i64::try_from(secs / 86_400).unwrap_or(0);
-    let secs_in_day = (secs % 86_400) as u32;
-    let hour = secs_in_day / 3600;
-    let minute = (secs_in_day / 60) % 60;
-    let second = secs_in_day % 60;
-    let shifted = days_since_epoch + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097) as u32;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
-    let year_i64 = i64::from(year_of_era) + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_shifted = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_shifted + 2) / 5 + 1;
-    let month = if month_shifted < 10 {
-        month_shifted + 3
-    } else {
-        month_shifted - 9
-    };
-    let year_i64 = if month <= 2 { year_i64 + 1 } else { year_i64 };
-    let year = u32::try_from(year_i64).unwrap_or(0);
-    (year, month, day, hour, minute, second)
+    let line = format!("{entry}\n");
+    crate::audit_io::append_jsonl_line(&path, &line)
 }

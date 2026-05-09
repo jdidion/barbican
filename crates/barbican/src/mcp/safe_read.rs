@@ -359,18 +359,30 @@ fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
     };
 
     // Allow list ("hole punch"): lets a specific path escape the deny
-    // list when the user is sure it's safe. TWO conditions:
+    // list when the user explicitly whitelists it. TWO conditions:
     //   1. `original` path (what the caller asked for) exactly
     //      matches an allow entry; AND
     //   2. the allow entry's canonical form equals the CANONICAL
-    //      target AND does NOT itself hit the deny list.
+    //      target AND the allow entry and every path component under
+    //      it is a regular file or directory (not a symlink).
     //
     // (2) is the key symlink defense: if the allow entry points at
-    // (or is a symlink to) a sensitive file, the allow rule does NOT
-    // fire — whether the symlink was created by the user or an
-    // attacker.  ALLOW_SENSITIVE=1 is the only way to read sensitive
-    // canonical targets.
-    if allow_rule_permits(original, canonical, &denies) {
+    // (or is a symlink to) a sensitive file via an attacker-planted
+    // symlink, the allow rule does NOT fire. A user who legitimately
+    // wants to read a specific sensitive file MAY point
+    // `BARBICAN_SAFE_READ_ALLOW` at it directly — that's the intended
+    // hole-punch semantics — and the symlink check keeps an attacker
+    // from turning that into a path-traversal by swapping the leaf.
+    //
+    // 1.5.1 crew-review (GPT-5.2 W-1): earlier wording claimed the
+    // allow entry must not itself match the deny list, implying
+    // `BARBICAN_SAFE_READ_ALLOW=~/.ssh/id_rsa` would be denied and
+    // only `ALLOW_SENSITIVE=1` could read it. The actual design is
+    // that per-path allow *is* sufficient for user-scoped hole-
+    // punches; `ALLOW_SENSITIVE=1` is the BROAD override (any
+    // sensitive path allowed), not the only way to whitelist a
+    // specific file. The comment now matches the code.
+    if allow_rule_permits(original, canonical) {
         return Ok(());
     }
     Err(ReadError::PolicyDenied(policy_reason(sensitive_rule)))
@@ -388,7 +400,7 @@ fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
 ///
 /// Users who legitimately need to allow a symlink should point
 /// `BARBICAN_SAFE_READ_ALLOW` at the symlink's target directly.
-fn allow_rule_permits(original: &Path, canonical: &Path, _denies: &[PathBuf]) -> bool {
+fn allow_rule_permits(original: &Path, canonical: &Path) -> bool {
     let Ok(allows) = parse_absolute_path_list("BARBICAN_SAFE_READ_ALLOW") else {
         return false;
     };

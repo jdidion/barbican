@@ -1,0 +1,181 @@
+name: update homebrew tap
+
+# Triggered when a GitHub release is published. Bumps the Formula in
+# jdidion/homebrew-barbican to point at the new version's tarballs and
+# opens a PR on the tap repo for maintainer review.
+#
+# Requires a repo-scoped fine-grained PAT stored as
+# secrets.TAP_UPDATE_PAT with contents:write + pull-requests:write on
+# jdidion/homebrew-barbican. The default GITHUB_TOKEN can't push to a
+# different repo, so a scoped PAT (or a GitHub App installation token)
+# is required.
+#
+# Deliberately opens a PR instead of committing directly, so a botched
+# release doesn't ship to every `brew upgrade` user before the
+# maintainer has a chance to sanity-check the formula.
+
+on:
+  release:
+    types: [published]
+  # Re-runnable by hand if the auto-fire misses a release (e.g. if the
+  # PAT is rotated and the workflow needs a retry after the secret is
+  # updated).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump to (e.g. v1.5.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bump-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag + version
+        id: resolve
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${RELEASE_TAG:-$DISPATCH_TAG}"
+          if [ -z "$TAG" ]; then
+            echo "::error::no tag resolved (neither release nor dispatch input)"
+            exit 1
+          fi
+          # Strip leading `v` to get the bare version for formula strings.
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch release asset SHA256s
+        id: shas
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Fetch the per-target .sha256 sidecar files the release
+          # workflow already publishes alongside each tarball. Each
+          # sidecar is `<sha256>  <filename>`; we need just the hash.
+          BASE="https://github.com/jdidion/barbican/releases/download/$TAG"
+          for T in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            URL="$BASE/barbican-$VERSION-$T.tar.gz.sha256"
+            SHA=$(curl -sfL "$URL" | awk '{print $1}')
+            if [ -z "$SHA" ] || [ "${#SHA}" -ne 64 ]; then
+              echo "::error::could not fetch or parse SHA256 for $T from $URL"
+              exit 1
+            fi
+            # Emit as `sha_<target>=<hex>` — underscore-safe for outputs.
+            echo "sha_${T//-/_}=$SHA" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout tap
+        # SHA-pinned to match the hardened release.yml / ci.yml pattern
+        # (1.5.1 crew-review, Claude W-5). Bumping via a version tag
+        # would let an attacker who compromises the actions/checkout
+        # repo repoint the tag at a malicious action, and this workflow
+        # holds a tap-scoped write PAT so the blast radius is wider
+        # than CI's read-only contexts.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: jdidion/homebrew-barbican
+          token: ${{ secrets.TAP_UPDATE_PAT }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Update Formula/barbican.rb
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA_AARCH64_APPLE_DARWIN: ${{ steps.shas.outputs.sha_aarch64_apple_darwin }}
+          SHA_X86_64_APPLE_DARWIN:  ${{ steps.shas.outputs.sha_x86_64_apple_darwin }}
+          SHA_AARCH64_UNKNOWN_LINUX_GNU: ${{ steps.shas.outputs.sha_aarch64_unknown_linux_gnu }}
+          SHA_X86_64_UNKNOWN_LINUX_GNU:  ${{ steps.shas.outputs.sha_x86_64_unknown_linux_gnu }}
+        run: |
+          set -euo pipefail
+          cd tap
+          # The formula hard-codes each URL + SHA256 per-target. We
+          # rewrite in place with a small Python script — Ruby-aware
+          # enough to preserve the surrounding structure, dumber and
+          # less fragile than a sed pipeline.
+          python3 - <<PY
+          import pathlib, re, os
+          p = pathlib.Path("Formula/barbican.rb")
+          text = p.read_text()
+          version = os.environ["VERSION"]
+          shas = {
+              "aarch64-apple-darwin":         os.environ["SHA_AARCH64_APPLE_DARWIN"],
+              "x86_64-apple-darwin":          os.environ["SHA_X86_64_APPLE_DARWIN"],
+              "aarch64-unknown-linux-gnu":    os.environ["SHA_AARCH64_UNKNOWN_LINUX_GNU"],
+              "x86_64-unknown-linux-gnu":     os.environ["SHA_X86_64_UNKNOWN_LINUX_GNU"],
+          }
+          for target, sha in shas.items():
+              # Match the full URL line for this target and rewrite the
+              # version segment. Target is part of the tarball name so
+              # each target's URL is unique.
+              url_re = re.compile(
+                  r'(url "https://github\.com/jdidion/barbican/releases/download/)'
+                  r'v\d+\.\d+\.\d+'
+                  r'(/barbican-)'
+                  r'\d+\.\d+\.\d+'
+                  r'(-' + re.escape(target) + r'\.tar\.gz")'
+              )
+              new_url = rf'\1v{version}\2{version}\3'
+              text, n_url = url_re.subn(new_url, text, count=1)
+              if n_url != 1:
+                  raise SystemExit(f"url rewrite for {target} failed: matched {n_url} times")
+              # The sha256 on the next line belongs to this target.
+              # Match only the FIRST sha256 occurrence after the url we
+              # just rewrote, not globally.
+              sha_re = re.compile(
+                  r'(url "https://github\.com/jdidion/barbican/releases/download/v'
+                  + re.escape(version)
+                  + r'/barbican-' + re.escape(version) + r'-' + re.escape(target)
+                  + r'\.tar\.gz"\s*\n\s*sha256 ")[0-9a-f]{64}(")'
+              )
+              text, n_sha = sha_re.subn(rf'\g<1>{sha}\g<2>', text, count=1)
+              if n_sha != 1:
+                  raise SystemExit(f"sha rewrite for {target} failed: matched {n_sha} times")
+          p.write_text(text)
+          print(f"bumped formula to {version}")
+          PY
+
+      - name: Diff sanity-check
+        working-directory: tap
+        run: |
+          git diff --stat
+          git diff Formula/barbican.rb
+
+      - name: Open bump PR
+        working-directory: tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_UPDATE_PAT }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          BRANCH="bump/$TAG"
+          git config user.name  "barbican-tap-bot"
+          git config user.email "barbican-tap-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Formula/barbican.rb
+          git commit -m "bump: barbican $VERSION"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "bump: barbican $VERSION" \
+            --body "Automated bump triggered by jdidion/barbican release $TAG.
+
+          Formula updated to point at the newly published tarballs; SHA256s pulled from the release's \`.sha256\` sidecar files.
+
+          Release: https://github.com/jdidion/barbican/releases/tag/$TAG
+
+          Before merging, sanity-check:
+          - [ ] The four \`url\` lines point at the $VERSION tarballs (not a stale version).
+          - [ ] Each \`sha256\` matches the release's sidecar file.
+          - [ ] \`brew audit --new --strict jdidion/barbican/barbican\` passes locally.
+
+          🤖 Opened by [.github/workflows/update-homebrew-tap.yml](https://github.com/jdidion/barbican/blob/main/.github/workflows/update-homebrew-tap.yml) in jdidion/barbican."

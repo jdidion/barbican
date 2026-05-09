@@ -37,6 +37,56 @@ pub fn strip_ansi(s: &str) -> Cow<'_, str> {
     re.replace_all(s, "")
 }
 
+/// Neutralize an attacker-influenced string that will be spliced into
+/// prose output (the `additionalContext` block, stderr messages, any
+/// user-visible rendered text). Specifically:
+///
+/// 1. ANSI escapes stripped (same as `strip_ansi`).
+/// 2. Every ASCII control character (`0x00-0x1F` + `0x7F`, including
+///    LF, CR, VT, FF, TAB, NUL, BEL, ESC) replaced with `?`. This
+///    stops an attacker from splicing `\n\nSYSTEM: …` into a trusted
+///    hook advisory — the canonical 1.5.1 GPT-5.2 CRITICAL-1 attack.
+/// 3. Zero-width and bidi-override unicode (same class as
+///    `strip_invisible`) removed — these don't render visibly so
+///    they're pure smuggling vectors in prose.
+/// 4. Result truncated at 256 UTF-8 bytes (with a `…` marker) so an
+///    attacker-controlled filename can't blow out the advisory with
+///    a multi-megabyte payload that exhausts the display channel.
+///
+/// Use this on any string that (a) may be attacker-influenced AND
+/// (b) is spliced into a user- or model-visible prose message. Do NOT
+/// use this on strings destined for structured fields (JSON values,
+/// audit-log fields with their own quoting) — those already escape
+/// control characters as part of their serialization.
+#[must_use]
+pub fn escape_for_prose(s: &str) -> String {
+    const MAX_PROSE_BYTES: usize = 256;
+    // Pass 1: strip ANSI so escapes don't survive as raw bytes.
+    let ansi_free = strip_ansi(s).into_owned();
+    // Pass 2: drop zero-width / bidi-override.
+    let without_invisibles = strip_invisible(&ansi_free);
+    // Pass 3: replace control characters with `?`.
+    let mut out = String::with_capacity(without_invisibles.len());
+    for c in without_invisibles.chars() {
+        if c.is_control() {
+            out.push('?');
+        } else {
+            out.push(c);
+        }
+    }
+    // Pass 4: truncate if too long.
+    if out.len() > MAX_PROSE_BYTES {
+        // Truncate at a char boundary below the cap.
+        let mut cut = MAX_PROSE_BYTES;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push('…');
+    }
+    out
+}
+
 /// Remove zero-width and bidi-override characters.
 ///
 /// The set:

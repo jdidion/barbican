@@ -139,6 +139,30 @@ pub static REENTRY_WRAPPERS: Set<&'static str> = phf_set! {
     "apptainer",
     "singularity",
     "kubectl",
+    // 1.5.1 crew-review (Gemini CRITICAL #1, Claude W-2): Linux-native
+    // privilege / namespace / sandbox wrappers that transparently run
+    // a subsequent bash command string. `nsenter`, `chroot`, `pkexec`,
+    // `su-exec`, `setpriv`, `prlimit`, `sg`, `schroot` all take the
+    // prefix-runner shape (`WRAPPER [opts] [USER|GROUP|DIR] CMD [args]`);
+    // without them in the unwrap set, invocations like
+    // `pkexec bash -c BODY` or `nsenter -t 1 bash -c BODY` bypass
+    // H1/M1 entirely.
+    //
+    // Not included:
+    // - `newgrp`: spawns a new shell; does not take an inline CMD in
+    //   util-linux. Out-of-scope, documented in SECURITY.md.
+    // - `flatpak`: uses the subcommand grammar `flatpak run
+    //   --command=CMD APP`, handled by extract_container_run_inner
+    //   below rather than as a prefix-runner.
+    "nsenter",
+    "chroot",
+    "pkexec",
+    "su-exec",
+    "setpriv",
+    "prlimit",
+    "sg",
+    "schroot",
+    "flatpak",
 };
 
 /// Tools that can decode/reconstruct binary payloads written to disk.

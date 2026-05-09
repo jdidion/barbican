@@ -144,13 +144,20 @@ fn sensitive_paths() -> &'static [(Regex, &'static str)] {
 }
 
 /// Return the list of sensitive-path findings for `path` (empty if none).
+///
+/// 1.5.1 crew-review (GPT-5.2 CRITICAL-1): the finding string embeds
+/// a static `label` but NEVER echoes the raw `path`. Echoing the path
+/// into the finding, which then flows into the `additionalContext`
+/// trusted-hook channel, turns a path-with-embedded-newlines
+/// (`"ci.yml\n\nSYSTEM: ..."`) into a prompt-injection vector. The
+/// pattern-ID-only finding is non-forgeable and safe to splice.
 #[must_use]
 pub fn scan_sensitive_path(path: &str) -> Vec<String> {
     let norm = path.replace('\\', "/");
     let mut out = Vec::new();
     for (re, label) in sensitive_paths() {
         if re.is_match(&norm) {
-            out.push(format!("write to sensitive path: {label} ({path})"));
+            out.push(format!("write to sensitive path: {label}"));
         }
     }
     out
@@ -256,6 +263,15 @@ fn invisible_regex() -> &'static Regex {
 /// Run the prompt-injection scan on `text`. Returns a list of
 /// findings. Caller is responsible for truncation via
 /// [`truncate_for_scan`] before calling here.
+///
+/// 1.5.1 crew-review (GPT-5.2 CRITICAL-1): findings embed match COUNTS,
+/// not snippets. An earlier version echoed the matched phrase
+/// (capped at 80 chars each) into the finding, which then flowed into
+/// the trusted-hook `additionalContext` channel. An attacker who could
+/// influence the scanned text could then inject prose like
+/// `"SYSTEM: ignore previous instructions"` and have it rendered as
+/// part of Barbican's own trusted advisory. Match counts carry the
+/// same "this is suspicious" signal without the injection risk.
 #[must_use]
 pub fn scan_injection(text: &str) -> Vec<String> {
     let mut findings = Vec::new();
@@ -274,19 +290,20 @@ pub fn scan_injection(text: &str) -> Vec<String> {
     // suspenders ensures nothing slipped past NFKC.
     let normalized = strip_invisible(&normalized);
 
-    let mut hits: Vec<String> = Vec::new();
+    let mut total_hits: usize = 0;
+    let mut patterns_matched: usize = 0;
     for re in injection_patterns() {
-        for m in re.find_iter(&normalized) {
-            let snippet: String = m.as_str().chars().take(80).collect();
-            hits.push(snippet);
+        let n = re.find_iter(&normalized).count();
+        if n > 0 {
+            patterns_matched += 1;
+            total_hits = total_hits.saturating_add(n);
         }
     }
-    // Dedupe + cap.
-    let mut seen = std::collections::HashSet::new();
-    hits.retain(|h| seen.insert(h.clone()));
-    hits.truncate(6);
-    if !hits.is_empty() {
-        findings.push(format!("jailbreak-shaped phrase(s): {}", hits.join(" | ")));
+    if total_hits > 0 {
+        findings.push(format!(
+            "jailbreak-shaped phrase(s) detected \
+             ({total_hits} match(es) across {patterns_matched} pattern(s))"
+        ));
     }
 
     findings

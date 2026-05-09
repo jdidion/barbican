@@ -22,7 +22,7 @@ Barbican is **a safety floor, not a ceiling.** Read this before installing.
 
 ### What Barbican catches
 
-- **Dangerous bash compositions before they run**: `curl | bash`, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `nohup`, `find -exec`, `docker run <shell> -c`, container/sandbox/debugger fronts), DNS-channel exfil, secret-to-network pipelines, git config injection, scripting-lang shellouts, and ~30 more concrete shapes. Every one ships with a red-test-first regression test under `tests/pre_bash_*.rs`.
+- **Dangerous bash compositions before they run**: `curl` / `wget` piped to a shell interpreter, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `nohup`, `find -exec`, `docker run <shell> -c`, container/sandbox/debugger/privilege-escalation fronts — `nsenter`, `chroot`, `pkexec`, `su-exec`, `setpriv`, `prlimit`, `sg`, `schroot`, `flatpak run`, and the usual container family), DNS-channel exfil, secret-to-network pipelines, staged download-and-execute payloads written to exec targets, shell-startup env-var smuggling (`PROMPT_COMMAND=`, `BASH_ENV=`, `ENV=`), reverse-shell `/dev/tcp/…` patterns, git config injection, and scripting-language shellouts across python / perl / ruby / node / deno / bun / php / lua / tclsh / rscript / swift / racket / guile / julia / sbcl / awk / pwsh. The classifier is narrowed to specific shapes; broader network-tool-to-shell compositions (`nc | bash`, `ssh host cat | bash`, `socat | bash`) are NOT caught unless they also cross an M2 signal (secret reference, env dumper, base64-then-network). See [`SECURITY.md` § Known parser limits](SECURITY.md) for the full scope. Every shape ships with a red-test-first regression test under `tests/pre_bash_*.rs`.
 - **Prompt-injection markers in tool output**: NFKC-normalized scans for "ignore previous instructions"-style patterns, with zero-width and bidi-override stripping. Not a complete defense, but closes the obvious cases.
 - **SSRF in `safe_fetch`**: RFC1918 / loopback / link-local / CGNAT / IMDS filtering, DNS pinning to defeat rebinding, mandatory `no_proxy()` to prevent proxy-side lookups.
 - **Sensitive-path reads in `safe_read`**: `.ssh/`, `.aws/`, `.env`, SSH/GPG key files, `/etc/shadow`, `/etc/sudoers`, etc. Escape hatch via `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`.
@@ -58,6 +58,32 @@ See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the 
 - You're in an adversarial environment where the attacker controls your shell startup. Barbican's opt-out env vars become an attack surface.
 
 ## Install
+
+### Homebrew (recommended on macOS / Linux with `brew`)
+
+```sh
+brew install jdidion/barbican/barbican
+barbican install        # wires hooks + MCP server into ~/.claude
+```
+
+Then restart Claude Code so the MCP registration takes effect.
+
+Homebrew downloads the same release tarball the direct-download path uses and inherits Barbican's [Sigstore build-provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) for free. The tap itself lives at [`jdidion/homebrew-barbican`](https://github.com/jdidion/homebrew-barbican); its formula pins a SHA256 for each release.
+
+To uninstall just Barbican's hook wiring without removing the binary:
+
+```sh
+barbican uninstall
+```
+
+To fully remove:
+
+```sh
+barbican uninstall
+brew uninstall barbican
+```
+
+### Direct download (scripted installs, offline use, or no `brew`)
 
 Download the binary for your platform from the [latest release](https://github.com/jdidion/barbican/releases/latest), verify both the checksum and the build-provenance attestation, then run `./barbican install`:
 
