@@ -166,6 +166,16 @@ jobs:
           git checkout -b "$BRANCH"
           git add Formula/barbican.rb
           git commit -m "bump: barbican $VERSION"
+          # Re-point origin at an HTTPS URL with the PAT embedded, so
+          # `git push` authenticates. actions/checkout uses a bundled
+          # credential helper that hides the token from shell-level
+          # `git push` calls; bypass it with the explicit URL form.
+          # 1.5.1 workflow-fix: plain `git push` returns 403 because it
+          # uses the actions-token (limited GITHUB_TOKEN), not
+          # TAP_UPDATE_PAT. Safe to embed here: GH_TOKEN is a secret and
+          # is redacted in logs, and the URL never lands on disk
+          # outside this ephemeral runner.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/jdidion/homebrew-barbican.git"
           git push -u origin "$BRANCH"
           gh pr create \
             --base main \
