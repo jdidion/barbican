@@ -122,7 +122,11 @@ jobs:
                   r'\d+\.\d+\.\d+'
                   r'(-' + re.escape(target) + r'\.tar\.gz")'
               )
-              new_url = rf'\1v{version}\2{version}\3'
+              # Use `\g<N>` unambiguous group refs: `\1v{version}` would
+              # parse as `\1v1.5.1` → `\1v1` fine, but `\2{version}` =
+              # `\21.5.1` → regex engine reads `\21` as group 21 and
+              # raises "invalid group reference." 1.5.1 bugfix.
+              new_url = rf'\g<1>v{version}\g<2>{version}\g<3>'
               text, n_url = url_re.subn(new_url, text, count=1)
               if n_url != 1:
                   raise SystemExit(f"url rewrite for {target} failed: matched {n_url} times")
