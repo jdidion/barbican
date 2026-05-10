@@ -825,45 +825,56 @@ fn write_audit_entry(
         return;
     };
     let ts = crate::audit_io::iso8601_utc_now();
-    // Hand-roll the JSON to avoid serialization ceremony for a
-    // single-line record. Every string field that could carry
-    // attacker-controllable content goes through `sanitize_field`
-    // (ANSI-strip + truncate) before it lands in the log.
-    let mut line = String::with_capacity(256);
-    line.push_str("{\"ts\":\"");
-    line.push_str(&ts);
-    line.push_str("\",\"event\":\"wrapper\",\"dialect\":\"");
-    line.push_str(dialect.audit_tag());
-    line.push_str("\",\"decision\":\"");
-    line.push_str(decision);
-    line.push_str("\",\"body_sha256\":\"");
-    line.push_str(body_sha256);
-    line.push('"');
+    // 1.5.5 Claude Rust-expert review: switched from hand-rolled
+    // `push_str` JSON to `serde_json::json!`. The hand-rolled form
+    // relied on every field being pre-sanitized before embedding
+    // — `ts`, `dialect.audit_tag()`, and `decision` happen to be
+    // fixed character sets today, but that's not compiler-enforced,
+    // and one future field containing a `"` would have silently
+    // emitted invalid JSON. `serde_json` escapes per-field
+    // unconditionally. Attacker-influenceable strings (`reason`,
+    // `detail`) still pass through `sanitize_field` (ANSI-strip +
+    // truncate) before serde sees them.
+    let mut fields = serde_json::Map::new();
+    fields.insert("ts".to_string(), serde_json::Value::String(ts));
+    fields.insert(
+        "event".to_string(),
+        serde_json::Value::String("wrapper".to_string()),
+    );
+    fields.insert(
+        "dialect".to_string(),
+        serde_json::Value::String(dialect.audit_tag().to_string()),
+    );
+    fields.insert(
+        "decision".to_string(),
+        serde_json::Value::String(decision.to_string()),
+    );
+    fields.insert(
+        "body_sha256".to_string(),
+        serde_json::Value::String(body_sha256.to_string()),
+    );
     if let Some(r) = reason {
-        // Classifier reasons can embed path fragments and other
-        // attacker-influenced substrings; strip ANSI and cap length
-        // before embedding. `serde_json::to_string` on a &str only
-        // fails on OOM; the `unwrap_or` is defensive.
-        let cleaned = crate::audit_io::sanitize_field(r, crate::audit_io::MAX_STRING_CHARS);
-        line.push_str(",\"reason\":");
-        line.push_str(
-            &serde_json::to_string(&cleaned)
-                .unwrap_or_else(|_| "\"<serialize error>\"".to_string()),
-        );
+        let cleaned = crate::audit_io::sanitize_field(r, crate::audit_io::MAX_STRING_BYTES);
+        fields.insert("reason".to_string(), serde_json::Value::String(cleaned));
     }
     if let Some(d) = detail {
-        let cleaned = crate::audit_io::sanitize_field(d, crate::audit_io::MAX_STRING_CHARS);
-        line.push_str(",\"detail\":");
-        line.push_str(
-            &serde_json::to_string(&cleaned)
-                .unwrap_or_else(|_| "\"<serialize error>\"".to_string()),
-        );
+        let cleaned = crate::audit_io::sanitize_field(d, crate::audit_io::MAX_STRING_BYTES);
+        fields.insert("detail".to_string(), serde_json::Value::String(cleaned));
     }
     if let Some(e) = exit_code {
-        line.push_str(",\"exit\":");
-        line.push_str(&e.to_string());
+        fields.insert(
+            "exit".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(e)),
+        );
     }
-    line.push_str("}\n");
+    // `preserve_order` feature (enabled in Cargo.toml) keeps Map
+    // insertion order, so `ts` leads every record for `sort -n`
+    // friendliness. `to_string` on a Value only fails on OOM; if
+    // that happens, skip the line rather than write a partial.
+    let Ok(mut line) = serde_json::to_string(&serde_json::Value::Object(fields)) else {
+        return;
+    };
+    line.push('\n');
     let _ = crate::audit_io::append_jsonl_line(&path, &line);
 }
 

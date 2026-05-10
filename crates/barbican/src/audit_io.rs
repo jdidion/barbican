@@ -34,9 +34,17 @@ use std::time::SystemTime;
 
 use crate::sanitize::strip_ansi;
 
-/// Max chars any single string field is allowed to reach before
-/// truncation. Matches the hook's historical cap (Narthex parity).
-pub const MAX_STRING_CHARS: usize = 4000;
+/// Max UTF-8 bytes any single string field is allowed to reach
+/// before truncation. Matches the hook's historical cap (Narthex
+/// parity).
+///
+/// 1.5.5 GPT-5.2 review: pre-1.5.5 this was named `MAX_STRING_CHARS`
+/// and documentation said "chars". The implementation has always
+/// measured in bytes (`s.len()`), with a trailing char-boundary
+/// backtrack to preserve UTF-8 validity. Renamed for accuracy and
+/// so a future reviewer doesn't "fix" the code to match the stale
+/// name. The on-disk cap is unchanged (4000 bytes).
+pub const MAX_STRING_BYTES: usize = 4000;
 
 /// Resolve `~/.claude/barbican/audit.log` from the current `HOME` env
 /// var. Returns `None` if HOME is unset, empty, or non-absolute —
@@ -168,11 +176,13 @@ const fn o_nofollow() -> i32 {
     }
 }
 
-/// ANSI-strip `s` and truncate to `cap` chars with a
-/// `...[truncated N chars]` marker. Use for every caller-provided
+/// ANSI-strip `s` and truncate to `cap` UTF-8 bytes with a
+/// `...[truncated N bytes]` marker. Use for every caller-provided
 /// string field that lands in the audit log — classifier deny
 /// reasons, command strings, URLs, session ids. Stripping first
-/// ensures truncation never cuts an escape in half.
+/// ensures truncation never cuts an escape in half. Truncation
+/// backtracks from `cap` to the preceding UTF-8 char boundary so
+/// the output is always valid UTF-8.
 #[must_use]
 pub fn sanitize_field(s: &str, cap: usize) -> String {
     let stripped = strip_ansi(s).into_owned();
@@ -188,7 +198,7 @@ fn truncate_with_marker(s: &str, cap: usize) -> String {
         end -= 1;
     }
     let dropped = s.len() - end;
-    format!("{prefix}...[truncated {dropped} chars]", prefix = &s[..end])
+    format!("{prefix}...[truncated {dropped} bytes]", prefix = &s[..end])
 }
 
 /// Anomaly marker emitted when the wall clock reports a pre-1970 time.
@@ -318,7 +328,7 @@ mod tests {
         let long = "a".repeat(5000);
         let out = sanitize_field(&long, 4000);
         assert!(out.starts_with(&"a".repeat(4000)));
-        assert!(out.contains("...[truncated 1000 chars]"));
+        assert!(out.contains("...[truncated 1000 bytes]"));
     }
 
     /// 1.3.7 adversarial review (gemini-3.1-pro CRITICAL #1):

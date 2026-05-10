@@ -215,12 +215,21 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
 /// few characters of `s` look like HTML / SVG / XML regardless of
 /// case. Adversarial review flagged that `<HtMl>` / `<SvG>` bypassed
 /// a case-sensitive `starts_with`.
+///
+/// 1.5.5 GPT-5.2 review: the prior form allocated a fresh lowercase
+/// `String` prefix per call via
+/// `s.chars().take(10).flat_map(char::to_lowercase).collect()`. All
+/// probe tokens are ASCII, so an `eq_ignore_ascii_case` byte-prefix
+/// compare is equivalent and zero-allocation. `<?xml` must still
+/// match case-insensitively because the XML spec allows
+/// `<?XmL version=...>`.
 fn sniff_looks_like_markup(s: &str) -> bool {
-    let prefix: String = s.chars().take(10).flat_map(char::to_lowercase).collect();
-    prefix.starts_with("<!doctype")
-        || prefix.starts_with("<html")
-        || prefix.starts_with("<svg")
-        || prefix.starts_with("<?xml")
+    let bytes = s.as_bytes();
+    // Probes ordered by common prevalence: html > doctype > svg > xml.
+    const PROBES: &[&[u8]] = &[b"<!DOCTYPE", b"<HTML", b"<SVG", b"<?XML"];
+    PROBES.iter().any(|probe| {
+        bytes.len() >= probe.len() && bytes[..probe.len()].eq_ignore_ascii_case(probe)
+    })
 }
 
 /// Expand a leading `~` or `~user` in a path. Anything else is
@@ -409,8 +418,25 @@ fn enforce_policy(canonical: &Path, original: &Path) -> Result<(), ReadError> {
 /// Users who legitimately need to allow a symlink should point
 /// `BARBICAN_SAFE_READ_ALLOW` at the symlink's target directly.
 fn allow_rule_permits(original: &Path, canonical: &Path) -> bool {
-    let Ok(allows) = parse_absolute_path_list("BARBICAN_SAFE_READ_ALLOW") else {
-        return false;
+    // 1.5.5 Claude Rust-expert review: the prior `let Ok(...) else
+    // { return false }` silently swallowed parse errors on malformed
+    // allow lists. The user saw "path denied by sensitive rule X"
+    // instead of "your BARBICAN_SAFE_READ_ALLOW is malformed at
+    // entry N" — spending hours chasing the wrong phantom. Deny-by-
+    // default on malformed input stays correct (CLAUDE.md rule #1),
+    // but we now log the parse error so operators can find it.
+    let allows = match parse_absolute_path_list("BARBICAN_SAFE_READ_ALLOW") {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "safe_read: BARBICAN_SAFE_READ_ALLOW parse failed — \
+                 treating as empty allow list (deny-by-default per \
+                 safety posture). Fix the env var to expose an allow \
+                 carveout."
+            );
+            return false;
+        }
     };
     for a in &allows {
         if !paths_equal(original, a) {
@@ -526,8 +552,39 @@ fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
 /// where `/var` → `/private/var`) match the canonical form of the
 /// user-supplied path. If canonicalization fails (path doesn't exist
 /// yet), we keep the lexical form as a fallback.
+///
+/// 1.5.5 Claude Rust-expert review: the list is rebuilt from scratch
+/// on every `enforce_policy` call — 18+ `PathBuf::join` allocations
+/// plus several `canonicalize` syscalls per safe_read request. Cache
+/// keyed by the resolved `$HOME` so legitimate test environments
+/// that mutate `HOME` pick up the new list without a process
+/// restart. The OnceLock holds `(home, list)`; a miss rebuilds.
 fn default_deny_list() -> Vec<PathBuf> {
+    use std::sync::Mutex;
+    static CACHE: std::sync::OnceLock<Mutex<Option<(PathBuf, Vec<PathBuf>)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
     let home = canonical_or_same(home_dir());
+    // Mutex lock is local to this function; contention is nil in
+    // practice (one hook process = one safe_read at a time) and the
+    // critical section is the home-equality check + at most one
+    // rebuild.
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((cached_home, list)) = guard.as_ref() {
+            if cached_home == &home {
+                return list.clone();
+            }
+        }
+        let list = build_default_deny_list(&home);
+        *guard = Some((home, list.clone()));
+        return list;
+    }
+    // Poisoned mutex (panic during prior hold) — fall back to
+    // uncached. Correct semantics; just slower.
+    build_default_deny_list(&home)
+}
+
+fn build_default_deny_list(home: &Path) -> Vec<PathBuf> {
     vec![
         // SSH + AWS + GnuPG + GitHub CLI + Docker — per L3 audit.
         home.join(".ssh"),

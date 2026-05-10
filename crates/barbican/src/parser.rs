@@ -312,11 +312,11 @@ fn walk_statement(
         return Err(ParseError::Malformed);
     }
     match node.kind() {
-        "pipeline" => out.push(walk_pipeline(node, src, depth + 1)?),
+        "pipeline" => out.push(walk_pipeline(node, src, depth.saturating_add(1))?),
         "command" => out.push(Pipeline {
-            stages: vec![walk_command(node, src, depth + 1)?],
+            stages: vec![walk_command(node, src, depth.saturating_add(1))?],
         }),
-        "redirected_statement" => walk_redirected_statement(node, src, out, depth + 1)?,
+        "redirected_statement" => walk_redirected_statement(node, src, out, depth.saturating_add(1))?,
         // True data / leaf kinds. Never contain executable
         // substitutions — safe to skip without recursing. Don't deny,
         // because denying breaks legitimate `for x in a b c`, `case`,
@@ -382,7 +382,7 @@ fn walk_statement(
         | "process_substitution" => {
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
-                    walk_statement(child, src, out, depth + 1)?;
+                    walk_statement(child, src, out, depth.saturating_add(1))?;
                 }
             }
         }
@@ -409,7 +409,7 @@ fn walk_pipeline(node: Node<'_>, src: &[u8], depth: usize) -> Result<Pipeline, P
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "command" => stages.push(walk_command(child, src, depth + 1)?),
+            "command" => stages.push(walk_command(child, src, depth.saturating_add(1))?),
             "redirected_statement" => {
                 let body = redirected_statement_body(child)?;
                 if body.kind() != "command" {
@@ -418,7 +418,7 @@ fn walk_pipeline(node: Node<'_>, src: &[u8], depth: usize) -> Result<Pipeline, P
                     // surface as a bare subshell stage.
                     return Err(ParseError::Malformed);
                 }
-                let mut c = walk_command(body, src, depth + 1)?;
+                let mut c = walk_command(body, src, depth.saturating_add(1))?;
                 c.redirects.extend(collect_redirects(child, src)?);
                 stages.push(c);
             }
@@ -444,13 +444,13 @@ fn walk_redirected_statement(
     let redirects = collect_redirects(node, src)?;
     match body.kind() {
         "pipeline" => {
-            let mut p = walk_pipeline(body, src, depth + 1)?;
+            let mut p = walk_pipeline(body, src, depth.saturating_add(1))?;
             let last = p.stages.last_mut().ok_or(ParseError::Malformed)?;
             last.redirects.extend(redirects);
             out.push(p);
         }
         "command" => {
-            let mut c = walk_command(body, src, depth + 1)?;
+            let mut c = walk_command(body, src, depth.saturating_add(1))?;
             c.redirects.extend(redirects);
             out.push(Pipeline { stages: vec![c] });
         }
@@ -499,7 +499,7 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
         let normalized = crate::sanitize::nfkc(&raw);
         cmd.basename = cmd_basename(strip_command_name_quoting(&normalized)).to_string();
         cmd.argv0_raw = raw;
-        collect_substitutions(name_node, src, &mut cmd.substitutions, depth + 1)?;
+        collect_substitutions(name_node, src, &mut cmd.substitutions, depth.saturating_add(1))?;
     }
 
     let mut cursor = node.walk();
@@ -509,8 +509,8 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
         }
         if is_redirect_kind(child.kind()) {
             cmd.redirects
-                .push(redirect_from_node(child, src, depth + 1)?);
-            collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
+                .push(redirect_from_node(child, src, depth.saturating_add(1))?);
+            collect_substitutions(child, src, &mut cmd.substitutions, depth.saturating_add(1))?;
             continue;
         }
         if child.kind() == "variable_assignment" {
@@ -523,7 +523,7 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
             if let Some((name, value)) = extract_variable_assignment(child, src) {
                 cmd.assignments.push((name, value));
             }
-            collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
+            collect_substitutions(child, src, &mut cmd.substitutions, depth.saturating_add(1))?;
             continue;
         }
         if name_id == Some(child.id()) {
@@ -531,7 +531,7 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
             continue;
         }
         cmd.args.push(extract_word_text(child, src)?);
-        collect_substitutions(child, src, &mut cmd.substitutions, depth + 1)?;
+        collect_substitutions(child, src, &mut cmd.substitutions, depth.saturating_add(1))?;
     }
 
     Ok(cmd)
@@ -565,7 +565,17 @@ fn is_redirect_kind(kind: &str) -> bool {
 ///
 /// Deny on any redirect shape we don't know — being lenient here
 /// re-creates the bypass class the review flagged.
-fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redirect, ParseError> {
+// 1.5.5 GPT-5.2 + Claude review: `depth` was prefixed to `_depth`
+// because the file_redirect arm's recursive-walk-through-target was
+// never wired. Renaming keeps the parameter at call sites (the
+// walk_command callers still pass depth for parity with the other
+// walkers, in case a future grammar change exposes subst nodes
+// directly under the redirect) while silencing the unused-variable
+// warning. Also removed a vestigial `redirect.target.shrink_to_fit()`
+// — the target String comes from `String::from_utf8_lossy(bytes).into_owned()`
+// which already allocates at capacity, so shrink_to_fit was a
+// guaranteed realloc-to-same-size.
+fn redirect_from_node(node: Node<'_>, src: &[u8], _depth: usize) -> Result<Redirect, ParseError> {
     match node.kind() {
         "file_redirect" => {
             let op_text = redirect_operator_text(node, src)?;
@@ -585,7 +595,7 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
                 .child_by_field_name("destination")
                 .ok_or(ParseError::Malformed)?;
             let target = extract_word_text(dest, src)?;
-            let mut redirect = Redirect {
+            let redirect = Redirect {
                 kind,
                 target,
                 body: None,
@@ -594,10 +604,6 @@ fn redirect_from_node(node: Node<'_>, src: &[u8], depth: usize) -> Result<Redire
             // `destination` can contain a process substitution — preserve
             // it via the caller (see walk_command, which collects subs on
             // the redirect node itself).
-            let _ = depth; // reserved for future recursion through target
-                           // Reconstruct nothing else; substitutions are captured at
-                           // the walk_command layer.
-            redirect.target.shrink_to_fit();
             Ok(redirect)
         }
         "herestring_redirect" => {
@@ -767,14 +773,14 @@ fn collect_substitutions(
             let mut inner = Script::default();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_statement(child, src, &mut inner.pipelines, depth + 1)?;
+                walk_statement(child, src, &mut inner.pipelines, depth.saturating_add(1))?;
             }
             out.push(inner);
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect_substitutions(child, src, out, depth + 1)?;
+                collect_substitutions(child, src, out, depth.saturating_add(1))?;
             }
         }
     }

@@ -61,20 +61,28 @@ pub fn strip_ansi(s: &str) -> Cow<'_, str> {
 #[must_use]
 pub fn escape_for_prose(s: &str) -> String {
     const MAX_PROSE_BYTES: usize = 256;
-    // Pass 1: strip ANSI so escapes don't survive as raw bytes.
-    let ansi_free = strip_ansi(s).into_owned();
-    // Pass 2: drop zero-width / bidi-override.
-    let without_invisibles = strip_invisible(&ansi_free);
-    // Pass 3: replace control characters with `?`.
-    let mut out = String::with_capacity(without_invisibles.len());
-    for c in without_invisibles.chars() {
+    // 1.5.5 Gemini + Claude review: the pre-1.5.5 form ran
+    // `strip_ansi.into_owned()` → `strip_invisible` (allocates) →
+    // per-char `is_control` rewrite (allocates) as three separate
+    // Strings. The ANSI pass is regex-driven and stays separate, but
+    // the invisible-strip and control-replace are char-level and can
+    // fuse into a single filter/map. On a 256-byte attacker string
+    // this was 3 allocations; fused form is 2 (or 1 when the string
+    // has no ANSI and borrows through).
+    let ansi_free = strip_ansi(s);
+    // Fused: skip invisibles, replace controls with `?`, accumulate.
+    let mut out = String::with_capacity(ansi_free.len());
+    for c in ansi_free.chars() {
+        if is_invisible(c) {
+            continue;
+        }
         if c.is_control() {
             out.push('?');
         } else {
             out.push(c);
         }
     }
-    // Pass 4: truncate if too long.
+    // Truncate if too long.
     if out.len() > MAX_PROSE_BYTES {
         // Truncate at a char boundary below the cap.
         let mut cut = MAX_PROSE_BYTES;
