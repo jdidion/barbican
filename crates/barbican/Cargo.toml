@@ -5,7 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+# Package-relative (not workspace-relative) — workspace-inherited
+# readme paths get re-rooted to the workspace, yielding invalid
+# ../../../../README.md. Symlinked so there's only one canonical copy.
+readme = "README.md"
 description.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

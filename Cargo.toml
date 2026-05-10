@@ -17,7 +17,18 @@ edition = "2021"
 rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/jdidion/barbican"
-description = "Rust port of Narthex: a safety layer for Claude Code hooks and MCP tools."
+homepage = "https://github.com/jdidion/barbican"
+description = "Safety layer for Claude Code: classifier-gated bash hook + MCP server blocking dangerous command compositions."
+keywords = ["claude-code", "security", "safety", "sandbox", "agent"]
+# crates.io categories chosen from the canonical list at
+# https://crates.io/category_slugs. "command-line-utilities" is the
+# primary (Barbican is invoked as a binary); the security + development
+# tools rubrics narrow the audience.
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "development-tools::testing",
+]
 
 [workspace.lints.rust]
 # 1.4.0: the wrapper binaries need `libc::signal(SIGINT, SIG_IGN)` +
