@@ -511,7 +511,7 @@ fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
 /// The baked-in deny list. Every entry is expanded against the current
 /// `HOME` each call so test harnesses that swap `HOME` see fresh
 /// paths. The list is small and hand-maintained — if you add a new
-/// entry, also update `SECURITY.md` and the deny-by-default test.
+/// entry, also update `docs/SECURITY.md` and the deny-by-default test.
 ///
 /// The `HOME` base and every absolute path are passed through
 /// `fs::canonicalize` when possible so symlinked roots (notably macOS

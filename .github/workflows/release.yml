@@ -133,7 +133,7 @@ jobs:
           for wrapper in barbican-shell barbican-python barbican-node barbican-ruby barbican-perl; do
             cp "$BIN_DIR/$wrapper" "$STAGE_DIR/$wrapper"
           done
-          cp README.md LICENSE CHANGELOG.md SECURITY.md "$STAGE_DIR/"
+          cp README.md LICENSE CHANGELOG.md docs/SECURITY.md "$STAGE_DIR/"
 
           # Pack as .tar.gz (same convention as rustup-init, fd, ripgrep,
           # etc.). No .zip — single-binary release, Unix-only users.

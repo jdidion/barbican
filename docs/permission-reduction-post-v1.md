@@ -206,7 +206,7 @@ Secondary metric: prompt-fatigue rate (prompts per session). Not directly measur
 
 ## 8. Sequencing
 
-This is a **v2 deliverable**. Not part of the Narthex port defined in `/Users/jodidion/projects/barbican/PLAN.md`. It coexists with the other v2 candidates already under discussion:
+This is a **v2 deliverable**. Not part of the Narthex port defined in `/Users/jodidion/projects/barbican/docs/PLAN.md`. It coexists with the other v2 candidates already under discussion:
 
 | v2 candidate | Relationship |
 |---|---|
@@ -259,6 +259,6 @@ Apply with: barbican permissions apply
 
 - Classifier tables: `/Users/jodidion/projects/barbican/crates/barbican/src/tables.rs`
 - PreToolUse hook entry: `/Users/jodidion/projects/barbican/crates/barbican/src/hooks/pre_bash.rs`
-- CLI dispatcher (where the `permissions` subcommand would be wired alongside `install` / `uninstall` / `audit`): `/Users/jodidion/projects/barbican/crates/barbican/src/main.rs`. Install/uninstall modules are planned per PLAN.md module layout but not yet present in the v1 tree.
-- Port plan: `/Users/jodidion/projects/barbican/PLAN.md`
+- CLI dispatcher (where the `permissions` subcommand would be wired alongside `install` / `uninstall` / `audit`): `/Users/jodidion/projects/barbican/crates/barbican/src/main.rs`. Install/uninstall modules are planned per docs/PLAN.md module layout but not yet present in the v1 tree.
+- Port plan: `/Users/jodidion/projects/barbican/docs/PLAN.md`
 - Threat model (for trust-model section reference): `/Users/jodidion/projects/barbican/SECURITY.md`
