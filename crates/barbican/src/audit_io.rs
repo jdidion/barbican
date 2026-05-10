@@ -244,6 +244,10 @@ pub fn iso8601_utc_now() -> String {
 /// so the anomaly-marker path (clock before `UNIX_EPOCH`) can be
 /// exercised without rolling the system clock back.
 #[must_use]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "year/month/day/hour/minute/second are the canonical single-letter names for the civil-from-unix tuple"
+)]
 pub(crate) fn iso8601_utc_from(t: SystemTime) -> String {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(now) => {
@@ -335,7 +339,7 @@ mod tests {
         // before 1.5.4 the function used `.unwrap_or_default()` and
         // silently produced `1970-01-01T00:00:00.000Z` on clock
         // rollback. Now it emits the anomaly marker.
-        let pre_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(3600);
+        let pre_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_hours(1);
         assert_eq!(iso8601_utc_from(pre_epoch), CLOCK_ANOMALY_MARKER);
         // Anomaly marker is intentionally a different length from the
         // normal 24-char timestamp, so any downstream parser doing a
@@ -351,7 +355,10 @@ mod tests {
     fn iso8601_from_known_epoch_matches_expected_format() {
         // 2024-02-29T00:00:00.000Z — a leap day, catches civil_from_unix
         // regressions through the public function.
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_709_164_800);
+        // 2024-02-29 00:00 UTC is 474_768 hours after UNIX_EPOCH; the
+        // `from_hours` form reads cleaner than the equivalent second
+        // count. clippy's `duration_suboptimal_units` surfaced this.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(474_768);
         assert_eq!(iso8601_utc_from(t), "2024-02-29T00:00:00.000Z");
     }
 
