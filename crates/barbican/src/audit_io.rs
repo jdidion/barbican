@@ -101,7 +101,26 @@ pub fn append_jsonl_line(path: &Path, line: &str) -> std::io::Result<()> {
                 )));
             }
             Ok(meta) if meta.file_type().is_dir() => {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                // Best-effort tighten to 0o700 (defense-in-depth L2). If
+                // this silently failed — e.g. parent is on a filesystem
+                // that doesn't honor POSIX perms, or the running user
+                // doesn't own it — the advertised `0o700` guarantee would
+                // be weakened without operators knowing. Surface the
+                // failure via `tracing::warn!` so it shows up in the
+                // session log. The write still proceeds because the
+                // other security properties (leaf mode 0o600,
+                // O_NOFOLLOW, ancestor-symlink rejection) still hold.
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                {
+                    tracing::warn!(
+                        parent = %parent.display(),
+                        error = %e,
+                        "barbican audit: failed to tighten parent directory permissions to 0o700 \
+                         — log write proceeds (leaf mode 0o600 + O_NOFOLLOW still enforced), \
+                         but directory listings may be readable by other users on this host",
+                    );
+                }
             }
             _ => {}
         }
@@ -159,18 +178,17 @@ fn ancestor_chain_has_symlink(parent: &Path) -> bool {
     false
 }
 
-/// The POSIX `O_NOFOLLOW` flag. Differs by OS; fallback to 0 on
-/// exotic platforms (they lose symlink hardening but still build).
+/// The POSIX `O_NOFOLLOW` flag. Delegates to `libc` so the per-OS
+/// value stays correct across platforms; the previous hand-rolled
+/// constant duplicated libc's values and risked drifting on any
+/// target we hadn't thought about. Non-unix targets get `0` (they
+/// lose symlink hardening but still build).
 const fn o_nofollow() -> i32 {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        0x0100
+        libc::O_NOFOLLOW
     }
-    #[cfg(target_os = "linux")]
-    {
-        0x20000
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(unix))]
     {
         0
     }
@@ -241,9 +259,19 @@ pub(crate) fn iso8601_utc_from(t: SystemTime) -> String {
 /// Split a Unix timestamp into `(year, month, day, hour, minute,
 /// second)` in UTC. Based on Howard Hinnant's civil-date algorithm
 /// (<https://howardhinnant.github.io/date_algorithms.html>).
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+///
+/// Casts here are all provably safe because the algorithm floors each
+/// intermediate value into a sub-u32 range before the cast fires. A
+/// blanket `#[allow]` was attached on the function previously; each
+/// cast now carries its own justification so a future reader sees
+/// exactly why the truncation is fine.
 fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let days_since_epoch = i64::try_from(secs / 86_400).unwrap_or(0);
+    // `secs % 86_400` is in `0..86_400`, which fits in u32 (max 86_399).
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "secs % 86_400 is bounded to 0..86_400, fits in u32"
+    )]
     let secs_in_day = (secs % 86_400) as u32;
     let hour = secs_in_day / 3600;
     let minute = (secs_in_day / 60) % 60;
@@ -251,6 +279,12 @@ fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 
     let shifted = days_since_epoch + 719_468;
     let era = shifted.div_euclid(146_097);
+    // `rem_euclid(146_097)` is always in `0..146_097`, which fits in u32.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rem_euclid(146_097) is bounded to 0..146_097, fits in u32 and is non-negative"
+    )]
     let day_of_era = shifted.rem_euclid(146_097) as u32;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
