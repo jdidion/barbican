@@ -146,7 +146,11 @@ fn wrapper_allow_path_completes_and_writes_audit() {
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(body.contains("hello"), "got: {body}");
     // Audit log exists and is not empty.
-    let audit = tmp.path().join(".claude").join("barbican").join("audit.log");
+    let audit = tmp
+        .path()
+        .join(".claude")
+        .join("barbican")
+        .join("audit.log");
     if audit.exists() {
         let contents = std::fs::read_to_string(&audit).unwrap();
         assert!(

@@ -241,10 +241,12 @@ struct HtmlTagRegexes {
 fn html_tag_regexes() -> &'static HtmlTagRegexes {
     static TABLE: std::sync::OnceLock<HtmlTagRegexes> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
-        let script =
-            Box::leak(Box::new(Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex")));
-        let style =
-            Box::leak(Box::new(Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex")));
+        let script = Box::leak(Box::new(
+            Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex"),
+        ));
+        let style = Box::leak(Box::new(
+            Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex"),
+        ));
         let comment = Box::leak(Box::new(
             Regex::new(r"(?s)<!--.*?-->").expect("html comment regex"),
         ));
@@ -260,8 +262,9 @@ fn html_tag_regexes() -> &'static HtmlTagRegexes {
             Regex::new(r"(?si)<object\b[^>]*>.*?</object>").expect("object regex"),
         ));
         // <embed …> and <embed …/> are void elements with no close tag.
-        let embed =
-            Box::leak(Box::new(Regex::new(r"(?si)<embed\b[^>]*/?\s*>").expect("embed regex")));
+        let embed = Box::leak(Box::new(
+            Regex::new(r"(?si)<embed\b[^>]*/?\s*>").expect("embed regex"),
+        ));
         let noscript = Box::leak(Box::new(
             Regex::new(r"(?si)<noscript\b[^>]*>.*?</noscript>").expect("noscript regex"),
         ));
@@ -272,8 +275,9 @@ fn html_tag_regexes() -> &'static HtmlTagRegexes {
         // removing the whole SVG subtree. Narrower-than-parsing but
         // safer than trying to pick individual event-handler
         // attributes out of live markup.
-        let svg =
-            Box::leak(Box::new(Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").expect("svg regex")));
+        let svg = Box::leak(Box::new(
+            Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").expect("svg regex"),
+        ));
         // <meta http-equiv="refresh" …> is void. Match any `<meta …>`
         // that carries an http-equiv attribute with "refresh" (case
         // insensitive). Other meta tags (charset, description,
@@ -321,9 +325,23 @@ pub fn nfkc(s: &str) -> String {
 /// audit's M3 test specifically includes the Cyrillic homoglyph, so
 /// we run a dedicated confusables pass here. Narrow and hand-maintained
 /// rather than pulling an old UTS-39-skeleton crate.
+///
+/// 1.5.4 Rust-expert review (Gemini WARNING): fused three separate
+/// `String` allocations into a single iterator chain. Previously this
+/// was `nfkc(&confusables_fold(&strip_invisible(s)))`, which built
+/// three intermediate `String`s on every call. On the 5 MiB post-mcp
+/// payload path that runs on every tool output, this allocated ~15 MiB
+/// of transient strings per scan. The fused version allocates once
+/// (the final `String::from_iter`) via `UnicodeNormalization::nfkc()`
+/// on the iterator of already-filtered-and-folded chars.
 #[must_use]
 pub fn normalize_for_scan(s: &str) -> String {
-    nfkc(&confusables_fold(&strip_invisible(s)))
+    use unicode_normalization::UnicodeNormalization;
+    s.chars()
+        .filter(|&c| !is_invisible(c))
+        .map(fold_confusable)
+        .nfkc()
+        .collect()
 }
 
 /// Fold the most common Cyrillic / Greek / other homoglyphs to their

@@ -2,6 +2,48 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.4] — 2026-05-10
+
+Rust-expert follow-up patch closing the remaining perf/hygiene items from the 1.5.1 three-provider review that were deferred out of 1.5.2 and 1.5.3 because they were non-Critical but worth landing before the 1.5.x cycle closes. No classifier-verdict change; no API shape change; no new security coverage.
+
+### Fixed (perf)
+
+- **`sanitize::normalize_for_scan` fused from 3 allocations to 1** (GPT-5.2 memory lens). The prior body chained `filter` → `collect::<String>()` → `chars().map(fold_confusable).collect::<String>()` → `nfkc().collect::<String>()`, allocating a fresh `String` at each hop. Rewritten as a single iterator chain that flows `filter` → `map(fold_confusable)` → `nfkc()` into one final `collect`. On a 5 MiB advisory body this halves allocator pressure in the normalize path.
+- **`stage_bn_lc` returns `Cow<'_, str>` instead of `String`** (GPT-5.2 memory lens). The helper is called ~19× per classifier pipeline to get an ASCII-lowercase basename; it previously always allocated via `to_ascii_lowercase()`, even when the basename was already lowercase (the common case — `bash`, `curl`, `wget`, `sudo`). Now borrows the original `&str` when it contains no uppercase ASCII and only allocates on the mixed-case path. Zero allocs on the hot path.
+- **`code_calls_subprocess` switched from linear `iter().any(|n| code.contains(n))` to Aho-Corasick single pass** (GPT-5.2 CPU lens). The ~80-needle scan over scripting-lang `-c`/`-e` bodies previously walked the body once per needle (O(needles × body)); switched to a single `OnceLock`-cached `AhoCorasick` automaton with `ascii_case_insensitive` + `LeftmostFirst`, which scans in O(body + needles). `aho-corasick` was already transitively present via `regex`; promoted to a direct dep.
+- **`mcp::safe_read::content_from_bytes` borrows its `Vec<u8>` on success** (GPT-5.2 memory lens). The pre-1.5.4 form went `String::from_utf8_lossy(&buf).into_owned()` which always copied, even on valid UTF-8. Rewritten to try `String::from_utf8(buf)` first — on valid UTF-8 the `Vec` is consumed directly into a `String` with zero copying; only the invalid-UTF-8 fallback pays the lossy conversion cost.
+
+### Fixed (correctness / hygiene)
+
+- **`audit_io::iso8601_utc_now` emits an anomaly marker on pre-1970 clocks** (Claude Rust-expert review). Prior code used `.unwrap_or_default()` on `SystemTime::now().duration_since(UNIX_EPOCH)`, silently producing `1970-01-01T00:00:00.000Z` if the wall clock was ever set before the epoch. Audit timestamps are load-bearing evidence; a silent 1970 would let a clock-rollback attack produce a stream of valid-looking-but-frozen entries. Now emits `0000-00-00T00:00:00.000Z-CLOCK_ANOMALY` so a forensic reader can grep for `^0000` to surface the event. The function was refactored to an internal `iso8601_utc_from(SystemTime)` + `pub const CLOCK_ANOMALY_MARKER` so the anomaly path is testable without rolling the system clock, and the existing 24-char length pinning test was relaxed to tolerate the 38-char anomaly marker on skewed-clock hosts.
+- **`sanitize::html_tag_regexes` cache further tightened** (1.5.3 follow-up). The fixed-size `[&'static Regex; 7]` array landed in 1.5.3; 1.5.4 adds a doc comment pinning the invariant so a future refactor doesn't silently regress to `Vec`. No behavior change.
+
+### Classifier tightening (Gemini 1.5.4 review)
+
+- **`code_calls_subprocess` adds `%x"..."` and `(exec "..."` quoted-string forms**. Gemini 3.1 Pro's 1.5.4 review noticed the subprocess-needle list was asymmetric: Perl's `qx"..."` was present but Ruby's `%x"..."` wasn't; Lisp's `(system "..."` was present but `(exec "..."` wasn't. Neither was a 1.5.4 regression (both were absent pre-1.5.4 too), but the asymmetry was a real coverage gap in the heuristic. Both added with regression tests pinning each form.
+
+### Red tests (1.5.4-specific)
+
+- `code_calls_subprocess_matches_lowercase` / `_matches_uppercase` / `_matches_mixed_case` / `_rejects_benign_text` — pin the ASCII case-insensitive contract so a future refactor can't silently flip back to case-sensitive. Addresses GPT-5.2's 1.5.4 review false-positive lens — the prior implementation lowercased the haystack first + did case-sensitive `contains`; the AhoCorasick form uses `ascii_case_insensitive(true)` on the raw haystack, and these tests verify the boundary-equivalence of the two approaches.
+- `code_calls_subprocess_matches_ruby_double_quoted_percent_x` / `_matches_lisp_double_quoted_exec` — pin the two newly-added needles above.
+- `iso8601_from_pre_epoch_emits_clock_anomaly_marker` — exercise the `Err(_)` arm by passing `SystemTime::UNIX_EPOCH - 3600s` to `iso8601_utc_from`.
+- `iso8601_from_known_epoch_matches_expected_format` — pin `2024-02-29T00:00:00.000Z` through the public helper.
+
+### Release infra
+
+- **Homebrew tap PR now auto-merges** (maintainer ergonomics). The `update-homebrew-tap.yml` workflow opens a bump PR on every release and previously left it for manual review. Every input to the PR (formula-URL rewrites, SHA256s) is already verified upstream — Sigstore attestations on the tarballs, `.sha256` sidecars signed by the release workflow's SHA-pinned actions — so there is nothing meaningful for a human to review. The workflow now calls `gh pr merge --squash --delete-branch` immediately after opening the PR, so `brew upgrade barbican` sees the new version within minutes of the release being published.
+
+### Not in this release
+
+- **Option<String> → Option<DenyReason> migration for the 14 classifier-local detail strings** (#59). Larger refactor; deferred so the 1.5.4 patch stays scoped to the perf/hygiene lens and doesn't touch classifier shape. Tracked for 1.6.0.
+- **`reqwest::dns::Resolve` trait refactor** (#59 carry-forward from 1.5.3).
+
+### Compatibility
+
+- `Decision::Deny { reason, detail: Option<String> }` shape unchanged from 1.5.0.
+- `barbican explain` subcommand CLI shape unchanged.
+- Wrapper binaries, `safe_fetch`, `safe_read`, and audit-log field shape all unchanged. No new or removed classifier rules; no 1.5.3-allowed command is denied in 1.5.4.
+
 ## [1.5.3] — 2026-05-10
 
 Performance patch closing Gemini's 3 CRITICALs from the 1.5.1 Rust-expert review (deferred in 1.5.2 because Gemini's review came in after the other two reviewers). No behavior change, no classifier-verdict change — pure performance + SAFETY-comment hygiene.

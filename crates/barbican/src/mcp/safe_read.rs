@@ -110,7 +110,15 @@ fn read_blocking(path: &str, max_bytes: usize) -> Result<ReadOutcome, ReadError>
     }
 
     let bytes_read = buf.len();
-    let raw = String::from_utf8_lossy(&buf).into_owned();
+    // 1.5.4 Rust-expert review: `from_utf8_lossy().into_owned()`
+    // allocated a fresh String even when the bytes were already
+    // valid UTF-8. Try `String::from_utf8` first (zero allocation if
+    // the bytes are valid — `buf` is consumed and reused in place);
+    // fall back to lossy only on decode error.
+    let raw = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    };
     let (body, sanitizer_notes) = sanitize(&raw, &canonical, truncated);
 
     Ok(ReadOutcome {

