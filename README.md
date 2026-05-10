@@ -14,7 +14,7 @@
 
 A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a single static Rust binary. Barbican runs as a `PreToolUse` / `PostToolUse` hook and as an MCP server that exposes sanitized fetch / read / inspect tools, blocking a concrete list of known-dangerous bash compositions and prompt-injection patterns before they reach the model.
 
-This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`SECURITY.md`](SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
+This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`docs/SECURITY.md`](docs/SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ## Is Barbican right for you?
 
@@ -22,7 +22,7 @@ Barbican is **a safety floor, not a ceiling.** Read this before installing.
 
 ### What Barbican catches
 
-- **Dangerous bash compositions before they run**: `curl` / `wget` piped to a shell interpreter, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `nohup`, `find -exec`, `docker run <shell> -c`, container/sandbox/debugger/privilege-escalation fronts — `nsenter`, `chroot`, `pkexec`, `su-exec`, `setpriv`, `prlimit`, `sg`, `schroot`, `flatpak run`, and the usual container family), DNS-channel exfil, secret-to-network pipelines, staged download-and-execute payloads written to exec targets, shell-startup env-var smuggling (`PROMPT_COMMAND=`, `BASH_ENV=`, `ENV=`), reverse-shell `/dev/tcp/…` patterns, git config injection, and scripting-language shellouts across python / perl / ruby / node / deno / bun / php / lua / tclsh / rscript / swift / racket / guile / julia / sbcl / awk / pwsh. The classifier is narrowed to specific shapes; broader network-tool-to-shell compositions (`nc | bash`, `ssh host cat | bash`, `socat | bash`) are NOT caught unless they also cross an M2 signal (secret reference, env dumper, base64-then-network). See [`SECURITY.md` § Known parser limits](SECURITY.md) for the full scope. Every shape ships with a red-test-first regression test under `tests/pre_bash_*.rs`.
+- **Dangerous bash compositions before they run**: `curl` / `wget` piped to a shell interpreter, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `nohup`, `find -exec`, `docker run <shell> -c`, container/sandbox/debugger/privilege-escalation fronts — `nsenter`, `chroot`, `pkexec`, `su-exec`, `setpriv`, `prlimit`, `sg`, `schroot`, `flatpak run`, and the usual container family), DNS-channel exfil, secret-to-network pipelines, staged download-and-execute payloads written to exec targets, shell-startup env-var smuggling (`PROMPT_COMMAND=`, `BASH_ENV=`, `ENV=`), reverse-shell `/dev/tcp/…` patterns, git config injection, and scripting-language shellouts across python / perl / ruby / node / deno / bun / php / lua / tclsh / rscript / swift / racket / guile / julia / sbcl / awk / pwsh. The classifier is narrowed to specific shapes; broader network-tool-to-shell compositions (`nc | bash`, `ssh host cat | bash`, `socat | bash`) are NOT caught unless they also cross an M2 signal (secret reference, env dumper, base64-then-network). See [`SECURITY.md` § Known parser limits](docs/SECURITY.md) for the full scope. Every shape ships with a red-test-first regression test under `tests/pre_bash_*.rs`.
 - **Prompt-injection markers in tool output**: NFKC-normalized scans for "ignore previous instructions"-style patterns, with zero-width and bidi-override stripping. Not a complete defense, but closes the obvious cases.
 - **SSRF in `safe_fetch`**: RFC1918 / loopback / link-local / CGNAT / IMDS filtering, DNS pinning to defeat rebinding, mandatory `no_proxy()` to prevent proxy-side lookups.
 - **Sensitive-path reads in `safe_read`**: `.ssh/`, `.aws/`, `.env`, SSH/GPG key files, `/etc/shadow`, `/etc/sudoers`, etc. Escape hatch via `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1`.
@@ -31,13 +31,13 @@ Barbican is **a safety floor, not a ceiling.** Read this before installing.
 ### What Barbican does NOT catch
 
 - **Commands that are syntactically fine but semantically harmful.** `rm -rf ~/important`, `git push --force origin main`, `aws s3 rb s3://prod-data` — all parseable, all allow. Barbican detects *composition* patterns, not *intent*. You still need to read what Claude Code emits.
-- **Attacks that fall outside the classifier families shipped today.** New attack shapes land as findings, then as red-test-first fixes. The fuzzing infrastructure narrows this surface daily, but "no open vulnerabilities" is not the same as "no vulnerabilities." See [`SECURITY.md § Explicit non-goals`](SECURITY.md) for the documented limits.
+- **Attacks that fall outside the classifier families shipped today.** New attack shapes land as findings, then as red-test-first fixes. The fuzzing infrastructure narrows this surface daily, but "no open vulnerabilities" is not the same as "no vulnerabilities." See [`docs/SECURITY.md § Explicit non-goals`](docs/SECURITY.md) for the documented limits.
 - **A compromised launch environment.** If an attacker controls `HOME`, `PATH`, `LD_PRELOAD`, a shell `.envrc`, or the Barbican binary itself, Barbican runs against you. Documented in `SECURITY.md § Untrusted-launch environment`.
 - **A modified Claude Code binary.** Barbican sits behind Claude Code's hook contract. If Claude Code is compromised, so is everything it runs — including Barbican's hooks.
 
 ### Risks of adoption (honest assessment)
 
-See [`SECURITY.md § Risks of adoption`](SECURITY.md#risks-of-adoption) for the full list. Headline risks:
+See [`docs/SECURITY.md § Risks of adoption`](docs/SECURITY.md#risks-of-adoption) for the full list. Headline risks:
 
 1. **New attack surface you didn't have before.** The Barbican binary, the MCP server, and the installer all run as your user. A compromised release or a bug in the hook itself is code execution in every session. We publish releases signed only by the release-automation identity on GitHub; there is no reproducible-build story yet.
 2. **Silent opt-outs.** Environment variables like `BARBICAN_ALLOW_MALFORMED_HOOK_JSON=1` or `BARBICAN_SAFE_READ_ALLOW_SENSITIVE=1` turn off individual checks. An attacker who can write to your shell startup can set them.
@@ -177,7 +177,7 @@ The same classifier runs behind `explain`, the `PreToolUse` hook, and each wrapp
 cargo build --release --target aarch64-apple-darwin
 ```
 
-Requires Rust stable 1.91+ (pinned in `rust-toolchain.toml`). See [`SECURITY.md`](SECURITY.md) for the environment variables Barbican reads.
+Requires Rust stable 1.91+ (pinned in `rust-toolchain.toml`). See [`docs/SECURITY.md`](docs/SECURITY.md) for the environment variables Barbican reads.
 
 ## Fuzzing
 

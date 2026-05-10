@@ -1423,7 +1423,7 @@ fn is_h1_shell_sink(basename: &str) -> bool {
 }
 
 /// H1's narrowed network-tool set. See `h1_pipeline_curl_to_shell` and
-/// `SECURITY.md` §Known parser limits — other egress tools (`nc`,
+/// `docs/SECURITY.md` §Known parser limits — other egress tools (`nc`,
 /// `socat`, `ssh`, …) live in `NETWORK_TOOLS_HARD` and will be gated
 /// by later-phase classifiers.
 fn is_curl_or_wget(basename: &str) -> bool {
