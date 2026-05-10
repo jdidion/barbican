@@ -153,6 +153,27 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
     let mut hops = 0_u8;
     let timeout = Duration::from_secs(timeout_from_env());
 
+    // 1.5.3 Rust-expert review (Gemini CRITICAL): reuse the reqwest
+    // Client across redirect hops that stay on the same host.
+    // reqwest::Client::builder().build() is expensive — it initializes
+    // connection pools and TLS state — and rebuilding it per hop
+    // leaked pools and made redirect chains O(n) in TLS handshakes.
+    //
+    // The cache key is the resolved host string: reqwest's
+    // `resolve_to_addrs` DNS-override map is keyed exactly on the
+    // host, and changing hosts requires a new override registration,
+    // so we DO rebuild when the host changes (common-case redirects
+    // like HTTPS upgrade or trailing-slash stay on the same host and
+    // hit the cache).
+    //
+    // Note: the full structural fix Gemini suggested — register a
+    // custom `reqwest::dns::Resolve` implementation so one client
+    // handles all hosts — is tracked separately (#59) since it's a
+    // larger refactor of the Resolver trait and the SSRF filter's
+    // resolve/connect pinning. This is the minimum-diff fix that
+    // eliminates the common-case per-hop rebuild.
+    let mut cached_client: Option<(String, Client)> = None;
+
     loop {
         // Normalize the URL's host once, up front, so both the
         // `resolve_to_addrs` map key and the actual request use the
@@ -207,20 +228,32 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
             return Err(FetchError::Dns(format!("no addresses for {lookup_host}")));
         }
 
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(timeout)
-            // no_proxy() is critical: without it, reqwest honors the
-            // ambient HTTP_PROXY / HTTPS_PROXY env vars and sends the
-            // full URL to the proxy, which does its own DNS lookup.
-            // That defeats our `resolve_to_addrs` pin entirely.
-            .no_proxy()
-            .resolve_to_addrs(&host, &addrs)
-            .user_agent("barbican-safe-fetch/0.1 (+SSRF-hardened)")
-            .build()
-            .map_err(FetchError::Client)?;
+        // Cache lookup: reuse the existing client if it was built for
+        // THIS host. The DNS override is keyed exactly on `host`, so
+        // changing hosts requires a rebuild to re-pin.
+        let client_ref: &Client = match &cached_client {
+            Some((cached_host, client)) if cached_host == &host => client,
+            _ => {
+                let new_client = Client::builder()
+                    .redirect(Policy::none())
+                    .timeout(timeout)
+                    // no_proxy() is critical: without it, reqwest honors
+                    // the ambient HTTP_PROXY / HTTPS_PROXY env vars and
+                    // sends the full URL to the proxy, which does its
+                    // own DNS lookup. That defeats our
+                    // `resolve_to_addrs` pin entirely.
+                    .no_proxy()
+                    .resolve_to_addrs(&host, &addrs)
+                    .user_agent("barbican-safe-fetch/0.1 (+SSRF-hardened)")
+                    .build()
+                    .map_err(FetchError::Client)?;
+                cached_client = Some((host.clone(), new_client));
+                // Safe: we just inserted this entry.
+                &cached_client.as_ref().expect("just cached").1
+            }
+        };
 
-        let resp = client
+        let resp = client_ref
             .request(Method::GET, current.clone())
             .send()
             .await
