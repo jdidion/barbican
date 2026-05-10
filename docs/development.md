@@ -107,47 +107,80 @@ Check with `gh api repos/jdidion/barbican/releases --jq '.[] | select(.draft)'` 
 
 ## Secrets and `direnv` + `secretspec`
 
-The project uses [secretspec](https://secretspec.dev) to manage developer-scoped secrets (e.g. `CARGO_REGISTRY_TOKEN` for future crates.io publishes, potentially an Apple Developer ID for codesigning). `.envrc` at the repo root auto-loads them when direnv is active:
+The project uses [secretspec](https://secretspec.dev) to manage developer-scoped secrets (e.g. `CARGO_REGISTRY_TOKEN` for crates.io publishes, Apple Developer ID for future codesigning). `.envrc` at the repo root auto-loads them when direnv is active:
 
 ```sh
-# In the barbican checkout:
-direnv allow    # first time only, authorizes the .envrc
+brew install direnv secretspec      # or your OS equivalent
+# Set up the direnv shell hook: https://direnv.net/docs/hook.html
+cd ~/projects/barbican
+direnv allow                         # first time only; authorizes .envrc
 ```
 
-After `direnv allow`, the next `cd` into the repo runs the `.envrc`, which invokes `secretspec run --export` and exports every secret in `secretspec.toml` (if present) as environment variables for the session.
+After `direnv allow`, every `cd` into the repo runs `.envrc`, which checks for `secretspec.toml` in this order:
+
+1. `${PWD}/secretspec.toml` — per-project secrets (not currently used in Barbican).
+2. `${HOME}/secretspec.toml` — per-user secrets (the common layout for crates.io tokens).
+
+The first file found wins. Only a small allowlist of variable names is forwarded into the session (`CARGO_REGISTRY_TOKEN`, `GITLAB_TOKEN`, `JIRA_USERNAME`, `JIRA_API_TOKEN`) so `.envrc` does not leak every secretspec-managed value into every shell.
 
 ### Managing `CARGO_REGISTRY_TOKEN`
 
 The crates.io publish token is a high-value secret — a leak lets anyone publish under your crates.io account. secretspec + direnv keeps it off disk in plaintext.
 
-1. **Register the secret in secretspec.toml** (one-time, at the repo root):
+Barbican's `.envrc` checks for `secretspec.toml` in two places in order:
+
+1. `${PWD}/secretspec.toml` — per-repo. Useful when a secret is scoped to this project only.
+2. `${HOME}/secretspec.toml` — per-user. Useful when the same secret (e.g. `CARGO_REGISTRY_TOKEN`) is shared across multiple crates you publish.
+
+The user-scoped layout is the recommended default for `CARGO_REGISTRY_TOKEN` — one token per crates.io account, used across every crate you publish.
+
+**One-time user setup:**
+
+1. **Create `~/secretspec.toml` with the secrets you want to manage:**
 
    ```toml
-   # secretspec.toml
-   [secrets.CARGO_REGISTRY_TOKEN]
-   description = "crates.io publish token for the barbican crate"
+   # ~/secretspec.toml
+   [project]
+   name = "my-personal-secrets"
+   revision = "1.0"
+
+   [profiles.default]
+   CARGO_REGISTRY_TOKEN = { description = "Crates.io publish token", required = false }
+   # Add other per-user secrets here.
    ```
 
 2. **Set the secret value:**
 
    ```sh
-   secretspec set CARGO_REGISTRY_TOKEN
-   # Pastes from your clipboard or prompts interactively; value is
-   # stored in the OS keychain (macOS Keychain / Linux secret-service).
+   secretspec -f ~/secretspec.toml set CARGO_REGISTRY_TOKEN
+   # Prompts interactively; value is stored in the OS keychain
+   # (macOS Keychain / Linux secret-service). secretspec never
+   # writes the value to the toml file — it just tracks which keys
+   # the project uses.
    ```
 
-   Secretspec supports multiple backends; the default on macOS is the Keychain, so the token never touches disk in plaintext. On Linux it delegates to the system secret-service (gnome-keyring / kwallet); on CI it can be sourced from an environment variable.
+   secretspec supports multiple backends; the default on macOS is the Keychain, so the token never touches disk in plaintext. On Linux it delegates to the system secret-service (gnome-keyring / kwallet); on CI it can be sourced from an environment variable.
 
-3. **`.envrc` exports it on `cd`.** When you `cd` into the barbican checkout after `direnv allow`:
+3. **Enable direnv for the barbican checkout (one-time):**
+
+   ```sh
+   cd ~/projects/barbican && direnv allow
+   ```
+
+4. **`.envrc` loads it on `cd`.** Every subsequent `cd` into the barbican checkout:
 
    ```
    direnv: loading ~/projects/barbican/.envrc
    direnv: export +CARGO_REGISTRY_TOKEN
    ```
 
-4. **Publish.** With `CARGO_REGISTRY_TOKEN` in the environment, `cargo publish` works without `--token` on the command line (where it would otherwise be captured in shell history).
+5. **Publish.** With `CARGO_REGISTRY_TOKEN` in the environment, `cargo publish` works without `--token` on the command line (where it would otherwise be captured in shell history):
 
-5. **Verify the token is actually loaded:**
+   ```sh
+   cargo publish -p barbican
+   ```
+
+6. **Verify the token is actually loaded:**
 
    ```sh
    # Confirm direnv exported it (should print `export CARGO_REGISTRY_TOKEN=…`):

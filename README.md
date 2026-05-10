@@ -14,6 +14,7 @@
 
 [![CI](https://github.com/jdidion/barbican/actions/workflows/ci.yml/badge.svg)](https://github.com/jdidion/barbican/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jdidion/barbican?display_name=tag&sort=semver)](https://github.com/jdidion/barbican/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/barbican.svg)](https://crates.io/crates/barbican)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Rust: 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
 
@@ -87,6 +88,15 @@ To fully remove:
 barbican uninstall
 brew uninstall barbican
 ```
+
+### Cargo (for Rust developers)
+
+```sh
+cargo install barbican
+barbican install
+```
+
+`cargo install` compiles from source — it takes several minutes — but the published tarball is signed by the author's crates.io account and cryptographically verified by cargo before install. Useful if you already have the Rust toolchain and don't want a separate Homebrew install.
 
 ### Direct download (scripted installs, offline use, or no `brew`)
 
