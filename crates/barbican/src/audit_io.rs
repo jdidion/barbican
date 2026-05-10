@@ -191,32 +191,40 @@ fn truncate_with_marker(s: &str, cap: usize) -> String {
     format!("{prefix}...[truncated {dropped} chars]", prefix = &s[..end])
 }
 
+/// Anomaly marker emitted when the wall clock reports a pre-1970 time.
+/// RFC3339-shaped year `0000` + `-CLOCK_ANOMALY` suffix so forensic
+/// readers can grep `^0000` and downstream parsers expecting a normal
+/// 24-char timestamp will fail-loud rather than silently accepting a
+/// frozen 1970-01-01 record. Length is intentionally different from
+/// the normal-path 24 chars.
+pub const CLOCK_ANOMALY_MARKER: &str = "0000-00-00T00:00:00.000Z-CLOCK_ANOMALY";
+
 /// ISO-8601 UTC timestamp to millisecond precision:
 /// `2026-04-29T23:51:00.123Z`. Hand-rolled (vs. `chrono`) to avoid a
 /// dep just for one formatter.
+///
+/// Returns [`CLOCK_ANOMALY_MARKER`] (a distinct 40-char string) when the
+/// system clock reports a pre-1970 time. Callers / log parsers must
+/// therefore accept both the normal 24-char shape *and* the anomaly
+/// marker; a fixed-width length check would be wrong.
 #[must_use]
 pub fn iso8601_utc_now() -> String {
-    // 1.5.4 Rust-expert review: `.unwrap_or_default()` silently
-    // produced a `1970-01-01T00:00:00.000Z` timestamp if
-    // `SystemTime::now()` is before UNIX_EPOCH. Audit timestamps are
-    // load-bearing evidence; a silent 1970 entry would make a clock-
-    // rollback attack invisible. Emit a clearly-anomalous marker
-    // instead so any forensic reader can spot the event.
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+    iso8601_utc_from(SystemTime::now())
+}
+
+/// Testable core of [`iso8601_utc_now`]. Takes an explicit `SystemTime`
+/// so the anomaly-marker path (clock before `UNIX_EPOCH`) can be
+/// exercised without rolling the system clock back.
+#[must_use]
+pub(crate) fn iso8601_utc_from(t: SystemTime) -> String {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(now) => {
             let secs = now.as_secs();
             let millis = now.subsec_millis();
             let (y, mo, d, h, mi, s) = civil_from_unix(secs);
             format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
         }
-        Err(_) => {
-            // Clock reported a pre-1970 time. Emit a recognizably
-            // anomalous string so downstream log-parsers will not
-            // conflate it with a normal epoch-start record. The
-            // value is RFC3339-shaped but uses year 0000 so a
-            // grep for `^0000` picks it up.
-            "0000-00-00T00:00:00.000Z-CLOCK_ANOMALY".to_string()
-        }
+        Err(_) => CLOCK_ANOMALY_MARKER.to_string(),
     }
 }
 
@@ -263,10 +271,44 @@ mod tests {
     #[test]
     fn iso8601_has_z_suffix_and_t_separator() {
         let s = iso8601_utc_now();
-        // `YYYY-MM-DDTHH:MM:SS.mmmZ` is 24 chars.
+        // Normal-path shape: `YYYY-MM-DDTHH:MM:SS.mmmZ` = 24 chars. The
+        // function may also return `CLOCK_ANOMALY_MARKER` (40 chars) if
+        // the wall clock is pre-1970; tolerate either so a host with a
+        // skewed clock doesn't flake this test (the anomaly path has
+        // its own dedicated test below).
+        if s == CLOCK_ANOMALY_MARKER {
+            return;
+        }
         assert_eq!(s.len(), 24, "want `YYYY-MM-DDTHH:MM:SS.mmmZ`, got {s}");
         assert_eq!(&s[10..11], "T");
         assert_eq!(&s[23..24], "Z");
+    }
+
+    #[test]
+    fn iso8601_from_pre_epoch_emits_clock_anomaly_marker() {
+        // Exercise the Err(_) arm by feeding a SystemTime known to be
+        // before UNIX_EPOCH. This is the 1.5.4 Rust-expert finding:
+        // before 1.5.4 the function used `.unwrap_or_default()` and
+        // silently produced `1970-01-01T00:00:00.000Z` on clock
+        // rollback. Now it emits the anomaly marker.
+        let pre_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(3600);
+        assert_eq!(iso8601_utc_from(pre_epoch), CLOCK_ANOMALY_MARKER);
+        // Anomaly marker is intentionally a different length from the
+        // normal 24-char timestamp, so any downstream parser doing a
+        // fixed-width length check fails loud on the anomaly path
+        // rather than silently treating it as a normal record.
+        assert_ne!(CLOCK_ANOMALY_MARKER.len(), 24);
+        // Forensic grep affordance: starts with "0000" so `^0000` hits.
+        assert!(CLOCK_ANOMALY_MARKER.starts_with("0000"));
+        assert!(CLOCK_ANOMALY_MARKER.ends_with("-CLOCK_ANOMALY"));
+    }
+
+    #[test]
+    fn iso8601_from_known_epoch_matches_expected_format() {
+        // 2024-02-29T00:00:00.000Z — a leap day, catches civil_from_unix
+        // regressions through the public function.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_709_164_800);
+        assert_eq!(iso8601_utc_from(t), "2024-02-29T00:00:00.000Z");
     }
 
     #[test]

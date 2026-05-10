@@ -209,9 +209,17 @@ jobs:
           # assets — every input is already verified upstream (Sigstore
           # attestation on the tarballs, `.sha256` sidecars, the
           # release workflow's SHA-pinned actions). Nothing to review
-          # manually. Use `gh pr merge --squash` (not `--auto`) to
-          # merge immediately instead of waiting for merge conditions.
+          # manually.
+          #
+          # Use `--auto` (not a plain immediate squash) so GitHub
+          # queues the merge for when mergeability is confirmed rather
+          # than racing the PR's post-create mergeability computation.
+          # On a tap with no branch protection and no required checks
+          # (the current state), `--auto` resolves to "merge now"; if
+          # the tap ever grows protection rules, the queue waits for
+          # them instead of failing. GPT-5.2 1.5.4 review follow-up.
           gh pr merge "$BRANCH" \
             --repo jdidion/homebrew-barbican \
+            --auto \
             --squash \
             --delete-branch
