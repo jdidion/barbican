@@ -72,12 +72,25 @@ pub fn render_error(source: &str, message: &str) -> String {
 
 /// XML-attribute-escape the five dangerous characters. Used in every
 /// attribute value; body contents go through `neutralize_sentinels`.
+///
+/// 1.5.5 GPT-5.2 review: replaced four chained `.replace(...)` calls
+/// (each allocating a fresh `String`) with a single-pass char scanner
+/// that pushes either the literal char or the escape sequence. On a
+/// typical attribute value (file path, tool name) the prior form
+/// allocated 4×; this form allocates once.
 #[must_use]
 pub fn xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Prevent an attacker-controlled body from closing the sentinel

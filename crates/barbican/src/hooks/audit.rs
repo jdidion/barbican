@@ -12,15 +12,15 @@
 //! - **L2**: file mode is `0o600`. Never rely on umask — the log
 //!   contains command strings and URLs (may include tokens).
 //!
-//! Payload truncation: any string field longer than 4000 chars is
-//! trimmed with a `...[truncated N chars]` marker (Narthex parity).
+//! Payload truncation: any string field longer than 4000 UTF-8 bytes
+//! is trimmed with a `...[truncated N bytes]` marker (Narthex parity).
 
 use std::io::Read;
 
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::audit_io::MAX_STRING_CHARS;
+use crate::audit_io::MAX_STRING_BYTES;
 use crate::audit_io::{append_jsonl_line, audit_log_path, iso8601_utc_now, sanitize_field};
 
 /// Run the audit hook. Never returns Err — writer failures are
@@ -74,7 +74,7 @@ fn build_entry(payload: &Value) -> Value {
 
 /// Recursively walk a JSON value, ANSI-stripping every string
 /// (including object KEYS) and truncating anything over
-/// [`MAX_STRING_CHARS`]. Object keys are sanitized too so a log
+/// [`MAX_STRING_BYTES`]. Object keys are sanitized too so a log
 /// consumer decoding the JSONL and displaying a key doesn't render
 /// an attacker-planted ESC.
 fn sanitize_value(v: Value) -> Value {
@@ -96,7 +96,7 @@ fn sanitize_string(s: &str) -> String {
     // Delegate to the shared audit_io helper — keeps the ANSI-strip +
     // truncate discipline consistent between this hook and the 1.4.0
     // wrapper binaries.
-    sanitize_field(s, MAX_STRING_CHARS)
+    sanitize_field(s, MAX_STRING_BYTES)
 }
 
 /// Render a top-level JSON field for the log entry. Strings go

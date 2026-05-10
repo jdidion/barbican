@@ -41,18 +41,43 @@ pub fn flatten_value_strings(v: &Value) -> String {
     parts.join(" ")
 }
 
+/// Recursion-depth cap for [`walk_strings`].
+///
+/// 1.5.5 Claude Rust-expert review: the unbounded recursion could be
+/// weaponized by an attacker-controlled MCP response or user
+/// ToolInput JSON containing a deeply-nested structure. `serde_json`
+/// itself does not cap nesting; without a local guard the recursive
+/// walk can blow the thread stack, taking the whole hook process
+/// down. 64 is generous — legitimate MCP responses are typically
+/// 3-6 levels — but still cheap to exceed maliciously.
+const MAX_JSON_DEPTH: usize = 64;
+
 fn walk_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    walk_strings_bounded(v, out, 0);
+}
+
+fn walk_strings_bounded<'a>(v: &'a Value, out: &mut Vec<&'a str>, depth: usize) {
+    if depth > MAX_JSON_DEPTH {
+        // Deliberately silent — the walk is a content-gathering step
+        // for injection-scan; dropping a deeply-nested subtree is
+        // more conservative than panicking, and the classifier has
+        // already seen every string up to this depth. An attacker
+        // who hides their injection payload at depth >64 loses the
+        // injection point; defenders don't legitimately nest that
+        // deep.
+        return;
+    }
     match v {
         Value::String(s) => out.push(s.as_str()),
         Value::Array(xs) => {
             for x in xs {
-                walk_strings(x, out);
+                walk_strings_bounded(x, out, depth.saturating_add(1));
             }
         }
         Value::Object(map) => {
             for (k, v) in map {
                 out.push(k.as_str());
-                walk_strings(v, out);
+                walk_strings_bounded(v, out, depth.saturating_add(1));
             }
         }
         _ => {}
@@ -288,6 +313,13 @@ pub fn scan_injection(text: &str) -> Vec<String> {
     let normalized = normalize_for_scan(text);
     // `strip_invisible` already ran in `normalize_for_scan`; belt-and-
     // suspenders ensures nothing slipped past NFKC.
+    //
+    // 1.5.5 GPT-5.2 review: `sanitize::is_invisible` was widened to
+    // exactly match `scan::invisible_regex`'s set (U+200B-200F,
+    // 202A-202E, 2060-206F, FEFF, 180E) so this second pass now
+    // catches any invisible char we counted in the raw-text pass
+    // above. Redundancy is defense-in-depth against a future NFKC
+    // that generates new invisibles — unlikely but cheap to guard.
     let normalized = strip_invisible(&normalized);
 
     let mut total_hits: usize = 0;

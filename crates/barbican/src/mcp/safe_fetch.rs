@@ -231,8 +231,16 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
         // Cache lookup: reuse the existing client if it was built for
         // THIS host. The DNS override is keyed exactly on `host`, so
         // changing hosts requires a rebuild to re-pin.
-        let client_ref: &Client = match &cached_client {
-            Some((cached_host, client)) if cached_host == &host => client,
+        //
+        // 1.5.5 Claude + GPT-5.2 review: the pre-1.5.5 form held a
+        // `&Client` borrow via `expect("just cached")` after a
+        // conditional `cached_client = Some(...)`, which was correct
+        // but relied on a non-compiler-enforced "we just inserted"
+        // invariant. `reqwest::Client::clone()` is cheap (Arc::clone
+        // internally), so we can own the client by value and skip
+        // the expect entirely.
+        let client = match cached_client.as_ref() {
+            Some((cached_host, cached)) if cached_host == &host => cached.clone(),
             _ => {
                 let new_client = Client::builder()
                     .redirect(Policy::none())
@@ -247,13 +255,12 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
                     .user_agent("barbican-safe-fetch/0.1 (+SSRF-hardened)")
                     .build()
                     .map_err(FetchError::Client)?;
-                cached_client = Some((host.clone(), new_client));
-                // Safe: we just inserted this entry.
-                &cached_client.as_ref().expect("just cached").1
+                cached_client = Some((host.clone(), new_client.clone()));
+                new_client
             }
         };
 
-        let resp = client_ref
+        let resp = client
             .request(Method::GET, current.clone())
             .send()
             .await
@@ -531,9 +538,28 @@ fn sanitize_body(raw: &str, content_type: &str, truncated: bool) -> (String, Vec
     };
 
     // Normalize: strip invisible/bidi, fold confusables, NFKC.
-    let normalized = normalize_for_scan(&stripped);
+    let mut normalized = normalize_for_scan(&stripped);
     if normalized.len() != stripped.len() {
         notes.push("stripped invisible/bidi unicode".to_string());
+    }
+    // 1.5.5 Gemini review: re-run the markup stripper AFTER
+    // normalization so fullwidth / mathematical `<script>` forms
+    // (e.g. `＜script＞`) that NFKC folds into ASCII `<script>` are
+    // also removed. `safe_read::content_from_bytes` already does
+    // this (see safe_read.rs L192-L201); parity with that pipeline
+    // is load-bearing for defense-in-depth — an attacker returning
+    // a confusable-masked script through a fetched URL would
+    // otherwise survive the first strip pass and reach
+    // `scan_injection` / the caller as executable HTML.
+    if is_markup || sniff_looks_markup {
+        let before = normalized.len();
+        normalized = strip_html_tags(&normalized);
+        if normalized.len() != before {
+            notes.push(format!(
+                "removed normalized HTML blocks ({} bytes)",
+                before - normalized.len()
+            ));
+        }
     }
 
     // Scan for jailbreak patterns and report (don't remove).

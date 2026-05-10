@@ -61,20 +61,28 @@ pub fn strip_ansi(s: &str) -> Cow<'_, str> {
 #[must_use]
 pub fn escape_for_prose(s: &str) -> String {
     const MAX_PROSE_BYTES: usize = 256;
-    // Pass 1: strip ANSI so escapes don't survive as raw bytes.
-    let ansi_free = strip_ansi(s).into_owned();
-    // Pass 2: drop zero-width / bidi-override.
-    let without_invisibles = strip_invisible(&ansi_free);
-    // Pass 3: replace control characters with `?`.
-    let mut out = String::with_capacity(without_invisibles.len());
-    for c in without_invisibles.chars() {
+    // 1.5.5 Gemini + Claude review: the pre-1.5.5 form ran
+    // `strip_ansi.into_owned()` → `strip_invisible` (allocates) →
+    // per-char `is_control` rewrite (allocates) as three separate
+    // Strings. The ANSI pass is regex-driven and stays separate, but
+    // the invisible-strip and control-replace are char-level and can
+    // fuse into a single filter/map. On a 256-byte attacker string
+    // this was 3 allocations; fused form is 2 (or 1 when the string
+    // has no ANSI and borrows through).
+    let ansi_free = strip_ansi(s);
+    // Fused: skip invisibles, replace controls with `?`, accumulate.
+    let mut out = String::with_capacity(ansi_free.len());
+    for c in ansi_free.chars() {
+        if is_invisible(c) {
+            continue;
+        }
         if c.is_control() {
             out.push('?');
         } else {
             out.push(c);
         }
     }
-    // Pass 4: truncate if too long.
+    // Truncate if too long.
     if out.len() > MAX_PROSE_BYTES {
         // Truncate at a char boundary below the cap.
         let mut cut = MAX_PROSE_BYTES;
@@ -106,12 +114,33 @@ pub fn strip_invisible(s: &str) -> String {
     s.chars().filter(|&c| !is_invisible(c)).collect()
 }
 
+/// Invisible / bidi-control codepoints that should be removed before
+/// scanning or normalizing for advisory display.
+///
+/// 1.5.5 GPT-5.2 review: the set here was narrower than the
+/// `scan::invisible_regex` it was supposed to pair with
+/// (`[\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{206F}\u{FEFF}\u{180E}]`),
+/// so the scan pass would COUNT codepoints like U+200E (LRM) or
+/// U+2060 (word joiner) as "invisible/bidi present" but then
+/// `strip_invisible` wouldn't actually remove them — the normalized
+/// text retained its smuggling primitives. Widened to match
+/// `scan::invisible_regex` exactly: every char that `scan` flags is
+/// now also stripped, closing the "count but don't remove" gap.
 const fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}'
+        // 200B–200F: zero-width space / ZWNJ / ZWJ / LRM / RLM
+        '\u{200B}'..='\u{200F}'
+        // 202A–202E: bidi embed/pop (LRE/RLE/PDF/LRO/RLO)
         | '\u{202A}'..='\u{202E}'
-        | '\u{2066}'..='\u{2069}'
+        // 2060–206F: word joiner, function-application, invisible-times,
+        // invisible-separator, invisible-plus, isolates (2066–2069),
+        // inhibit-symmetric-swapping (206A–206F)
+        | '\u{2060}'..='\u{206F}'
+        // Byte-order mark
+        | '\u{FEFF}'
+        // Mongolian vowel separator
+        | '\u{180E}'
     )
 }
 
@@ -171,14 +200,26 @@ pub fn strip_html_tags_attributed(s: &str) -> (String, HtmlStripHits) {
     // tags listed above. Attributed as a single bit because the inspect
     // surface only cares that "an executable-class tag was removed",
     // not which one.
+    //
+    // 1.5.5 Gemini + Claude review: the prior form did
+    // `after_executable = Cow::Owned(next.into_owned())` at the end
+    // of each loop iteration, unconditionally allocating a fresh
+    // String even when the regex didn't match. On a 5 MiB post-MCP
+    // body with no HTML content the 7-regex loop allocated 7× the
+    // body size (≈35 MiB) per scan. Now we only swap to `Owned`
+    // when the regex actually fired, preserving the upstream
+    // `Cow::Borrowed` for unchanged passes.
     let mut after_executable = after_style;
     let mut executable_fired = false;
     for re in &res.executable {
         let next = re.replace_all(&after_executable, "");
         if next.len() != after_executable.len() {
             executable_fired = true;
+            after_executable = std::borrow::Cow::Owned(next.into_owned());
         }
-        after_executable = std::borrow::Cow::Owned(next.into_owned());
+        // If the regex didn't fire, keep `after_executable` as-is;
+        // `next` is a `Cow::Borrowed` wrapping the same bytes so
+        // discarding it costs nothing.
     }
     hits.removed_executable = executable_fired;
 
