@@ -598,8 +598,7 @@ impl Drop for SignalGuard {
                 // so the types match. `sigaction` is async-signal-
                 // safe per POSIX.1-2008 § sigaction.
                 #[allow(unsafe_code)]
-                let rc =
-                    unsafe { libc::sigaction(signum, &raw const *prev, std::ptr::null_mut()) };
+                let rc = unsafe { libc::sigaction(signum, &raw const *prev, std::ptr::null_mut()) };
                 if rc != 0 {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -661,9 +660,7 @@ fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
         // disposition save. Both pointers are derived from locals
         // we own exclusively within this loop iteration.
         #[allow(unsafe_code)]
-        let rc = unsafe {
-            libc::sigaction(signum, &raw const new_action, &raw mut old_action)
-        };
+        let rc = unsafe { libc::sigaction(signum, &raw const new_action, &raw mut old_action) };
         if rc == 0 {
             saved[i] = Some((signum, old_action));
         } else {
@@ -696,8 +693,7 @@ fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
         cmd.pre_exec(|| {
             for &signum in &SignalGuard::SIGNALS {
                 // SAFETY: zeroed POD, same rationale as parent.
-                let mut dfl_action: libc::sigaction =
-                    std::mem::MaybeUninit::zeroed().assume_init();
+                let mut dfl_action: libc::sigaction = std::mem::MaybeUninit::zeroed().assume_init();
                 dfl_action.sa_sigaction = libc::SIG_DFL;
                 // SAFETY: sigemptyset is on the POSIX AS-safe list.
                 libc::sigemptyset(&raw mut dfl_action.sa_mask);

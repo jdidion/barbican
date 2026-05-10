@@ -203,3 +203,15 @@ jobs:
           - [ ] \`brew audit --new --strict jdidion/barbican/barbican\` passes locally.
 
           🤖 Opened by [.github/workflows/update-homebrew-tap.yml](https://github.com/jdidion/barbican/blob/main/.github/workflows/update-homebrew-tap.yml) in jdidion/barbican."
+
+          # 1.5.4 policy: auto-merge the bump PR. Tap bumps are pure
+          # formula-URL + SHA256 updates derived from signed release
+          # assets — every input is already verified upstream (Sigstore
+          # attestation on the tarballs, `.sha256` sidecars, the
+          # release workflow's SHA-pinned actions). Nothing to review
+          # manually. Use `gh pr merge --squash` (not `--auto`) to
+          # merge immediately instead of waiting for merge conditions.
+          gh pr merge "$BRANCH" \
+            --repo jdidion/homebrew-barbican \
+            --squash \
+            --delete-branch

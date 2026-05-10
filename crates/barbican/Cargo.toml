@@ -18,6 +18,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+# Multi-pattern literal search used by `code_calls_subprocess` in
+# `hooks/pre_bash.rs` — 80+ needles scanned per scripting-lang body.
+# Already transitively pulled in via the `regex` crate so adding it
+# as a direct dep is zero cost.
+aho-corasick = "1.1"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 # DNS resolver with tokio integration — we resolve hostnames ourselves

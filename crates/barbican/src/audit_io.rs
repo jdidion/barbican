@@ -196,13 +196,28 @@ fn truncate_with_marker(s: &str, cap: usize) -> String {
 /// dep just for one formatter.
 #[must_use]
 pub fn iso8601_utc_now() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+    // 1.5.4 Rust-expert review: `.unwrap_or_default()` silently
+    // produced a `1970-01-01T00:00:00.000Z` timestamp if
+    // `SystemTime::now()` is before UNIX_EPOCH. Audit timestamps are
+    // load-bearing evidence; a silent 1970 entry would make a clock-
+    // rollback attack invisible. Emit a clearly-anomalous marker
+    // instead so any forensic reader can spot the event.
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(now) => {
+            let secs = now.as_secs();
+            let millis = now.subsec_millis();
+            let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+        }
+        Err(_) => {
+            // Clock reported a pre-1970 time. Emit a recognizably
+            // anomalous string so downstream log-parsers will not
+            // conflate it with a normal epoch-start record. The
+            // value is RFC3339-shaped but uses year 0000 so a
+            // grep for `^0000` picks it up.
+            "0000-00-00T00:00:00.000Z-CLOCK_ANOMALY".to_string()
+        }
+    }
 }
 
 /// Split a Unix timestamp into `(year, month, day, hour, minute,

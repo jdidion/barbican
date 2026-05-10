@@ -296,6 +296,13 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
         let truncated = bytes.len() > max_bytes;
         let trimmed = &bytes[..bytes.len().min(max_bytes)];
 
+        // Valid UTF-8 is the common case for HTTP bodies we care
+        // about (HTML, JSON). `from_utf8_lossy` returns `Cow::Borrowed`
+        // there, then `.into_owned()` re-allocates. Threading
+        // `Cow<'_, str>` through `sanitize_body` would let us keep
+        // the zero-alloc path end-to-end; not worth the refactor
+        // cost until profiling shows this as a hot spot. Note in
+        // #59 for future work.
         let raw = String::from_utf8_lossy(trimmed).into_owned();
         let (body, notes) = sanitize_body(&raw, &content_type, truncated);
 
