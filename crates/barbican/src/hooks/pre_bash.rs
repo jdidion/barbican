@@ -2223,7 +2223,7 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<DenyReason> {
         // When the payload references both a network tool AND a
         // shell sink, fire — the in-pipeline H1 is scoped to one
         // pipeline, so the staged-write shape was sliding past.
-        if network_tool_word_regex().is_match(&payload_text)
+        if payload_references_network_tool(&payload_text)
             && payload_references_shell_sink(&payload_text)
         {
             let t = sanitize_reason_text(&target);
@@ -3127,7 +3127,7 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<DenyReas
         // scan_payload_for_exfil misses it, but the combination of a
         // network-tool word AND a shell-code sink word in the payload
         // is the whole point of the `-s` stdin-execute shape.
-        if network_tool_word_regex().is_match(&payload) && payload_references_shell_sink(&payload) {
+        if payload_references_network_tool(&payload) && payload_references_shell_sink(&payload) {
             return Some(DenyReason::short(format!(
                 "blocked: shell interpreter `{sh} -s` reads its script \
                  from stdin, and the upstream pipeline stages emit text \
@@ -3196,16 +3196,14 @@ fn payload_references_shell_sink(payload: &str) -> bool {
 /// Strip a single pair of matching surrounding quotes (single or double)
 /// from the owned string. Used for here-string bodies where the outer
 /// quoting is syntactic and the interior is the shell command to exec.
+///
+/// 1.6.0 consolidation (#59 cross-file dup): the underlying
+/// primitive lives in `crate::quoting`. Backticks are intentionally
+/// NOT stripped here — this function's callers re-parse the output
+/// as bash, and a bare backtick is command-substitution syntax, not
+/// an outer quoting layer.
 fn strip_surrounding_quotes_owned(s: &str) -> String {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return s[1..s.len() - 1].to_string();
-        }
-    }
-    s.to_string()
+    crate::quoting::strip_surrounding_quotes_no_backtick(s).to_string()
 }
 
 /// Deny any write to a shell rc / login file or a known persistence
@@ -3420,7 +3418,7 @@ fn is_persistence_target(path: &str) -> bool {
 ///   adversarial review.
 fn scan_payload_for_exfil(payload: &str) -> bool {
     let has_secret = secret_path_regex().is_match(payload);
-    let has_net = network_tool_word_regex().is_match(payload);
+    let has_net = payload_references_network_tool(payload);
     let has_env = env_dumper_word_regex().is_match(payload);
     let has_environ_file = payload.contains("/proc/self/environ");
     if has_net && (has_secret || has_env || has_environ_file) {
@@ -3445,13 +3443,30 @@ fn env_dumper_word_regex() -> &'static regex::Regex {
     })
 }
 
-/// Whole-word network-tool regex, compiled once. Union of
-/// `EXFIL_NETWORK_TOOLS` members with `\b` boundaries.
+/// Return `true` if `payload` contains any whole-word network-tool
+/// name (curl / wget / nc / scp / rsync / …). Union of the
+/// `EXFIL_NETWORK_TOOLS` table with case-insensitive matching and
+/// ASCII `\b` semantics at both ends.
 ///
-/// 1.2.1 M-2 adversarial review: added `aria2c`, `lftp`, `rclone`,
-/// `gsutil`, `aws`, `az`, `gcloud`. Each of these will upload a local
-/// file (or stdin) to a remote endpoint as readily as `curl -T` /
-/// `scp` / `rsync`:
+/// 1.6.0 perf-lens (#59, lens 2 item 3): was a `(?i)\b(alt|...|alt)\b`
+/// regex — a ~40-token alternation scanned over potentially-large
+/// bodies (heredoc bodies, scripting-lang `-c` inputs). Replaced with
+/// an Aho-Corasick automaton built once and cached in a `OnceLock`,
+/// mirroring the 1.5.4 migration of `code_calls_subprocess`. The
+/// automaton is a single pass over the input; the regex engine did
+/// one pass per alternation arm in the worst case.
+///
+/// AC doesn't support `\b` natively, so we do an explicit boundary
+/// check per hit: match bytes immediately before / after the hit
+/// must be ASCII-word-class absent (or end-of-input). ASCII-word
+/// class = alnum + `_`, matching the regex crate's default `\b`
+/// semantics for ASCII inputs. All needles here are ASCII, so the
+/// ASCII boundary check is lock-step with the old regex behavior.
+///
+/// 1.2.1 M-2 adversarial review: the set includes `aria2c`, `lftp`,
+/// `rclone`, `gsutil`, `aws`, `az`, `gcloud`. Each of these will
+/// upload a local file (or stdin) to a remote endpoint as readily
+/// as `curl -T` / `scp` / `rsync`:
 ///
 /// - `aria2c <url>` / `aria2c --out` — a multi-protocol download AND
 ///   upload tool with FTP/SFTP/HTTP support.
@@ -3462,21 +3477,83 @@ fn env_dumper_word_regex() -> &'static regex::Regex {
 /// - `aws s3 cp -` / `aws s3api put-object` — AWS CLI uploader.
 /// - `az storage blob upload` — Azure equivalent.
 /// - `gcloud storage cp` — GCP equivalent.
-fn network_tool_word_regex() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        // Keep this in lock-step with EXFIL_NETWORK_TOOLS.
-        // 1.5.1 crew-review (Claude W-4 follow-up): PowerShell
-        // download verbs (`iwr`/`irm`/`Invoke-WebRequest` /
-        // `Invoke-RestMethod`) are the PowerShell equivalents of
-        // `curl`/`wget`. `pwsh -c 'iex(iwr URL).Content'` without
-        // these words in the regex was a classifier bypass.
-        regex::Regex::new(
-            r"(?i)\b(?:curl|wget|nc|ncat|netcat|socat|dig|host|nslookup|drill|resolvectl|scp|rsync|sftp|ftp|tftp|http|https|httpie|xh|mail|sendmail|mutt|ssh|aria2c|lftp|rclone|gsutil|aws|az|gcloud|iwr|irm|invoke-webrequest|invoke-restmethod|start-bitstransfer)\b",
-        )
-        .expect("network-tool regex compiles")
-    })
+///
+/// 1.5.1 crew-review (Claude W-4 follow-up): PowerShell download
+/// verbs (`iwr`/`irm`/`Invoke-WebRequest` / `Invoke-RestMethod`) are
+/// the PowerShell equivalents of `curl`/`wget`.
+/// `pwsh -c 'iex(iwr URL).Content'` without these names in the set
+/// was a classifier bypass.
+fn payload_references_network_tool(payload: &str) -> bool {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    let ac = AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .build(NETWORK_TOOL_NEEDLES)
+            .expect("compile network-tool needle set")
+    });
+    let bytes = payload.as_bytes();
+    for m in ac.find_iter(payload) {
+        let start = m.start();
+        let end = m.end();
+        let before_ok = start == 0 || !is_ascii_word_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_ascii_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
+
+/// ASCII `\b` boundary helper: a byte is "word-class" if it's an
+/// ASCII letter, digit, or underscore. Matches the regex crate's
+/// default `\b` semantics for ASCII inputs.
+#[inline]
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Needle set for [`payload_references_network_tool`]. Keep in
+/// lock-step with `EXFIL_NETWORK_TOOLS` and the pre-1.6.0 alternation
+/// regex.
+const NETWORK_TOOL_NEEDLES: &[&str] = &[
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "dig",
+    "host",
+    "nslookup",
+    "drill",
+    "resolvectl",
+    "scp",
+    "rsync",
+    "sftp",
+    "ftp",
+    "tftp",
+    "http",
+    "https",
+    "httpie",
+    "xh",
+    "mail",
+    "sendmail",
+    "mutt",
+    "ssh",
+    "aria2c",
+    "lftp",
+    "rclone",
+    "gsutil",
+    "aws",
+    "az",
+    "gcloud",
+    "iwr",
+    "irm",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "start-bitstransfer",
+];
 
 /// Deny `chmod +x <path>` (or octal mode with the execute bit set)
 /// targeting a path in an attacker-influenceable directory:
@@ -3839,7 +3916,7 @@ fn scripting_lang_shellout(pipeline: &Pipeline) -> Option<DenyReason> {
         //     network-tool name alone (without secret/env) would
         //     miss `scan_payload_for_exfil`, but when paired with a
         //     subprocess spawn API it's unambiguous.
-        if code_calls_subprocess(&code) && network_tool_word_regex().is_match(&code) {
+        if code_calls_subprocess(&code) && payload_references_network_tool(&code) {
             return Some(DenyReason::with_detail(
                 format!(
                     "blocked: `{bn}` inline code invokes a \

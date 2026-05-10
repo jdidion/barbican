@@ -842,16 +842,13 @@ fn redirect_operator_text<'a>(node: Node<'_>, src: &'a [u8]) -> Result<&'a str, 
 ///
 /// Kept narrow on purpose — `strip_command_name_quoting` handles the
 /// richer set (including `$'...'` / `$"..."`) used by `argv[0]`.
+///
+/// 1.6.0 consolidation (#59 cross-file dup): the actual primitive
+/// now lives in `crate::quoting`; the parser's near-identical copy
+/// has been replaced with a call through so the quote-character
+/// set is pinned to one place.
 fn strip_surrounding_quotes(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if first == last && matches!(first, b'"' | b'\'' | b'`') {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
+    crate::quoting::strip_surrounding_quotes(s)
 }
 
 /// Strip ANSI-C (`$'...'`), localized (`$"..."`), and plain surrounding
