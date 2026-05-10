@@ -15,8 +15,19 @@ Rust-expert follow-up patch closing the remaining perf/hygiene items from the 1.
 
 ### Fixed (correctness / hygiene)
 
-- **`audit_io::iso8601_utc_now` emits an anomaly marker on pre-1970 clocks** (Claude Rust-expert review). Prior code used `.unwrap_or_default()` on `SystemTime::now().duration_since(UNIX_EPOCH)`, silently producing `1970-01-01T00:00:00.000Z` if the wall clock was ever set before the epoch. Audit timestamps are load-bearing evidence; a silent 1970 would let a clock-rollback attack produce a stream of valid-looking-but-frozen entries. Now emits `0000-00-00T00:00:00.000Z-CLOCK_ANOMALY` so a forensic reader can grep for `^0000` to surface the event.
+- **`audit_io::iso8601_utc_now` emits an anomaly marker on pre-1970 clocks** (Claude Rust-expert review). Prior code used `.unwrap_or_default()` on `SystemTime::now().duration_since(UNIX_EPOCH)`, silently producing `1970-01-01T00:00:00.000Z` if the wall clock was ever set before the epoch. Audit timestamps are load-bearing evidence; a silent 1970 would let a clock-rollback attack produce a stream of valid-looking-but-frozen entries. Now emits `0000-00-00T00:00:00.000Z-CLOCK_ANOMALY` so a forensic reader can grep for `^0000` to surface the event. The function was refactored to an internal `iso8601_utc_from(SystemTime)` + `pub const CLOCK_ANOMALY_MARKER` so the anomaly path is testable without rolling the system clock, and the existing 24-char length pinning test was relaxed to tolerate the 38-char anomaly marker on skewed-clock hosts.
 - **`sanitize::html_tag_regexes` cache further tightened** (1.5.3 follow-up). The fixed-size `[&'static Regex; 7]` array landed in 1.5.3; 1.5.4 adds a doc comment pinning the invariant so a future refactor doesn't silently regress to `Vec`. No behavior change.
+
+### Classifier tightening (Gemini 1.5.4 review)
+
+- **`code_calls_subprocess` adds `%x"..."` and `(exec "..."` quoted-string forms**. Gemini 3.1 Pro's 1.5.4 review noticed the subprocess-needle list was asymmetric: Perl's `qx"..."` was present but Ruby's `%x"..."` wasn't; Lisp's `(system "..."` was present but `(exec "..."` wasn't. Neither was a 1.5.4 regression (both were absent pre-1.5.4 too), but the asymmetry was a real coverage gap in the heuristic. Both added with regression tests pinning each form.
+
+### Red tests (1.5.4-specific)
+
+- `code_calls_subprocess_matches_lowercase` / `_matches_uppercase` / `_matches_mixed_case` / `_rejects_benign_text` — pin the ASCII case-insensitive contract so a future refactor can't silently flip back to case-sensitive. Addresses GPT-5.2's 1.5.4 review false-positive lens — the prior implementation lowercased the haystack first + did case-sensitive `contains`; the AhoCorasick form uses `ascii_case_insensitive(true)` on the raw haystack, and these tests verify the boundary-equivalence of the two approaches.
+- `code_calls_subprocess_matches_ruby_double_quoted_percent_x` / `_matches_lisp_double_quoted_exec` — pin the two newly-added needles above.
+- `iso8601_from_pre_epoch_emits_clock_anomaly_marker` — exercise the `Err(_)` arm by passing `SystemTime::UNIX_EPOCH - 3600s` to `iso8601_utc_from`.
+- `iso8601_from_known_epoch_matches_expected_format` — pin `2024-02-29T00:00:00.000Z` through the public helper.
 
 ### Release infra
 

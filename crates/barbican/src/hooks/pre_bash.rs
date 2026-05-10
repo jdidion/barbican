@@ -3932,6 +3932,10 @@ const SUBPROCESS_NEEDLES: &[&str] = &[
     "%x/",
     "%x|",
     "%x!",
+    // 1.5.4 Gemini review: the Ruby `%x"..."` quoted form was absent
+    // despite `qx"..."` (Perl equivalent) being covered. Adds symmetry
+    // across the language pair.
+    "%x\"",
     "qx{",
     "qx(",
     "qx[",
@@ -3973,6 +3977,10 @@ const SUBPROCESS_NEEDLES: &[&str] = &[
     "(system\"",
     "(exec ",
     "(exec\t",
+    // 1.5.4 Gemini review: `(exec "..."` was absent despite the
+    // sibling `(system "..."` being covered. Adds Lisp-family
+    // symmetry for direct-quoted exec forms.
+    "(exec\"",
     "(process ",
     "(subprocess ",
     // Ruby/Perl command-style call WITHOUT parens:
@@ -4812,5 +4820,22 @@ mod tests {
         assert!(!code_calls_subprocess("print('hello world')"));
         assert!(!code_calls_subprocess("# using subprocess is fine"));
         assert!(!code_calls_subprocess("let x = 1 + 2"));
+    }
+
+    // 1.5.4 Gemini review: symmetry fills for the Ruby `%x"..."` and
+    // Lisp `(exec "..."` quoted-string forms that were absent despite
+    // their siblings (`qx"..."` / `(system "..."`) being covered. Pin
+    // both so the symmetry can't regress.
+
+    #[test]
+    fn code_calls_subprocess_matches_ruby_double_quoted_percent_x() {
+        assert!(code_calls_subprocess("output = %x\"ls -la\""));
+        assert!(code_calls_subprocess("%X\"cat /etc/passwd\""));
+    }
+
+    #[test]
+    fn code_calls_subprocess_matches_lisp_double_quoted_exec() {
+        assert!(code_calls_subprocess("(exec\"/bin/sh\" \"-c\" \"id\")"));
+        assert!(code_calls_subprocess("(EXEC\"ls\")"));
     }
 }
