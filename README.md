@@ -12,6 +12,11 @@
 
 ---
 
+[![CI](https://github.com/jdidion/barbican/actions/workflows/ci.yml/badge.svg)](https://github.com/jdidion/barbican/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jdidion/barbican?display_name=tag&sort=semver)](https://github.com/jdidion/barbican/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Rust: 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
+
 A safety layer for [Claude Code](https://claude.com/claude-code) delivered as a single static Rust binary. Barbican runs as a `PreToolUse` / `PostToolUse` hook and as an MCP server that exposes sanitized fetch / read / inspect tools, blocking a concrete list of known-dangerous bash compositions and prompt-injection patterns before they reach the model.
 
 This is a port of [Narthex](https://github.com/fitz2882/narthex) (MIT-licensed Python prototype) with fixes for every finding in an external security audit. See [`docs/SECURITY.md`](docs/SECURITY.md) for the threat model and [`CHANGELOG.md`](CHANGELOG.md) for release history.
