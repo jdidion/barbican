@@ -203,7 +203,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     // Classify BEFORE spawning anything. If this returns Deny, the
     // child never runs.
-    let classifier_input = synthesize_classifier_input(dialect, &body);
+    let classifier_input = synthesize_classifier_input(dialect, body);
     let decision = classify_command(&classifier_input);
 
     let body_sha256 = sha256_hex(body.as_bytes());
@@ -226,7 +226,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     // Allow path — spawn the interpreter with pipes and redact output.
     let interpreter = resolve_interpreter(dialect);
-    let exit_code = spawn_with_redaction(dialect, &interpreter, &body, &extra_args);
+    let exit_code = spawn_with_redaction(dialect, &interpreter, body, extra_args);
 
     write_audit_entry(dialect, "allow", None, None, &body_sha256, Some(exit_code));
     std::process::exit(exit_code);
@@ -249,18 +249,27 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 ///   so we don't apply the bundled-option heuristic there.
 ///
 /// 1.4.0 crew review (gpt-5.2 WARNING).
-fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>), String> {
+fn parse_argv<'a>(
+    argv: &'a [String],
+    dialect: Dialect,
+) -> Result<(&'a str, &'a [String]), String> {
     let flag = dialect.inline_flag();
     let flag_letter = flag.as_bytes()[1]; // `-c` → b'c', `-e` → b'e'
-                                          // Skip argv[0].
-    let mut iter = argv.iter().skip(1);
-    while let Some(arg) = iter.next() {
+                                          // Skip argv[0]; walk by index so we can hand out a
+                                          // `&[String]` subslice for `rest` without cloning.
+                                          // 1.6.0 perf-lens (#59): previous version allocated
+                                          // both a `String` body and a `Vec<String>` of cloned
+                                          // extra args on every wrapper call. Now body is a
+                                          // borrow and rest is a subslice of argv.
+    let mut i = 1;
+    while i < argv.len() {
+        let arg = &argv[i];
         if arg == flag {
-            let body = iter
-                .next()
+            let body = argv
+                .get(i + 1)
                 .ok_or_else(|| format!("missing argument after {flag}"))?;
-            let rest: Vec<String> = iter.cloned().collect();
-            return Ok((body.clone(), rest));
+            let rest = &argv[(i + 2).min(argv.len())..];
+            return Ok((body.as_str(), rest));
         }
         // Bundled shell short-options: `-ce`, `-ec`, `-cex`, etc.
         // Shape: starts with `-`, not just `--`, contains flag_letter,
@@ -274,20 +283,21 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
                 && after_dash.contains(&flag_letter);
             if is_bundle {
                 // BODY is the next arg.
-                let body = iter
-                    .next()
+                let body = argv
+                    .get(i + 1)
                     .ok_or_else(|| format!("missing argument after {arg}"))?;
-                let rest: Vec<String> = iter.cloned().collect();
-                return Ok((body.clone(), rest));
+                let rest = &argv[(i + 2).min(argv.len())..];
+                return Ok((body.as_str(), rest));
             }
         }
         // Attached form: `-cBODY` / `-eBODY`.
         if let Some(body) = arg.strip_prefix(flag) {
             if body.is_empty() {
+                i += 1;
                 continue;
             }
-            let rest: Vec<String> = iter.cloned().collect();
-            return Ok((body.to_string(), rest));
+            let rest = &argv[(i + 1).min(argv.len())..];
+            return Ok((body, rest));
         }
         // 1.4.0 second crew review (Gemini WARNING-3): an arg before
         // the inline flag is either dropped (old behavior — broke
@@ -968,7 +978,7 @@ mod tests {
         ];
         let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
         assert_eq!(body, "echo \"$1\"");
-        assert_eq!(rest, vec!["hello".to_string()]);
+        assert_eq!(rest, &["hello".to_string()][..]);
     }
 
     #[test]
