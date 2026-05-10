@@ -223,13 +223,15 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
 /// compare is equivalent and zero-allocation. `<?xml` must still
 /// match case-insensitively because the XML spec allows
 /// `<?XmL version=...>`.
+/// Markup-prefix probes for `sniff_looks_like_markup`. Ordered by
+/// common prevalence (html > doctype > svg > xml).
+const MARKUP_PROBES: &[&[u8]] = &[b"<!DOCTYPE", b"<HTML", b"<SVG", b"<?XML"];
+
 fn sniff_looks_like_markup(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Probes ordered by common prevalence: html > doctype > svg > xml.
-    const PROBES: &[&[u8]] = &[b"<!DOCTYPE", b"<HTML", b"<SVG", b"<?XML"];
-    PROBES.iter().any(|probe| {
-        bytes.len() >= probe.len() && bytes[..probe.len()].eq_ignore_ascii_case(probe)
-    })
+    MARKUP_PROBES
+        .iter()
+        .any(|probe| bytes.len() >= probe.len() && bytes[..probe.len()].eq_ignore_ascii_case(probe))
 }
 
 /// Expand a leading `~` or `~user` in a path. Anything else is
@@ -559,10 +561,13 @@ fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
 /// keyed by the resolved `$HOME` so legitimate test environments
 /// that mutate `HOME` pick up the new list without a process
 /// restart. The OnceLock holds `(home, list)`; a miss rebuilds.
+/// Home-keyed cache of the rebuilt deny list. `(home, list)` — miss
+/// when `home` differs from the cached snapshot.
+type DenyListCache = std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, Vec<PathBuf>)>>>;
+
 fn default_deny_list() -> Vec<PathBuf> {
     use std::sync::Mutex;
-    static CACHE: std::sync::OnceLock<Mutex<Option<(PathBuf, Vec<PathBuf>)>>> =
-        std::sync::OnceLock::new();
+    static CACHE: DenyListCache = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let home = canonical_or_same(home_dir());
     // Mutex lock is local to this function; contention is nil in

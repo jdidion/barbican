@@ -499,7 +499,12 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
         let normalized = crate::sanitize::nfkc(&raw);
         cmd.basename = cmd_basename(strip_command_name_quoting(&normalized)).to_string();
         cmd.argv0_raw = raw;
-        collect_substitutions(name_node, src, &mut cmd.substitutions, depth.saturating_add(1))?;
+        collect_substitutions(
+            name_node,
+            src,
+            &mut cmd.substitutions,
+            depth.saturating_add(1),
+        )?;
     }
 
     let mut cursor = node.walk();

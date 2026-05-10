@@ -209,7 +209,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
     let body_sha256 = sha256_hex(body.as_bytes());
 
     if let Decision::Deny { reason, detail } = decision {
-        let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name(),);
+        let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name());
         if let Some(d) = detail.as_deref() {
             let _ = writeln!(std::io::stderr(), "detail: {d}");
         }

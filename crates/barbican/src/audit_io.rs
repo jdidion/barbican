@@ -226,6 +226,15 @@ pub fn iso8601_utc_now() -> String {
 /// so the anomaly-marker path (clock before `UNIX_EPOCH`) can be
 /// exercised without rolling the system clock back.
 #[must_use]
+// y/mo/d/h/mi/s are domain-standard tuple names for a split civil
+// date-time. Clippy's `many_single_char_names` lint fires at this
+// style but the alternative (year/month/day/hour/minute/second) would
+// bloat the format string without improving clarity. 1.6.0 rust-1.95
+// clippy follow-up.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "y/mo/d/h/mi/s are the conventional names for a split civil date-time tuple"
+)]
 pub(crate) fn iso8601_utc_from(t: SystemTime) -> String {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(now) => {
@@ -269,6 +278,14 @@ fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 }
 
 #[cfg(test)]
+// Tests use explicit seconds offsets from UNIX_EPOCH for readability
+// — `from_secs(3600)` reads as "one hour" more cleanly than
+// `from_hours(1)` at the call site where the intent is "one hour
+// before the epoch". Clippy 1.95+ disagrees; override locally.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "tests use from_secs(N) explicitly to keep the epoch-offset intent readable"
+)]
 mod tests {
     use super::*;
 
