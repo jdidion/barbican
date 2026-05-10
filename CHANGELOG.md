@@ -2,6 +2,35 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.2] — 2026-05-09
+
+Rust-hygiene patch. A Rust-expert adversarial review (Claude `code-reviewer` + GPT-5.2, 115 + 46 findings respectively; Gemini 3.1 Pro unavailable due to transient provider issues) of the entire `crates/barbican/src/**` + `tests/**` surface surfaced 4 CRITICAL findings. All four closed here. No classifier-verdict change; no new security coverage.
+
+### Fixed (CRITICAL)
+
+- **`child.wait().expect(…)` panic on wait failure** (Claude + GPT-5.2). A panic in the wrapper runtime path killed the user's Claude Code session with an unclean stderr dump. Now handled explicitly: wait error is logged, cleanup (thread joins, signal restore, audit entry) still runs, wrapper exits 1. Red test: `wrapper_allow_path_completes_and_writes_audit` exercises the new `match wait_result` arm on the happy path.
+
+- **Signal-set leak on spawn failure** (Claude). Before 1.5.2, a failed `cmd.spawn()` returned early without restoring `SIGINT`/`SIGTERM`/`SIGHUP` from `SIG_IGN` back to the parent's original disposition. A wrapper that failed to exec its interpreter would leave the parent shell in a signals-ignored state. Introduced new `SignalGuard` RAII type whose `Drop` implementation restores every successfully-saved `sigaction` on scope exit, so every early return (today's spawn-fail path and every future one) automatically restores signal state. Red test: `wrapper_spawn_failure_exits_cleanly_without_leaking_signals`.
+
+- **`libc::signal` → `sigaction` with explicit return-value checks** (Claude + GPT-5.2). The 1.4.0 signal handler used the legacy `signal()` call, which has historically ambiguous semantics across POSIX variants (System V vs. BSD, process-wide vs. thread-local effects when combined with threads), ignored its return value (`SIG_ERR` is undetected), and conflated single-thread correctness with async-signal-safety in SAFETY comments. Rewritten to use `sigaction`: POSIX-standard, well-defined across multi-threaded parents, saves/restores the full `sigaction` struct (including `sa_mask` and `sa_flags`), checks every return, logs install failures to stderr, and does not panic if installation fails. SAFETY comments updated to cite POSIX.1-2008 § sigaction's async-signal-safety guarantees explicitly.
+
+- **Saturating-depth arithmetic on classifier recursion** (Claude). `depth + 1` in the classifier's 10 recursion points could theoretically wrap if `depth` reached `usize::MAX` (impossible in practice since `M1_MAX_DEPTH = 8` short-circuits at 9, but a debug build would panic on overflow and a release build would wrap silently). Replaced all 10 sites with `depth.saturating_add(1)` so the bound check remains correct under any input. No functional change for realistic inputs; defense against a future refactor that removes the depth guard upstream.
+
+### Fixed (CPU)
+
+- **`pipe_to_redacted_chunks` rewritten from byte-at-a-time to `read_until + take`** (GPT-5.2 CRITICAL lens = CPU). The 1.4.0 `MAX_LINE_BYTES = 1 MiB` cap required reading one byte at a time to detect the cap boundary; even with `BufReader`'s 8 KiB internal buffer, the per-byte branch + bounds-check + `Vec::push` made the wrapper CPU-heavy on fast-writing children. Replaced with `reader.take(budget).read_until(b'\n', …)` where `budget = remaining_cap + 1`; when the take-limit fires without a newline we flush the partial line (preserving the memory cap) and continue. Red test: `wrapper_handles_large_newline_free_output_within_bounded_time` pipes 10 MiB of newline-free output and asserts completion within 15 seconds (typical local runtime is under 1 second). No behavior change visible to callers.
+
+### Follow-ups tracked (not in this release)
+
+The Rust-expert review surfaced another ~160 findings across Style, Memory, CPU, and Unsafe lenses (non-Critical). Tracked as an enhancement issue for opportunistic cleanup; none are security regressions. Highlights worth future patches: multi-pass normalization in `sanitize.rs` (3 allocs per scan on 5 MiB bodies), classifier `stage_bn_lc` allocating per stage × classifier (~100 allocs per pipeline), reqwest client rebuilt per redirect hop in `safe_fetch`, linear needle search in `code_calls_subprocess` (Aho-Corasick candidate), parser `Command` clones during M1 unwrap.
+
+### Compatibility
+
+- `Decision::Deny { reason, detail: Option<String> }` shape unchanged from 1.5.0.
+- `barbican explain` subcommand CLI shape unchanged.
+- Wrapper binaries' argv handling and exit codes unchanged on the happy path; spawn-failure exit is still 127; new wait-failure exit is 1 (previously panic).
+- No new classifier coverage; no commands that allowed in 1.5.1 are denied in 1.5.2.
+
 ## [1.5.1] — 2026-05-09
 
 Pre-announcement security patch. A full three-provider adversarial audit (Claude `security-reviewer` + GPT-5.2 + Gemini 3.1 Pro, each reviewing the entire 228-file tree at v1.5.0's HEAD with OWASP-style red-team framing) ran before the scheduled LinkedIn announcement. Three CRITICAL-tier findings surfaced; all three are closed here with red tests plus warning/suggestion fixes from the same review. No API or classifier-verdict change for commands that were allowed in 1.5.0 — 1.5.1 *narrows* the allow set (denies more, never less).
