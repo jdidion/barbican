@@ -2,6 +2,31 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.5.3] — 2026-05-10
+
+Performance patch closing Gemini's 3 CRITICALs from the 1.5.1 Rust-expert review (deferred in 1.5.2 because Gemini's review came in after the other two reviewers). No behavior change, no classifier-verdict change — pure performance + SAFETY-comment hygiene.
+
+### Fixed (CRITICAL)
+
+- **`sanitize::html_tag_regexes()` no longer allocates per call** (Gemini CRITICAL). Previously built a fresh `Vec<&'static Regex>` on every `strip_html_tags_attributed` invocation — every post-edit / post-mcp advisory scan allocated a 7-entry Vec even though the regexes themselves were statically cached. Rewritten to cache the entire `HtmlTagRegexes` struct in a single `OnceLock`, with a fixed-size `[&'static Regex; 7]` array instead of a `Vec`. Zero per-call allocation after first use.
+- **`mcp::safe_fetch` reuses the `reqwest::Client` across same-host redirects** (Gemini CRITICAL). Previously rebuilt the Client inside the manual redirect loop on every hop, even when the host hadn't changed — TLS setup + connection-pool initialization per hop. Now caches `Option<(String, Client)>` keyed by host string; common-case redirects (HTTPS upgrade, trailing slash, same-host path changes) hit the cache. Cross-host redirects still rebuild (reqwest's `resolve_to_addrs` DNS override is host-keyed, so changing hosts requires a new override registration). The full structural fix — register a `reqwest::dns::Resolve` trait impl so one client handles all hosts — is tracked in #59 as a larger refactor.
+- **`wrappers::install_signal_guard` SAFETY-comment scoping** (Gemini CRITICAL). Previously the whole function body sat inside a single `unsafe { }` block with one SAFETY comment covering both parent-side `sigaction` and the `cmd.pre_exec` registration. Refactored: each individual FFI call gets its own narrow `unsafe { }` with a dedicated SAFETY comment; the `pre_exec` closure has a SAFETY block explaining the post-fork async-signal-safety contract separately from the parent-side install. SAFETY prose now cites POSIX.1-2008 § XSH 2.4.3 (async-signal-safe functions list) explicitly.
+
+### Not in this release (tracked in #59)
+
+- `reqwest::dns::Resolve` trait refactor (would let one Client handle every host for the full life of the fetch, not just same-host chains). Larger scope than a patch.
+- Remaining ~13 Gemini findings (1 Warning + 4 Suggestions + 1 Nit, plus new items she flagged that the other reviewers didn't). All non-Critical.
+
+### Red tests
+
+`tests/sanitize_1_5_3.rs`: 4 tests pinning `strip_html_tags_attributed`'s behavior across the `OnceLock`-cached struct refactor (script/style still fire, all 7 executable-class tags covered, benign input passes through unchanged, repeated calls stay stable).
+
+### Compatibility
+
+- `Decision::Deny { reason, detail: Option<String> }` shape unchanged from 1.5.0.
+- `barbican explain` subcommand CLI shape unchanged.
+- Wrapper binaries, `safe_fetch`, and `safe_read` external behavior all unchanged. No new or removed classifier rules.
+
 ## [1.5.2] — 2026-05-09
 
 Rust-hygiene patch. A Rust-expert adversarial review (Claude `code-reviewer` + GPT-5.2, 115 + 46 findings respectively; Gemini 3.1 Pro unavailable due to transient provider issues) of the entire `crates/barbican/src/**` + `tests/**` surface surfaced 4 CRITICAL findings. All four closed here. No classifier-verdict change; no new security coverage.

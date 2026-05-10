@@ -615,70 +615,101 @@ impl Drop for SignalGuard {
 /// Install SIG_IGN on the three wrapper-ignored signals and register
 /// a `pre_exec` that resets them to SIG_DFL in the child. Returns a
 /// `SignalGuard` that restores the saved dispositions when it drops.
+///
+/// 1.5.3 Rust-expert review (Gemini CRITICAL): refactored to narrow
+/// `unsafe` blocks to the individual FFI calls that need them, rather
+/// than wrapping the whole function body. Each `unsafe` has its own
+/// dedicated SAFETY comment explaining the specific contract, and
+/// the `pre_exec` closure has an internal SAFETY comment for its
+/// post-fork async-signal-safety guarantees (separate from the
+/// parent-side install, which runs in a normal thread context).
 fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
     let mut saved: [Option<(libc::c_int, libc::sigaction)>; 3] = [None, None, None];
 
-    // SAFETY: `sigaction` is the POSIX-standard signal-handler
-    // installer, safe to call from any thread at any time. We only
-    // install `SIG_IGN`, a constant disposition (no user-supplied
-    // handler function), so no handler-context constraints apply.
-    // The `libc::sigaction` struct is POD and zero-initialization
-    // via `MaybeUninit::zeroed()` is valid for a POSIX sigaction.
+    for (i, &signum) in SignalGuard::SIGNALS.iter().enumerate() {
+        // SAFETY: `libc::sigaction` is POD; zero-initialization via
+        // `MaybeUninit::zeroed()` produces a valid-but-nulled struct.
+        // The constant `SIG_IGN` is written into the handler slot
+        // before the struct is handed to the OS.
+        #[allow(unsafe_code)]
+        let mut new_action: libc::sigaction =
+            unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        // Portable way to assign SIG_IGN: the `sa_sigaction` /
+        // `sa_handler` union's `sa_handler` slot holds a function
+        // pointer whose integer value is SIG_IGN. `libc` exposes it
+        // via the `sa_sigaction` field.
+        new_action.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: sigemptyset initializes the sa_mask set-type
+        // through a stable POSIX API. The pointer is derived from
+        // our owned local; no aliasing issues.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::sigemptyset(&raw mut new_action.sa_mask);
+        }
+        new_action.sa_flags = 0;
+
+        // SAFETY: same POD-zeroed argument for `old_action`. The
+        // OS will overwrite it on successful sigaction().
+        #[allow(unsafe_code)]
+        let mut old_action: libc::sigaction =
+            unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        // SAFETY: `sigaction(2)` is the POSIX-standard signal-handler
+        // installer, explicitly safe to call from any thread at any
+        // time (POSIX.1-2008 § XSH 2.4.3). We pass a read-only
+        // pointer to our fully-populated `new_action` and a
+        // writable pointer to our owned `old_action` for the old
+        // disposition save. Both pointers are derived from locals
+        // we own exclusively within this loop iteration.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::sigaction(signum, &raw const new_action, &raw mut old_action)
+        };
+        if rc == 0 {
+            saved[i] = Some((signum, old_action));
+        } else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "barbican-wrapper: failed to install SIG_IGN for signal {signum}: {}",
+                std::io::Error::last_os_error(),
+            );
+            // Leave saved[i] = None so Drop skips restoration for
+            // this signal — nothing changed, nothing to undo. The
+            // wrapper continues in a slightly-less-ideal state but
+            // does not panic.
+        }
+    }
+
+    // Child reset: between `fork(2)` and `execve(2)`, restore
+    // SIG_DFL on the three signals so the child remains
+    // interruptible. `pre_exec` is executed in the forked child
+    // before exec, so only async-signal-safe calls are permitted.
+    //
+    // SAFETY: `pre_exec` itself is unsafe because the closure runs
+    // in a post-fork, pre-exec context where calling most libc
+    // functions is undefined behavior. Our closure only calls
+    // `sigaction` and `sigemptyset`, both of which are on the
+    // POSIX.1-2008 async-signal-safe list (§ XSH 2.4.3). We do not
+    // touch heap, shared memory, locks, stdio, or allocation. We
+    // capture zero closure environment beyond the SIGNALS constant.
     #[allow(unsafe_code)]
     unsafe {
-        for (i, &signum) in SignalGuard::SIGNALS.iter().enumerate() {
-            let mut new_action: libc::sigaction = std::mem::MaybeUninit::zeroed().assume_init();
-            // Portable way to assign SIG_IGN: the sa_sigaction /
-            // sa_handler union's `sa_handler` slot holds a function
-            // pointer whose integer value SIG_IGN is. `libc` exposes
-            // this via the same `sigaction::sa_sigaction` slot.
-            new_action.sa_sigaction = libc::SIG_IGN;
-            libc::sigemptyset(&raw mut new_action.sa_mask);
-            new_action.sa_flags = 0;
-
-            let mut old_action: libc::sigaction =
-                std::mem::MaybeUninit::zeroed().assume_init();
-            let rc = libc::sigaction(signum, &raw const new_action, &raw mut old_action);
-            if rc == 0 {
-                saved[i] = Some((signum, old_action));
-            } else {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "barbican-wrapper: failed to install SIG_IGN for signal {signum}: {}",
-                    std::io::Error::last_os_error(),
-                );
-                // Leave saved[i] = None so Drop skips restoration
-                // for this signal — nothing changed, nothing to
-                // undo. The wrapper continues in a slightly-less-
-                // ideal state but does not panic.
-            }
-        }
-
-        // Child reset: between fork and execve, restore SIG_DFL on
-        // the three signals so the child remains interruptible.
-        // `pre_exec` is executed in the forked child before exec;
-        // only async-signal-safe calls are permitted. `sigaction`
-        // is on the POSIX AS-safe list.
-        //
-        // SAFETY: `pre_exec` runs in a post-fork context. We call
-        // only async-signal-safe functions (`sigaction`,
-        // `sigemptyset`). We do not touch any shared memory, heap,
-        // or runtime state. We do not capture the parent's Rust
-        // closure environment beyond constants.
         cmd.pre_exec(|| {
             for &signum in &SignalGuard::SIGNALS {
+                // SAFETY: zeroed POD, same rationale as parent.
                 let mut dfl_action: libc::sigaction =
                     std::mem::MaybeUninit::zeroed().assume_init();
                 dfl_action.sa_sigaction = libc::SIG_DFL;
+                // SAFETY: sigemptyset is on the POSIX AS-safe list.
                 libc::sigemptyset(&raw mut dfl_action.sa_mask);
                 dfl_action.sa_flags = 0;
-                // If sigaction fails here, there is nothing safe we
+                // SAFETY: sigaction is on the POSIX AS-safe list.
+                // If the call fails here, there is nothing safe we
                 // can do — we're post-fork, pre-exec, with no
                 // stderr to write to without violating async-signal-
-                // safety. The child will inherit whatever disposition
-                // we failed to change; in the worst case it inherits
-                // SIG_IGN from the parent, which is still recoverable
-                // (the user can SIGKILL).
+                // safety. The child will inherit whatever
+                // disposition we failed to change; in the worst
+                // case it inherits SIG_IGN from the parent, which
+                // is still recoverable (the user can SIGKILL).
                 let _ = libc::sigaction(signum, &raw const dfl_action, std::ptr::null_mut());
             }
             Ok(())

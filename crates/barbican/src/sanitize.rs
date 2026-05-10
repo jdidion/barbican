@@ -220,6 +220,14 @@ impl HtmlStripHits {
 /// Compiled regexes for [`strip_html_tags_attributed`]. Each regex is
 /// loose around attributes — `<name` with anything up to the closing
 /// `>`, then shortest-match to the closing tag.
+///
+/// 1.5.3 Rust-expert review (Gemini CRITICAL): the whole struct is
+/// now cached in a single `OnceLock` rather than assembled per call.
+/// Previously `html_tag_regexes()` built a fresh `Vec<&'static Regex>`
+/// on every `strip_html_tags_attributed` call, so every post-edit /
+/// post-mcp advisory scan heap-allocated a 7-entry Vec even though
+/// the regexes themselves were already statically cached. The struct
+/// now uses a fixed-size array so no allocation is needed.
 struct HtmlTagRegexes {
     script: &'static Regex,
     style: &'static Regex,
@@ -227,61 +235,63 @@ struct HtmlTagRegexes {
     /// Loader / pivot / executable-class tags. Attributed as a single
     /// bit; ordered by rough likelihood-of-appearance so the early
     /// patterns short-circuit on most inputs.
-    executable: Vec<&'static Regex>,
+    executable: [&'static Regex; 7],
 }
 
-fn html_tag_regexes() -> HtmlTagRegexes {
-    static SCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static STYLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static COMMENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    // 1.2.1 L-6: loader/pivot/executable-class tags.
-    static IFRAME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static OBJECT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static EMBED_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static NOSCRIPT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static TEMPLATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static SVG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static META_REFRESH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-
-    let executable = vec![
-        IFRAME_RE
-            .get_or_init(|| Regex::new(r"(?si)<iframe\b[^>]*>.*?</iframe>").expect("iframe regex")),
-        OBJECT_RE
-            .get_or_init(|| Regex::new(r"(?si)<object\b[^>]*>.*?</object>").expect("object regex")),
+fn html_tag_regexes() -> &'static HtmlTagRegexes {
+    static TABLE: std::sync::OnceLock<HtmlTagRegexes> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let script =
+            Box::leak(Box::new(Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex")));
+        let style =
+            Box::leak(Box::new(Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex")));
+        let comment = Box::leak(Box::new(
+            Regex::new(r"(?s)<!--.*?-->").expect("html comment regex"),
+        ));
+        // 1.2.1 L-6: loader/pivot/executable-class tags. Leaked once at
+        // first-use into `'static` so the returned references are
+        // themselves `'static`; total cost is the same as the prior
+        // per-regex OnceLocks (one heap alloc per regex) but the Vec
+        // allocation per call goes away.
+        let iframe = Box::leak(Box::new(
+            Regex::new(r"(?si)<iframe\b[^>]*>.*?</iframe>").expect("iframe regex"),
+        ));
+        let object = Box::leak(Box::new(
+            Regex::new(r"(?si)<object\b[^>]*>.*?</object>").expect("object regex"),
+        ));
         // <embed …> and <embed …/> are void elements with no close tag.
-        EMBED_RE.get_or_init(|| Regex::new(r"(?si)<embed\b[^>]*/?\s*>").expect("embed regex")),
-        NOSCRIPT_RE.get_or_init(|| {
-            Regex::new(r"(?si)<noscript\b[^>]*>.*?</noscript>").expect("noscript regex")
-        }),
-        TEMPLATE_RE.get_or_init(|| {
-            Regex::new(r"(?si)<template\b[^>]*>.*?</template>").expect("template regex")
-        }),
+        let embed =
+            Box::leak(Box::new(Regex::new(r"(?si)<embed\b[^>]*/?\s*>").expect("embed regex")));
+        let noscript = Box::leak(Box::new(
+            Regex::new(r"(?si)<noscript\b[^>]*>.*?</noscript>").expect("noscript regex"),
+        ));
+        let template = Box::leak(Box::new(
+            Regex::new(r"(?si)<template\b[^>]*>.*?</template>").expect("template regex"),
+        ));
         // <svg …>…</svg> covers `<svg onload=…>` and friends by
         // removing the whole SVG subtree. Narrower-than-parsing but
         // safer than trying to pick individual event-handler
         // attributes out of live markup.
-        SVG_RE.get_or_init(|| Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").expect("svg regex")),
+        let svg =
+            Box::leak(Box::new(Regex::new(r"(?si)<svg\b[^>]*>.*?</svg>").expect("svg regex")));
         // <meta http-equiv="refresh" …> is void. Match any `<meta …>`
         // that carries an http-equiv attribute with "refresh" (case
         // insensitive). Other meta tags (charset, description,
         // og:…) pass through unchanged.
-        META_REFRESH_RE.get_or_init(|| {
+        let meta_refresh = Box::leak(Box::new(
             Regex::new(
                 r#"(?si)<meta\b[^>]*\bhttp-equiv\s*=\s*(?:"refresh"|'refresh'|refresh)[^>]*>"#,
             )
-            .expect("meta refresh regex")
-        }),
-    ];
+            .expect("meta refresh regex"),
+        ));
 
-    HtmlTagRegexes {
-        script: SCRIPT_RE
-            .get_or_init(|| Regex::new(r"(?si)<script\b[^>]*>.*?</script>").expect("script regex")),
-        style: STYLE_RE
-            .get_or_init(|| Regex::new(r"(?si)<style\b[^>]*>.*?</style>").expect("style regex")),
-        comment: COMMENT_RE
-            .get_or_init(|| Regex::new(r"(?s)<!--.*?-->").expect("html comment regex")),
-        executable,
-    }
+        HtmlTagRegexes {
+            script,
+            style,
+            comment,
+            executable: [iframe, object, embed, noscript, template, svg, meta_refresh],
+        }
+    })
 }
 
 /// NFKC-normalize `s`.
