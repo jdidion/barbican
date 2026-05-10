@@ -255,7 +255,7 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(o_nofollow_source())
+        .custom_flags(libc::O_NOFOLLOW)
         .open(src)
         .with_context(|| format!("open source binary {}", src.display()))?;
     let mut bytes = Vec::new();
@@ -266,25 +266,6 @@ fn copy_binary(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("install binary to {}", dst.display()))?;
     log(&format!("installed binary to {}", dst.display()));
     Ok(())
-}
-
-/// POSIX `O_NOFOLLOW` flag for the installer's source-open path.
-/// Shares the per-OS values with `audit_io::o_nofollow` but doesn't
-/// re-use it so the installer doesn't take a dependency on an
-/// unrelated module's internal constant.
-const fn o_nofollow_source() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        0x0100
-    }
-    #[cfg(target_os = "linux")]
-    {
-        0x20000
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
 }
 
 /// 1.4.0 wrapper binaries that ship alongside `barbican`. The installer

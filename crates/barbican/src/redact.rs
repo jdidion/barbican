@@ -38,6 +38,15 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
+/// Defense-in-depth fallback when the regex matched but no named
+/// capture group owns the match. This branch is unreachable today
+/// because every alternation arm has a named group; the fallback
+/// exists so a future reviewer who adds an unnamed arm doesn't panic
+/// the whole process via `unreachable!()`. Keep as a `const` so the
+/// bytes path doesn't allocate a fresh `Vec<u8>` per match.
+const UNKNOWN_REPLACEMENT_STR: &str = "<redacted:unknown>";
+const UNKNOWN_REPLACEMENT_BYTES: &[u8] = UNKNOWN_REPLACEMENT_STR.as_bytes();
+
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 
@@ -185,7 +194,20 @@ pub fn redact_secrets_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
             } else if caps.name("jwt").is_some() {
                 SecretKind::Jwt
             } else {
-                return b"<redacted:unknown>".to_vec();
+                // Unreachable today: every arm of `combined_pattern`
+                // is a named capture group, so a match must belong to
+                // exactly one `SecretKind`. A future pattern edit
+                // could add an unnamed arm; catch that in debug
+                // builds instead of letting the redactor silently
+                // miss the kind. Release builds fall back to the
+                // shared const slice so over-redaction still wins
+                // over under-redaction.
+                debug_assert!(
+                    false,
+                    "redact_secrets_bytes: regex match with no named capture group — \
+                     a new alternation arm was added without a SecretKind"
+                );
+                return UNKNOWN_REPLACEMENT_BYTES.to_vec();
             };
             format!("<redacted:{}>", kind.tag()).into_bytes()
         })
@@ -222,9 +244,19 @@ pub fn redact_secrets(s: &str) -> Cow<'_, str> {
             } else if caps.name("jwt").is_some() {
                 SecretKind::Jwt
             } else {
-                // Unreachable if the alternation is disjoint; bail to
-                // the whole-match replacement as a defensive fallback.
-                return "<redacted:unknown>".to_string();
+                // Unreachable today: every arm of `combined_pattern`
+                // is a named capture group, so a match must belong to
+                // exactly one `SecretKind`. A future pattern edit
+                // could add an unnamed arm; catch that in debug
+                // builds via `debug_assert!` so tests fail loudly.
+                // Release builds fall back to the shared const marker
+                // so over-redaction still wins over under-redaction.
+                debug_assert!(
+                    false,
+                    "redact_secrets: regex match with no named capture group — \
+                     a new alternation arm was added without a SecretKind"
+                );
+                return UNKNOWN_REPLACEMENT_STR.to_string();
             };
             format!("<redacted:{}>", kind.tag())
         })
