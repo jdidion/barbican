@@ -106,12 +106,33 @@ pub fn strip_invisible(s: &str) -> String {
     s.chars().filter(|&c| !is_invisible(c)).collect()
 }
 
+/// Invisible / bidi-control codepoints that should be removed before
+/// scanning or normalizing for advisory display.
+///
+/// 1.5.5 GPT-5.2 review: the set here was narrower than the
+/// `scan::invisible_regex` it was supposed to pair with
+/// (`[\u{200B}-\u{200F}\u{202A}-\u{202E}\u{2060}-\u{206F}\u{FEFF}\u{180E}]`),
+/// so the scan pass would COUNT codepoints like U+200E (LRM) or
+/// U+2060 (word joiner) as "invisible/bidi present" but then
+/// `strip_invisible` wouldn't actually remove them — the normalized
+/// text retained its smuggling primitives. Widened to match
+/// `scan::invisible_regex` exactly: every char that `scan` flags is
+/// now also stripped, closing the "count but don't remove" gap.
 const fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}'
+        // 200B–200F: zero-width space / ZWNJ / ZWJ / LRM / RLM
+        '\u{200B}'..='\u{200F}'
+        // 202A–202E: bidi embed/pop (LRE/RLE/PDF/LRO/RLO)
         | '\u{202A}'..='\u{202E}'
-        | '\u{2066}'..='\u{2069}'
+        // 2060–206F: word joiner, function-application, invisible-times,
+        // invisible-separator, invisible-plus, isolates (2066–2069),
+        // inhibit-symmetric-swapping (206A–206F)
+        | '\u{2060}'..='\u{206F}'
+        // Byte-order mark
+        | '\u{FEFF}'
+        // Mongolian vowel separator
+        | '\u{180E}'
     )
 }
 
@@ -171,14 +192,26 @@ pub fn strip_html_tags_attributed(s: &str) -> (String, HtmlStripHits) {
     // tags listed above. Attributed as a single bit because the inspect
     // surface only cares that "an executable-class tag was removed",
     // not which one.
+    //
+    // 1.5.5 Gemini + Claude review: the prior form did
+    // `after_executable = Cow::Owned(next.into_owned())` at the end
+    // of each loop iteration, unconditionally allocating a fresh
+    // String even when the regex didn't match. On a 5 MiB post-MCP
+    // body with no HTML content the 7-regex loop allocated 7× the
+    // body size (≈35 MiB) per scan. Now we only swap to `Owned`
+    // when the regex actually fired, preserving the upstream
+    // `Cow::Borrowed` for unchanged passes.
     let mut after_executable = after_style;
     let mut executable_fired = false;
     for re in &res.executable {
         let next = re.replace_all(&after_executable, "");
         if next.len() != after_executable.len() {
             executable_fired = true;
+            after_executable = std::borrow::Cow::Owned(next.into_owned());
         }
-        after_executable = std::borrow::Cow::Owned(next.into_owned());
+        // If the regex didn't fire, keep `after_executable` as-is;
+        // `next` is a `Cow::Borrowed` wrapping the same bytes so
+        // discarding it costs nothing.
     }
     hits.removed_executable = executable_fired;
 

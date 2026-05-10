@@ -699,14 +699,25 @@ fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
                 libc::sigemptyset(&raw mut dfl_action.sa_mask);
                 dfl_action.sa_flags = 0;
                 // SAFETY: sigaction is on the POSIX AS-safe list.
-                // If the call fails here, there is nothing safe we
-                // can do — we're post-fork, pre-exec, with no
-                // stderr to write to without violating async-signal-
-                // safety. The child will inherit whatever
-                // disposition we failed to change; in the worst
-                // case it inherits SIG_IGN from the parent, which
-                // is still recoverable (the user can SIGKILL).
-                let _ = libc::sigaction(signum, &raw const dfl_action, std::ptr::null_mut());
+                //
+                // 1.5.5 Claude Rust-expert review: propagate errors
+                // as an `io::Error` via `pre_exec`'s documented
+                // contract instead of swallowing them. If sigaction
+                // fails here, the child would otherwise inherit the
+                // parent's SIG_IGN disposition (installed by
+                // `SignalGuard`) and run uninterruptibly, leaving the
+                // parent hung in `child.wait()` until the user
+                // SIGKILLs it. Returning `Err` from `pre_exec` aborts
+                // the fork before exec and surfaces as an
+                // `io::Error` from `Command::spawn()`, which the
+                // wrapper's existing spawn-failure path converts into
+                // a clean `EXIT_SPAWN_FAIL = 127` exit. Better UX
+                // than a hung wrapper. `last_os_error` is the
+                // async-signal-safe way to capture `errno` post-fork
+                // (reads thread-local errno, no heap).
+                if libc::sigaction(signum, &raw const dfl_action, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });

@@ -531,9 +531,28 @@ fn sanitize_body(raw: &str, content_type: &str, truncated: bool) -> (String, Vec
     };
 
     // Normalize: strip invisible/bidi, fold confusables, NFKC.
-    let normalized = normalize_for_scan(&stripped);
+    let mut normalized = normalize_for_scan(&stripped);
     if normalized.len() != stripped.len() {
         notes.push("stripped invisible/bidi unicode".to_string());
+    }
+    // 1.5.5 Gemini review: re-run the markup stripper AFTER
+    // normalization so fullwidth / mathematical `<script>` forms
+    // (e.g. `＜script＞`) that NFKC folds into ASCII `<script>` are
+    // also removed. `safe_read::content_from_bytes` already does
+    // this (see safe_read.rs L192-L201); parity with that pipeline
+    // is load-bearing for defense-in-depth — an attacker returning
+    // a confusable-masked script through a fetched URL would
+    // otherwise survive the first strip pass and reach
+    // `scan_injection` / the caller as executable HTML.
+    if is_markup || sniff_looks_markup {
+        let before = normalized.len();
+        normalized = strip_html_tags(&normalized);
+        if normalized.len() != before {
+            notes.push(format!(
+                "removed normalized HTML blocks ({} bytes)",
+                before - normalized.len()
+            ));
+        }
     }
 
     // Scan for jailbreak patterns and report (don't remove).
