@@ -211,15 +211,17 @@ jobs:
           # release workflow's SHA-pinned actions). Nothing to review
           # manually.
           #
-          # Use `--auto` (not a plain immediate squash) so GitHub
-          # queues the merge for when mergeability is confirmed rather
-          # than racing the PR's post-create mergeability computation.
-          # On a tap with no branch protection and no required checks
-          # (the current state), `--auto` resolves to "merge now"; if
-          # the tap ever grows protection rules, the queue waits for
-          # them instead of failing. GPT-5.2 1.5.4 review follow-up.
+          # `gh pr merge` with no `--auto` already handles the
+          # post-create mergeability race: if required checks haven't
+          # resolved yet, gh internally enables auto-merge; otherwise
+          # it merges immediately. The tap has `allow_auto_merge=true`
+          # set at the repo level (so the fallback path works if
+          # protection rules are ever added); with zero required
+          # checks today, this call merges the PR instantly. Gemini
+          # 3.1 Pro 1.5.4 review follow-up — an explicit `--auto`
+          # would fail on a repo without branch protection, which is
+          # exactly our current state.
           gh pr merge "$BRANCH" \
             --repo jdidion/homebrew-barbican \
-            --auto \
             --squash \
             --delete-branch
