@@ -83,6 +83,22 @@ pub struct Command {
     /// `$'...'` / `$"..."` strip. This is the string classifiers match
     /// against [`crate::tables`] sets.
     pub basename: String,
+    /// ASCII-lowercased form of [`basename`], populated at parse time
+    /// so classifiers can do case-insensitive lookups without
+    /// reallocating per-call. A realistic pipeline has ~20 classifier
+    /// dispatches per stage; pre-1.6.0 each dispatch did its own
+    /// `to_ascii_lowercase` via `stage_bn_lc`'s Cow fallback whenever
+    /// the basename happened to contain any uppercase (adversarial
+    /// `cUrL` / `CURL` inputs). Populated once at parse time means
+    /// classifiers can borrow this string for free.
+    ///
+    /// Invariant: this is always
+    /// `basename.to_ascii_lowercase()`. Constructed in `walk_command`;
+    /// callers that build `Command` literally (e.g. synthetic markers
+    /// in `hooks::pre_bash::unwrap_wrapper_command`) must maintain
+    /// the invariant manually — `Default::default()` on an empty
+    /// basename produces an empty `basename_lc`, which is consistent.
+    pub basename_lc: String,
     /// `argv[0]` as written, preserved for audit-log readability.
     pub argv0_raw: String,
     /// `argv[1..]` as raw text slices of the original input (quoting
@@ -498,6 +514,12 @@ fn walk_command(node: Node<'_>, src: &[u8], depth: usize) -> Result<Command, Par
         // display the attacker's original spelling.
         let normalized = crate::sanitize::nfkc(&raw);
         cmd.basename = cmd_basename(strip_command_name_quoting(&normalized)).to_string();
+        // 1.6.0 perf: cache the lowercase basename at parse time so
+        // classifiers' `stage_bn_lc` can hand out a borrowed &str
+        // unconditionally (previously it still reallocated when the
+        // basename contained any uppercase byte). See
+        // `Command::basename_lc` docs for the invariant.
+        cmd.basename_lc = cmd.basename.to_ascii_lowercase();
         cmd.argv0_raw = raw;
         collect_substitutions(
             name_node,

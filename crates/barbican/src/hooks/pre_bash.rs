@@ -561,6 +561,10 @@ fn unwrap_wrapper_command(stage: &crate::parser::Command) -> Option<Script> {
     // pipeline contains this marker, classify_script returns Deny.
     let marker = crate::parser::Command {
         basename: MALFORMED_REENTRY_MARKER.to_string(),
+        // Marker is an ASCII constant, so the lowercase form matches
+        // the literal — keep the invariant documented on
+        // `Command::basename_lc` intact.
+        basename_lc: MALFORMED_REENTRY_MARKER.to_string(),
         argv0_raw: String::new(),
         args: Vec::new(),
         redirects: Vec::new(),
@@ -1876,21 +1880,22 @@ fn pipeline_mentions_secret(pipeline: &Pipeline) -> bool {
 
 /// Basename of a stage, lowercased, for case-insensitive matching.
 ///
-/// 1.5.4 Rust-expert review: was `String::to_ascii_lowercase()` which
-/// allocated unconditionally. Now returns `Cow<'_, str>` borrowed
-/// when the basename is already ASCII-lowercase (the common case for
-/// real-world binaries), owned only when actual conversion is needed
-/// (e.g. adversarial `CURL` / `cUrL`). A pipeline with 20 stages ×
-/// 20 classifier dispatches went from ~400 allocs to ~0 on the hot
-/// path. Call sites that need `&str` can just `.as_ref()` or
-/// `&*lc`; `phf_set::contains` accepts `&str` and reborrows
-/// cleanly.
+/// 1.6.0 perf-lens (#59): the lowercase basename is now precomputed
+/// at parse time and cached on `Command::basename_lc`. This function
+/// returns a `Cow::Borrowed` pointing at that cached field, so there
+/// is no per-call allocation regardless of the input's case. The
+/// return type is kept as `Cow<'_, str>` so call sites
+/// (`.as_ref()` / `&*lc`) don't need to churn for the signature
+/// change.
+///
+/// Previously (1.5.4 Rust-expert review): returned `Cow<'_, str>`
+/// borrowed on the common all-lowercase case but reallocated via
+/// `to_ascii_lowercase` whenever ANY uppercase byte was present.
+/// Adversarial inputs like `cUrL` therefore still paid the alloc on
+/// every classifier dispatch. Moving the lowercase into the IR
+/// itself eliminates that alloc class entirely.
 fn stage_bn_lc(stage: &crate::parser::Command) -> std::borrow::Cow<'_, str> {
-    if stage.basename.chars().all(|c| !c.is_ascii_uppercase()) {
-        std::borrow::Cow::Borrowed(stage.basename.as_ref())
-    } else {
-        std::borrow::Cow::Owned(stage.basename.to_ascii_lowercase())
-    }
+    std::borrow::Cow::Borrowed(stage.basename_lc.as_str())
 }
 
 /// M2 reverse-shell pattern: any argv/redirect references `/dev/tcp/*`
