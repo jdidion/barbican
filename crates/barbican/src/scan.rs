@@ -313,6 +313,13 @@ pub fn scan_injection(text: &str) -> Vec<String> {
     let normalized = normalize_for_scan(text);
     // `strip_invisible` already ran in `normalize_for_scan`; belt-and-
     // suspenders ensures nothing slipped past NFKC.
+    //
+    // 1.5.5 GPT-5.2 review: `sanitize::is_invisible` was widened to
+    // exactly match `scan::invisible_regex`'s set (U+200B-200F,
+    // 202A-202E, 2060-206F, FEFF, 180E) so this second pass now
+    // catches any invisible char we counted in the raw-text pass
+    // above. Redundancy is defense-in-depth against a future NFKC
+    // that generates new invisibles — unlikely but cheap to guard.
     let normalized = strip_invisible(&normalized);
 
     let mut total_hits: usize = 0;

@@ -231,8 +231,16 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
         // Cache lookup: reuse the existing client if it was built for
         // THIS host. The DNS override is keyed exactly on `host`, so
         // changing hosts requires a rebuild to re-pin.
-        let client_ref: &Client = match &cached_client {
-            Some((cached_host, client)) if cached_host == &host => client,
+        //
+        // 1.5.5 Claude + GPT-5.2 review: the pre-1.5.5 form held a
+        // `&Client` borrow via `expect("just cached")` after a
+        // conditional `cached_client = Some(...)`, which was correct
+        // but relied on a non-compiler-enforced "we just inserted"
+        // invariant. `reqwest::Client::clone()` is cheap (Arc::clone
+        // internally), so we can own the client by value and skip
+        // the expect entirely.
+        let client = match cached_client.as_ref() {
+            Some((cached_host, cached)) if cached_host == &host => cached.clone(),
             _ => {
                 let new_client = Client::builder()
                     .redirect(Policy::none())
@@ -247,13 +255,12 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
                     .user_agent("barbican-safe-fetch/0.1 (+SSRF-hardened)")
                     .build()
                     .map_err(FetchError::Client)?;
-                cached_client = Some((host.clone(), new_client));
-                // Safe: we just inserted this entry.
-                &cached_client.as_ref().expect("just cached").1
+                cached_client = Some((host.clone(), new_client.clone()));
+                new_client
             }
         };
 
-        let resp = client_ref
+        let resp = client
             .request(Method::GET, current.clone())
             .send()
             .await
