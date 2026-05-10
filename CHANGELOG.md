@@ -2,6 +2,53 @@
 
 All notable changes to Barbican are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version numbers follow [SemVer](https://semver.org/).
 
+## [1.6.0] — 2026-05-10
+
+Minor release closing the bulk of GitHub issue #59 — the "Rust-hygiene cleanup" backlog the 1.5.1 adversarial review produced. No new classifier coverage, no security regressions, no attack-shape changes. The `.0` bump reflects one breaking API shape change: the `impl From<String> for Decision` escape hatch is gone.
+
+### API cleanup
+
+- **`DenyReason` migration across all 20 classifiers.** Pre-1.6.0, 13 classifiers still returned `Option<String>` and routed through an `impl From<String> for Decision` at the dispatch layer, silently losing the `detail` field. Now every classifier returns `Option<DenyReason>`; the `From<String>` impl is **deleted**. Recursive classifiers (`tar_command_exec`, `shell_with_stdin_script`, `rsync_dash_e_inner`, `shell_with_heredoc_or_herestring_body`) preserve nested `detail` via direct `DenyReason { reason, detail }` construction.
+
+  Breaking change for out-of-tree code that depended on `Decision::from(some_string)`: construct `DenyReason::short(reason)` or `DenyReason::with_detail(reason, detail)` and use `Decision::from(deny_reason)`. No known external consumers.
+
+- **`crate::quoting` module** — `strip_surrounding_quotes` and `strip_surrounding_quotes_owned` moved out of the near-duplicate implementations in `pre_bash.rs` and `parser.rs`. One source of truth.
+
+### Safety hardening (#59 lens 4)
+
+- **`O_NOFOLLOW` constant** — replaced the hand-rolled per-platform `0x0100` / `0x20000` in `audit_io::o_nofollow` and the duplicate in `installer::o_nofollow_source` with `libc::O_NOFOLLOW` under `#[cfg(unix)]`. libc is already a dep; per-platform-correct via its build.
+- **`audit_io::set_permissions(parent, 0o700)` failures now surface via `tracing::warn!`**. The hardening docs claim mode `0o700` on the log's parent directory; the pre-1.6.0 `let _ = ...` swallowed chmod failures silently, weakening the guarantee invisibly. The write still proceeds (leaf mode `0o600` + `O_NOFOLLOW` + ancestor-symlink rejection still enforced), but operators now see diagnostic logs when the tighten fails.
+- **`redact.rs` `unreachable!()` fallback** on unrecognized `SecretKind` replaced with `debug_assert!(false, ...)` + a safe `<redacted:unknown>` const slice. Defends against a future regex addition whose capture name doesn't match any known kind.
+- **`redact::redact_secrets_bytes` no longer allocates** a fresh `Vec<u8>` for `"<redacted:unknown>"` on each match; uses a module-scope `const REPLACEMENT: &[u8]` instead.
+- **NAT64 prefix match tightened** in `net.rs`. Pre-1.6.0 the code blocked `64:ff9b:*` (effectively `/32`) while the comment claimed `/96` + `/48`. Narrowed to the two IETF-assigned prefixes (`64:ff9b::/96` well-known + `64:ff9b:1::/48` local-use) and the comment updated to match.
+
+### Perf (#59 lens 2 + 3)
+
+- **`Command::basename_lc` field cached at parse time.** `stage_bn_lc` returns a borrow from the cached field instead of allocating a lowercase string per classifier call. On a realistic 10-stage pipeline × 20 classifiers, this drops ~200 allocations per hook invocation to zero.
+- **`wrappers::parse_argv` now returns borrows**, not clones. The body and trailing args were cloned despite callers holding the argv.
+- **`payload_references_network_tool` switched to Aho-Corasick** (renamed from `network_tool_word_regex`). Same pattern as the 1.5.4 `code_calls_subprocess` migration — a 40-token alternation regex replaced by a `OnceLock`-cached automaton.
+- **`safe_read` notes vector** now `Vec<Cow<'static, str>>`. Static messages like `"stripped invisible/bidi unicode"` are `Cow::Borrowed`; only dynamic messages (byte counts, paths) allocate.
+
+### Hygiene
+
+- **`#[allow(clippy::cast_*)]` on `civil_from_unix`** pushed down from function-level to expression-level with individual `reason = "..."` justifications.
+- **`many_single_char_names` allow with explicit `reason`** on `iso8601_utc_from` — `y/mo/d/h/mi/s` are domain-standard civil-date-time tuple names.
+- **Rust-1.95 clippy new-lint fixes** — `items_after_statements`, `type_complexity`, `unnecessary_trailing_comma`, `duration_suboptimal_units`. No behavior change.
+
+### Not in this release (tracked in #59)
+
+- **`reqwest::dns::Resolve` trait refactor** — carried forward again; the work started in 1.6.0 but the executor stalled mid-refactor and the change was reverted. The current same-host client cache from 1.5.3 remains the mitigation.
+- **`process::exit` removal from `wrappers::resolve_interpreter`** — evaluated and declined. The function is called once at wrapper startup, never from tests, and the exit-2 semantics are the correct behavior for a security rejection (absolute-path violation, `..` traversal). Moving the `process::exit` to the caller doesn't improve testability because tests would still go through a subprocess.
+- **libc return-value audit** outside `audit_io` — scope for a future patch.
+- **`scan_sensitive_path` / `scan_injection` return `Vec<&'static str>`** — deferred; affects API shape of the sensitive-path scanner.
+- **Per-call regex compilation audit outside the network/subprocess needle sets** — spot-checks look clean; formal audit deferred.
+
+### Compatibility
+
+- **Breaking** (minor-bump justification): `impl From<String> for Decision` is deleted. Out-of-tree code using `Decision::from("reason")` must migrate to `DenyReason::short("reason").into()`. No known external consumers.
+- Wrapper binaries, `safe_fetch`, `safe_read` all behave identically. No classifier-verdict changes.
+- Audit-log field shape unchanged.
+
 ## [1.5.5] — 2026-05-10
 
 Security + perf patch driven by a full-tree Rust-expert adversarial review (Claude `code-reviewer` + GPT-5.2 + Gemini 3.1 Pro) against 1.5.4 main. Gemini surfaced **four classifier-evasion bypasses** + **one defense-in-depth gap in `safe_fetch`** that Claude and GPT had missed. All closed with red tests. This release tightens coverage (denies more, never less) and closes ~15 non-security perf/hygiene items from the same review.

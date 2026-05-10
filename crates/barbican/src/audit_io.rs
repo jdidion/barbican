@@ -312,14 +312,6 @@ fn civil_from_unix(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 }
 
 #[cfg(test)]
-// Tests use explicit seconds offsets from UNIX_EPOCH for readability
-// — `from_secs(3600)` reads as "one hour" more cleanly than
-// `from_hours(1)` at the call site where the intent is "one hour
-// before the epoch". Clippy 1.95+ disagrees; override locally.
-#[allow(
-    clippy::duration_suboptimal_units,
-    reason = "tests use from_secs(N) explicitly to keep the epoch-offset intent readable"
-)]
 mod tests {
     use super::*;
 
