@@ -182,7 +182,7 @@ The same classifier runs behind `explain`, the `PreToolUse` hook, and each wrapp
 cargo build --release --target aarch64-apple-darwin
 ```
 
-Requires Rust stable 1.91+ (pinned in `rust-toolchain.toml`). See [`docs/SECURITY.md`](docs/SECURITY.md) for the environment variables Barbican reads.
+Requires Rust stable 1.91+ (pinned in `rust-toolchain.toml`). See [`docs/SECURITY.md`](docs/SECURITY.md) for the environment variables Barbican reads, and [`docs/development.md`](docs/development.md) for the full developer handbook (testing, release process, secretspec setup, tree-sitter debug workflow).
 
 ## Fuzzing
 
