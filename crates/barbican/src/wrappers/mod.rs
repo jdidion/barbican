@@ -58,7 +58,7 @@
 //! new exfil target. Only the sha256 digest survives.
 
 use std::borrow::Cow;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -433,24 +433,25 @@ fn spawn_with_redaction(
     // the pre_exec reset, the child would also inherit the
     // ignore-handler and become uninterruptible.
     //
+    // 1.5.2 crew-review CRITICAL (Claude + GPT-5.2): this block uses
+    // `sigaction` (POSIX-standard, well-defined semantics) instead
+    // of `signal` (legacy, historically ambiguous), checks every
+    // return value so a failed install surfaces on stderr, and
+    // installs a `SignalGuard` that restores the original
+    // disposition on drop. That means EVERY early return below
+    // (spawn failure, interpreter-resolution panic, any future
+    // error path) automatically restores the parent's SIGINT /
+    // SIGTERM / SIGHUP handlers — no more signal-set leak.
+    //
     // SAFETY: `pre_exec` runs between `fork` and `execve` in the
     // child, a context where only async-signal-safe calls are
-    // permitted. `libc::signal` is listed as async-signal-safe by
-    // POSIX.1-2008. In the wrapper itself, `libc::signal` is the
-    // POSIX signal-handler installer — safe to call from any thread
-    // at any time.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::signal(libc::SIGHUP, libc::SIG_DFL);
-            Ok(())
-        });
-    }
+    // permitted. `sigaction` is listed as async-signal-safe in
+    // POSIX.1-2008 § System Interfaces → sigaction(). We call
+    // nothing else in pre_exec. In the wrapper itself, `sigaction`
+    // is the POSIX signal-handler installer — safe to call from any
+    // thread at any time. The saved `sigaction_t` inside
+    // `SignalGuard` is POD and safe to carry across the Drop.
+    let _signal_guard = install_signal_guard(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -459,6 +460,9 @@ fn spawn_with_redaction(
                 std::io::stderr(),
                 "barbican-wrapper: failed to exec {interpreter}: {e}"
             );
+            // `_signal_guard` drops here and restores parent handlers
+            // — before 1.5.2 this was a signal-set leak (parent
+            // continued with SIG_IGN on SIGINT/TERM/HUP).
             return 127;
         }
     };
@@ -510,8 +514,18 @@ fn spawn_with_redaction(
         let _ = stderr.flush();
     });
 
-    let status = child.wait().expect("wait on child");
+    // 1.5.2 crew-review CRITICAL (Claude + GPT-5.2): previous code
+    // used `.expect("wait on child")`, which panics if
+    // `Child::wait` returns an I/O error. A panic in the wrapper
+    // kills the user's Claude Code session with an unclean stderr
+    // dump — the exact DoS a safety-tool runtime must avoid. Handle
+    // the error explicitly: log to stderr, still run the post-wait
+    // cleanup (thread joins, signal reset, audit entry), and return
+    // a conservative exit code (1) so the caller sees failure.
+    let wait_result = child.wait();
 
+    // Always run cleanup regardless of wait success/failure — the
+    // threads and signal handlers need to unwind cleanly.
     if let Some(t) = out_thread {
         let _ = t.join();
     }
@@ -521,22 +535,157 @@ fn spawn_with_redaction(
     let _ = fwd_out.join();
     let _ = fwd_err.join();
 
-    // Restore default signal handlers now that the child has exited.
-    // The wrapper is about to exit itself; this is cosmetic (nothing
-    // re-reads SIGINT after this), but keeps the process clean.
-    //
-    // SAFETY: async-signal-safe, same rationale as the pre-spawn block.
+    // Signal handlers are restored when `_signal_guard` drops (end
+    // of function). 1.5.2: previously this path had its own
+    // `libc::signal(SIG_DFL)` block; the guard makes it redundant.
+
+    match wait_result {
+        Ok(status) => status.code().unwrap_or_else(|| {
+            // Signal-killed; synthesize 128 + signal as shells do.
+            status.signal().map_or(1, |s| 128 + s)
+        }),
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}: wait on child failed: {e}",
+                dialect.wrapper_name()
+            );
+            // Conservative exit: the child's true status is unknown.
+            // `1` is shell-convention for "something went wrong."
+            1
+        }
+    }
+}
+
+/// RAII guard that installs `SIG_IGN` for SIGINT/SIGTERM/SIGHUP in
+/// the current process, and restores the previous disposition on
+/// drop. Also registers a `pre_exec` hook on the command so the
+/// child resets the three signals to `SIG_DFL` between `fork` and
+/// `execve` (POSIX preserves `SIG_IGN` across `execve` otherwise, so
+/// without the pre_exec the child would also inherit the ignore
+/// handler and be uninterruptible).
+///
+/// 1.5.2 crew-review CRITICAL (Claude + GPT-5.2): before this guard
+/// the wrapper used `libc::signal` directly, (a) ignored return
+/// values (missing `SIG_ERR` handling), (b) never restored handlers
+/// if the subsequent `spawn()` failed, (c) conflated single-thread
+/// correctness with async-signal-safety in SAFETY comments. This
+/// type replaces that pattern with `sigaction` (POSIX-standard,
+/// well-defined across multi-threaded parents) + Drop-based
+/// restoration. Every early return from `spawn_with_redaction` now
+/// automatically restores the parent's signal dispositions.
+struct SignalGuard {
+    /// Saved `sigaction` for each of our three signals. `None` means
+    /// the install failed — nothing to restore.
+    saved: [Option<(libc::c_int, libc::sigaction)>; 3],
+}
+
+impl SignalGuard {
+    /// The three signals we ignore in the wrapper parent.
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        // Restore each saved disposition. Any failure here is
+        // logged to stderr and ignored (we're on the drop path
+        // and cannot propagate).
+        for slot in &self.saved {
+            if let Some((signum, ref prev)) = *slot {
+                // SAFETY: `sigaction(signum, &prev, NULL)` restores
+                // the previously-saved handler. Both `signum` and
+                // `prev` came from a successful install call below,
+                // so the types match. `sigaction` is async-signal-
+                // safe per POSIX.1-2008 § sigaction.
+                #[allow(unsafe_code)]
+                let rc =
+                    unsafe { libc::sigaction(signum, &raw const *prev, std::ptr::null_mut()) };
+                if rc != 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "barbican-wrapper: failed to restore handler for signal {signum}: {}",
+                        std::io::Error::last_os_error(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Install SIG_IGN on the three wrapper-ignored signals and register
+/// a `pre_exec` that resets them to SIG_DFL in the child. Returns a
+/// `SignalGuard` that restores the saved dispositions when it drops.
+fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
+    let mut saved: [Option<(libc::c_int, libc::sigaction)>; 3] = [None, None, None];
+
+    // SAFETY: `sigaction` is the POSIX-standard signal-handler
+    // installer, safe to call from any thread at any time. We only
+    // install `SIG_IGN`, a constant disposition (no user-supplied
+    // handler function), so no handler-context constraints apply.
+    // The `libc::sigaction` struct is POD and zero-initialization
+    // via `MaybeUninit::zeroed()` is valid for a POSIX sigaction.
     #[allow(unsafe_code)]
     unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+        for (i, &signum) in SignalGuard::SIGNALS.iter().enumerate() {
+            let mut new_action: libc::sigaction = std::mem::MaybeUninit::zeroed().assume_init();
+            // Portable way to assign SIG_IGN: the sa_sigaction /
+            // sa_handler union's `sa_handler` slot holds a function
+            // pointer whose integer value SIG_IGN is. `libc` exposes
+            // this via the same `sigaction::sa_sigaction` slot.
+            new_action.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&raw mut new_action.sa_mask);
+            new_action.sa_flags = 0;
+
+            let mut old_action: libc::sigaction =
+                std::mem::MaybeUninit::zeroed().assume_init();
+            let rc = libc::sigaction(signum, &raw const new_action, &raw mut old_action);
+            if rc == 0 {
+                saved[i] = Some((signum, old_action));
+            } else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "barbican-wrapper: failed to install SIG_IGN for signal {signum}: {}",
+                    std::io::Error::last_os_error(),
+                );
+                // Leave saved[i] = None so Drop skips restoration
+                // for this signal — nothing changed, nothing to
+                // undo. The wrapper continues in a slightly-less-
+                // ideal state but does not panic.
+            }
+        }
+
+        // Child reset: between fork and execve, restore SIG_DFL on
+        // the three signals so the child remains interruptible.
+        // `pre_exec` is executed in the forked child before exec;
+        // only async-signal-safe calls are permitted. `sigaction`
+        // is on the POSIX AS-safe list.
+        //
+        // SAFETY: `pre_exec` runs in a post-fork context. We call
+        // only async-signal-safe functions (`sigaction`,
+        // `sigemptyset`). We do not touch any shared memory, heap,
+        // or runtime state. We do not capture the parent's Rust
+        // closure environment beyond constants.
+        cmd.pre_exec(|| {
+            for &signum in &SignalGuard::SIGNALS {
+                let mut dfl_action: libc::sigaction =
+                    std::mem::MaybeUninit::zeroed().assume_init();
+                dfl_action.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&raw mut dfl_action.sa_mask);
+                dfl_action.sa_flags = 0;
+                // If sigaction fails here, there is nothing safe we
+                // can do — we're post-fork, pre-exec, with no
+                // stderr to write to without violating async-signal-
+                // safety. The child will inherit whatever disposition
+                // we failed to change; in the worst case it inherits
+                // SIG_IGN from the parent, which is still recoverable
+                // (the user can SIGKILL).
+                let _ = libc::sigaction(signum, &raw const dfl_action, std::ptr::null_mut());
+            }
+            Ok(())
+        });
     }
 
-    status.code().unwrap_or_else(|| {
-        // Signal-killed; synthesize 128 + signal as shells do.
-        status.signal().map_or(1, |s| 128 + s)
-    })
+    SignalGuard { saved }
 }
 
 /// Read from `pipe` line-by-line, apply [`redact_secrets`] to each
@@ -566,43 +715,61 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 #[allow(clippy::needless_pass_by_value)] // must own `tx` so it drops at fn exit and closes the channel
 fn pipe_to_redacted_chunks<R: Read>(pipe: R, tx: mpsc::SyncSender<Vec<u8>>) {
     let mut reader = BufReader::new(pipe);
-    let mut buf = Vec::with_capacity(4096);
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    // 1.5.2 crew-review CRITICAL (GPT-5.2): previous implementation
+    // read one byte at a time to enforce the MAX_LINE_BYTES cap; even
+    // with `BufReader`'s 8KB internal buffer, the per-byte branch /
+    // bounds-check / Vec::push overhead made this CPU-heavy on
+    // fast-writing children. Use `read_until(b'\n', …)` over a
+    // *bounded* reader that yields at most `MAX_LINE_BYTES + 1 -
+    // buf.len()` bytes per attempt; when the take-limit is hit
+    // without a newline we flush the partial line (mid-line
+    // truncation preserves the memory cap) and continue.
     loop {
-        // Manual line-accumulate with a byte cap. We can't use
-        // `read_until(…, &mut buf)` directly because that will
-        // happily grow `buf` past `MAX_LINE_BYTES` if the child
-        // never emits a newline. Read one byte at a time; flush
-        // when we see `\n` OR when the cap is reached.
-        //
-        // The per-byte overhead is masked by `BufReader`'s internal
-        // 8KB buffer — we're really reading from the buffer, not the
-        // pipe, 99% of the time.
-        let mut byte = [0u8; 1];
-        match reader.read(&mut byte) {
+        let remaining = MAX_LINE_BYTES.saturating_sub(buf.len());
+        // Guaranteed >= 1 because we clear `buf` after each flush.
+        // Add 1 to the take budget so a read that lands exactly on
+        // `\n` at position `MAX_LINE_BYTES` still terminates the
+        // line cleanly.
+        let budget = (remaining.saturating_add(1)) as u64;
+        let starting_len = buf.len();
+        match (&mut reader).take(budget).read_until(b'\n', &mut buf) {
             Ok(0) => {
-                // EOF — flush any trailing partial line (no \n) and
-                // exit. The send may fail if the forwarder already
-                // disconnected; ignore.
+                // EOF — flush any trailing partial line and exit.
                 if !buf.is_empty() {
                     let redacted = redact_secrets_bytes(&buf);
                     let _ = tx.send(redacted.into_owned());
                 }
                 break;
             }
-            Ok(_) => {
-                buf.push(byte[0]);
-                let at_newline = byte[0] == b'\n';
+            Ok(_n) => {
+                // Check terminating condition. We flush if:
+                //   (a) the last byte read is `\n` (full line), OR
+                //   (b) `buf` has reached / exceeded `MAX_LINE_BYTES`
+                //       without a newline (mid-line cap flush).
+                // Otherwise the take-limit was shorter than expected
+                // (should not happen; read_until with take always
+                // returns 0 or a nonzero including trailing `\n`).
+                let last_is_newline = buf.last().copied() == Some(b'\n');
                 let at_cap = buf.len() >= MAX_LINE_BYTES;
-                if at_newline || at_cap {
+                if last_is_newline || at_cap {
                     let redacted = redact_secrets_bytes(&buf);
                     if tx.send(redacted.into_owned()).is_err() {
                         break;
                     }
                     buf.clear();
+                } else {
+                    // No newline, not at cap — this can only happen
+                    // if the underlying reader returned a short
+                    // read. The next loop iteration will resume.
+                    // Defensive: if we made zero progress, bail to
+                    // avoid a tight spin.
+                    if buf.len() == starting_len {
+                        break;
+                    }
                 }
             }
-            // I/O error — pipe broken. Let EOF on the reader thread's
-            // next iteration close the channel naturally.
+            // I/O error — pipe broken.
             Err(_) => break,
         }
     }
