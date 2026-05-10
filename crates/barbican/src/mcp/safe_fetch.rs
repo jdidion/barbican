@@ -166,12 +166,20 @@ async fn fetch_with_inner<R: Resolver + ?Sized>(
     // like HTTPS upgrade or trailing-slash stay on the same host and
     // hit the cache).
     //
-    // Note: the full structural fix Gemini suggested — register a
-    // custom `reqwest::dns::Resolve` implementation so one client
-    // handles all hosts — is tracked separately (#59) since it's a
-    // larger refactor of the Resolver trait and the SSRF filter's
-    // resolve/connect pinning. This is the minimum-diff fix that
-    // eliminates the common-case per-hop rebuild.
+    // 1.6.0 #59 follow-up: evaluated and declined a custom
+    // `reqwest::dns::Resolve` implementation that would let one
+    // client handle every host for the full fetch lifetime. It's
+    // unsafe to bolt on: our current flow runs the SSRF filter on
+    // the resolved IP set BEFORE the request (line 220-229 here),
+    // so a hostname that resolves to a blocked range returns a
+    // clean `FetchError::Reject` with a specific reason. Moving
+    // the resolution into a reqwest-internal `dns::Resolve` impl
+    // would run it during connect, producing opaque resolve errors
+    // and losing the pre-connect rejection discipline. The
+    // per-host rebuild cost is bounded by `MAX_REDIRECTS` and,
+    // with 1.5.3's same-host cache, only pays on cross-host hops
+    // (the minority case). Reject-and-move-on remains the correct
+    // engineering call.
     let mut cached_client: Option<(String, Client)> = None;
 
     loop {

@@ -249,10 +249,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 ///   so we don't apply the bundled-option heuristic there.
 ///
 /// 1.4.0 crew review (gpt-5.2 WARNING).
-fn parse_argv<'a>(
-    argv: &'a [String],
-    dialect: Dialect,
-) -> Result<(&'a str, &'a [String]), String> {
+fn parse_argv<'a>(argv: &'a [String], dialect: Dialect) -> Result<(&'a str, &'a [String]), String> {
     let flag = dialect.inline_flag();
     let flag_letter = flag.as_bytes()[1]; // `-c` → b'c', `-e` → b'e'
                                           // Skip argv[0]; walk by index so we can hand out a
@@ -651,10 +648,20 @@ fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
         // SAFETY: sigemptyset initializes the sa_mask set-type
         // through a stable POSIX API. The pointer is derived from
         // our owned local; no aliasing issues.
+        //
+        // 1.6.0 #59 lens-4: POSIX allows `sigemptyset` to return -1
+        // on an invalid `sigset_t*`. Our argument is an owned local
+        // with the correct type so failure is essentially
+        // impossible, but a debug_assert surfaces any future
+        // regression (e.g. a refactor that passes a null pointer).
         #[allow(unsafe_code)]
-        unsafe {
-            libc::sigemptyset(&raw mut new_action.sa_mask);
-        }
+        let emptyset_rc = unsafe { libc::sigemptyset(&raw mut new_action.sa_mask) };
+        debug_assert_eq!(
+            emptyset_rc,
+            0,
+            "sigemptyset failed unexpectedly: {}",
+            std::io::Error::last_os_error()
+        );
         new_action.sa_flags = 0;
 
         // SAFETY: same POD-zeroed argument for `old_action`. The

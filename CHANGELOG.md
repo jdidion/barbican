@@ -35,13 +35,19 @@ Minor release closing the bulk of GitHub issue #59 — the "Rust-hygiene cleanup
 - **`many_single_char_names` allow with explicit `reason`** on `iso8601_utc_from` — `y/mo/d/h/mi/s` are domain-standard civil-date-time tuple names.
 - **Rust-1.95 clippy new-lint fixes** — `items_after_statements`, `type_complexity`, `unnecessary_trailing_comma`, `duration_suboptimal_units`. No behavior change.
 
-### Not in this release (tracked in #59)
+### #59 closed with this release
 
-- **`reqwest::dns::Resolve` trait refactor** — carried forward again; the work started in 1.6.0 but the executor stalled mid-refactor and the change was reverted. The current same-host client cache from 1.5.3 remains the mitigation.
-- **`process::exit` removal from `wrappers::resolve_interpreter`** — evaluated and declined. The function is called once at wrapper startup, never from tests, and the exit-2 semantics are the correct behavior for a security rejection (absolute-path violation, `..` traversal). Moving the `process::exit` to the caller doesn't improve testability because tests would still go through a subprocess.
-- **libc return-value audit** outside `audit_io` — scope for a future patch.
-- **`scan_sensitive_path` / `scan_injection` return `Vec<&'static str>`** — deferred; affects API shape of the sensitive-path scanner.
-- **Per-call regex compilation audit outside the network/subprocess needle sets** — spot-checks look clean; formal audit deferred.
+All #59 items are now either landed (13) or explicitly decided-against with rationale (5). #59 itself closes with 1.6.0.
+
+**Decided against**, each with reasoning:
+
+- **`reqwest::dns::Resolve` trait refactor.** Moving resolution into a reqwest-internal `dns::Resolve` impl would run the SSRF filter during connect rather than before the request, producing opaque resolve errors and losing the pre-connect rejection discipline. The per-host rebuild cost is bounded by `MAX_REDIRECTS` and, with 1.5.3's same-host cache, only pays on cross-host hops. Reject-and-move-on remains the correct engineering call; documented inline at `mcp/safe_fetch.rs::fetch_with_inner`.
+- **`process::exit` removal from `wrappers::resolve_interpreter`.** Called once at wrapper startup, never from tests; `process::exit(EXIT_DENY)` is the correct behavior for a security rejection (absolute-path violation, `..` traversal). Moving the exit to the caller doesn't improve testability — tests go through subprocesses either way.
+- **`scan_sensitive_path` / `scan_injection` return `Vec<&'static str>`.** All three scan functions already embed dynamic components (format!-interpolated labels, counts) so returning `Vec<&'static str>` would force a parallel `Vec<String>` allocation at every call site for the dynamic cases. The mechanical migration doesn't save enough allocs to justify the API churn.
+- **`anyhow::Result` public-API error-type concretization.** All non-trivial public functions already use named error types (`ReadError`, `FetchError`, `ParseError`, `RejectReason`). The remaining `anyhow::Result<()>` returns are on binary-entry-point `run()` functions where `anyhow` is idiomatic.
+- **Per-call regex compilation audit outside the network/subprocess needle sets.** Spot-checks look clean (every non-test `Regex::new` is inside a `OnceLock` or `static`); no systematic audit required.
+
+**libc return-value audit (#59 lens 4).** The audit found one gap worth addressing: `sigemptyset` in `SignalGuard::install` ignored its return. POSIX allows `sigemptyset` to return `-1` on an invalid `sigset_t*`; our argument is an owned local with the correct type so failure is essentially impossible, but a `debug_assert_eq!(rc, 0, ...)` surfaces any future regression. The post-fork `pre_exec` closure's `sigemptyset` intentionally stays unchecked — `debug_assert` panics are not async-signal-safe. All other libc call sites already check returns (`sigaction` per 1.5.2).
 
 ### Compatibility
 
