@@ -289,6 +289,32 @@ pub mod __fuzz {
     pub fn path_in_attacker_writable_dir(path: &str) -> bool {
         super::path_in_attacker_writable_dir(path)
     }
+
+    /// Run `unwrap_wrappers_in_pipeline` on every pipeline of the
+    /// script produced by [`crate::parser::parse`]. Exposed so the
+    /// `unwrap_wrappers` fuzz target can exercise wrapper-unwrapping
+    /// on arbitrary bash-parsed IR without going through the full
+    /// classifier stack.
+    ///
+    /// The property under test is "never panics, never hangs" on any
+    /// parseable input. Return value is intentionally opaque to the
+    /// fuzzer (a `usize` count of pipelines that produced a `Some`
+    /// unwrap) — we don't pin a stricter shape-invariant because
+    /// `unwrap_wrappers_in_pipeline` legitimately returns an empty
+    /// `Script` when every wrapper stage in the pipeline had a
+    /// parseable-but-empty inner (the real caller then re-classifies
+    /// the empty script as `Allow`, which is the intended no-op).
+    #[must_use]
+    pub fn unwrap_wrappers_invariants(input: &str) -> usize {
+        let Ok(script) = crate::parser::parse(input) else {
+            return 0;
+        };
+        script
+            .pipelines
+            .iter()
+            .filter(|p| super::unwrap_wrappers_in_pipeline(p).is_some())
+            .count()
+    }
 }
 
 /// Classify a raw bash command string. Deny on parse failure; otherwise

@@ -1,0 +1,1 @@
+find /tmp -name '*.sh' -exec sh -c 'echo hi' \;

@@ -1,0 +1,11 @@
+[toolchain]
+# The fuzz crate is nightly-only by design: `libfuzzer-sys` needs
+# `-Z sanitizer=address`. The rest of Barbican stays on stable
+# (pinned at the repo root to 1.91.1); the fuzz crate's
+# `rust-toolchain.toml` overrides that pin whenever cargo runs
+# inside `crates/barbican/fuzz/`. Matches the intent of
+# `docs/fuzzing.md` which tells users to invoke
+# `cargo +nightly fuzz ...`, and makes the fuzz build work
+# whether or not the user's `cargo` is the rustup proxy.
+channel = "nightly"
+components = ["rust-src"]

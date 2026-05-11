@@ -50,5 +50,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "safe_read_policy"
+path = "fuzz_targets/safe_read_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safe_fetch_redirect"
+path = "fuzz_targets/safe_fetch_redirect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unwrap_wrappers"
+path = "fuzz_targets/unwrap_wrappers.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

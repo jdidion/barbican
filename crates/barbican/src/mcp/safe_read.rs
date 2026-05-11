@@ -825,6 +825,60 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// Internal, unstable surface exposed only so the `cargo-fuzz` crate
+/// under `crates/barbican/fuzz/` can drive the `safe_read` policy
+/// check on arbitrary path input. See `fuzz/fuzz_targets/safe_read_policy.rs`.
+///
+/// Not a stable API; every item here may move or be renamed. Mirrors
+/// the `hooks::pre_bash::__fuzz` convention.
+#[doc(hidden)]
+pub mod __fuzz {
+    use std::path::Path;
+
+    /// Classification of the `enforce_policy` result for the fuzzer.
+    /// Mirrors the internal `ReadError` taxonomy without leaking the
+    /// type. The fuzz target asserts this is the only shape that can
+    /// come back — no `Io` leakage, no panic.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PolicyOutcome {
+        /// Policy allowed the read.
+        Ok,
+        /// Policy denied the read. `reason` is the human-readable
+        /// message the model would see inside `<barbican-error>`.
+        Denied(String),
+    }
+
+    /// Run the full `enforce_policy` pipeline against an arbitrary
+    /// caller-supplied path string: tilde-expand, canonicalize, then
+    /// run the deny / allow / symlink checks.
+    ///
+    /// Invariants the fuzz target asserts:
+    /// - Never panics, never triggers a `debug_assert`.
+    /// - Returns `Ok` or `Denied(_)`; any `std::io::Error` is folded
+    ///   into `Denied` rather than leaked (the fuzz target can then
+    ///   check the message does not contain OS-path `errno` strings).
+    #[must_use]
+    pub fn enforce_policy(path: &str) -> PolicyOutcome {
+        let expanded = super::expand_tilde(path);
+        let canonical = match super::canonicalize(&expanded) {
+            Ok(c) => c,
+            Err(e) => return PolicyOutcome::Denied(e.to_string()),
+        };
+        match super::enforce_policy(&canonical, &expanded) {
+            Ok(()) => PolicyOutcome::Ok,
+            Err(e) => PolicyOutcome::Denied(e.to_string()),
+        }
+    }
+
+    /// Directly call `path_matches_rule` for component-boundary
+    /// property testing. `path` and `rule` are treated as filesystem
+    /// paths (no tilde expansion, no canonicalization).
+    #[must_use]
+    pub fn path_matches_rule(path: &str, rule: &str) -> bool {
+        super::path_matches_rule(Path::new(path), Path::new(rule))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -317,6 +317,27 @@ fn is_blocked_v6(v6: Ipv6Addr) -> Option<&'static str> {
     None
 }
 
+/// Internal, unstable surface exposed only so the `cargo-fuzz` crate
+/// can drive `validate_url_with` in its pure-sync form (no env read,
+/// no global state) for the redirect-chain fuzz target.
+///
+/// Not a stable API; every item here may move or be renamed. Mirrors
+/// the `hooks::pre_bash::__fuzz` convention.
+#[doc(hidden)]
+pub mod __fuzz {
+    use super::RejectReason;
+    use url::Url;
+
+    /// Pure version of [`super::validate_url_with`] the fuzzer can
+    /// drive without reading process env.
+    ///
+    /// # Errors
+    /// Returns the same `RejectReason` the internal function surfaces.
+    pub fn validate_url_with(s: &str, allow_ip_literals: bool) -> Result<Url, RejectReason> {
+        super::validate_url_with(s, allow_ip_literals)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
