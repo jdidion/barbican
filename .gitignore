@@ -21,6 +21,11 @@ crates/barbican/fuzz/corpus/**/*
 !crates/barbican/fuzz/corpus/*/
 !crates/barbican/fuzz/corpus/**/*_*
 
+# mdBook build output (source at book/src/, rendered HTML at book/book/).
+# Built in CI by .github/workflows/docs.yml and deployed to GitHub Pages;
+# never committed.
+book/book/
+
 # macOS
 .DS_Store
 
