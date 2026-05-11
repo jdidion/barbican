@@ -15,11 +15,14 @@ name: update homebrew tap
 # maintainer has a chance to sanity-check the formula.
 
 on:
-  release:
-    types: [published]
-  # Re-runnable by hand if the auto-fire misses a release (e.g. if the
-  # PAT is rotated and the workflow needs a retry after the secret is
-  # updated).
+  # 1.6.0 #70: dropped the `release: published` trigger. That event
+  # fires the instant `gh release create` runs, which used to race the
+  # release workflow's asset upload — the tap workflow would try to
+  # fetch `.sha256` sidecars that didn't exist yet and fail. The
+  # release workflow now dispatches this one explicitly (via
+  # `gh workflow run`) AFTER uploading assets, eliminating the race.
+  # Manual dispatch is kept for recovery (PAT rotations, upstream
+  # GitHub hiccups).
   workflow_dispatch:
     inputs:
       tag:
