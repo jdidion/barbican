@@ -1,0 +1,20 @@
+[book]
+title = "Barbican"
+description = "Pre-execution safety checks for AI-generated shell commands"
+authors = ["John Didion"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/jdidion/barbican"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/jdidion/barbican/edit/main/book/{path}"
+site-url = "/barbican/"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1

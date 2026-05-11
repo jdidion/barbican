@@ -15,6 +15,7 @@
 [![CI](https://github.com/jdidion/barbican/actions/workflows/ci.yml/badge.svg)](https://github.com/jdidion/barbican/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jdidion/barbican?display_name=tag&sort=semver)](https://github.com/jdidion/barbican/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/barbican.svg)](https://crates.io/crates/barbican)
+[![Docs](https://img.shields.io/badge/docs-john.didion.net/barbican-blue)](https://john.didion.net/barbican/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Rust: 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](rust-toolchain.toml)
 
