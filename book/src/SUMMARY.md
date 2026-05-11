@@ -4,6 +4,7 @@
 
 - [Install](./install.md)
 - [Configuration](./configuration.md)
+- [Classifier reference](./classifiers.md)
 - [Security model](./security.md)
 
 ---
