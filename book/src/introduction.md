@@ -6,6 +6,16 @@ A bug in Barbican is a bug in the safety floor of your entire Claude Code sessio
 
 This book is a practical guide to installing and operating Barbican. For the threat model and the authoritative list of what the classifier does and doesn't cover, see [`docs/SECURITY.md`](https://github.com/jdidion/barbican/blob/main/docs/SECURITY.md) in the source tree.
 
+## Terms used on this site
+
+A few Claude Code-adjacent terms appear throughout; quick glossary so you can read the rest of the pages cold:
+
+- **Claude Code hook** — a user-owned shell or binary that Claude Code invokes at defined points in its tool-call lifecycle. The hook's stdout / stderr / exit code are how it signals back.
+- **`PreToolUse` / `PostToolUse`** — the two hook points Barbican wires into. `PreToolUse` runs *before* a tool call (so a deny blocks it); `PostToolUse` runs *after* (so a scan can annotate the model's view of the result).
+- **MCP server** — a local server exposing tools (`safe_fetch`, `safe_read`, `inspect`) that Claude Code calls over the [Model Context Protocol](https://modelcontextprotocol.io/). Barbican ships its own MCP tools alongside the hook.
+- **Classifier** — one of ~22 rules under `crates/barbican/src/hooks/pre_bash.rs` that inspects a parsed bash pipeline and returns `Decision::Allow` or `Decision::Deny`. See the [Classifier reference](./classifiers.md).
+- **Wrapper binaries** — `barbican-shell`, `barbican-python`, etc.: preflight-gated drop-in replacements for `-c BODY` / `-e BODY` interpreter invocations. You use them by calling them directly instead of `bash -c '...'` / `python -c '...'`.
+
 ## What Barbican catches
 
 - **Dangerous bash compositions before they run** — `curl | bash`, base64-decode-to-exec, re-entry wrappers (`sudo`, `timeout`, `find -exec`, `docker run`, `nsenter`, `chroot`, `pkexec`, `flatpak run`, etc.), DNS-channel exfil, staged download-and-execute payloads written to exec targets, shell-startup env-var smuggling (`PROMPT_COMMAND=`, `BASH_ENV=`, `ENV=`), reverse-shell patterns, git config injection, and scripting-language shellouts across python / perl / ruby / node / deno / bun / php / lua / tclsh / rscript / swift / racket / guile / julia / sbcl / awk / pwsh.
