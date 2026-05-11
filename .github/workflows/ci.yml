@@ -78,10 +78,13 @@ jobs:
           shared-key: deny
       - uses: EmbarkStudios/cargo-deny-action@43cf000bced7a828a6e01af0596dd7e99b5b4e13 # v2.0.12
         with:
-          # `check` is shorthand for `advisories bans licenses sources`.
-          # We invoke each explicitly so a future policy split is a
-          # doc-visible change rather than a silent widening.
-          command: check advisories bans licenses sources
+          # `check bans licenses sources` — explicitly skip `advisories`
+          # because the dedicated cargo-audit job is the authoritative
+          # advisory gate. Also dodges a fatal upstream bug where
+          # cargo-deny 0.18's advisory-db parser rejects CVSS:4.0
+          # strings that newer RUSTSEC entries carry, aborting the whole
+          # check before any gate runs.
+          command: check bans licenses sources
 
   linux-fuzz-repro:
     # Reproducer job for the Linux-only tree-sitter-bash SIGSEGV
