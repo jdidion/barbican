@@ -63,6 +63,26 @@ jobs:
         # isn't compiled into Barbican. Documented in docs/SECURITY.md.
         run: cargo audit --deny warnings --ignore RUSTSEC-2026-0118
 
+  deny:
+    # cargo-deny layers license + source + duplicate-version checks
+    # on top of cargo-audit's advisory gate. Policy is defined in
+    # `deny.toml` at the repo root. Added in 1.6.x to close the
+    # supply-chain audit's M5 finding (license / source drift from a
+    # future transitive dep was unenforced outside advisory scans).
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.9.0
+        with:
+          shared-key: deny
+      - uses: EmbarkStudios/cargo-deny-action@43cf000bced7a828a6e01af0596dd7e99b5b4e13 # v2.0.12
+        with:
+          # `check` is shorthand for `advisories bans licenses sources`.
+          # We invoke each explicitly so a future policy split is a
+          # doc-visible change rather than a silent widening.
+          command: check advisories bans licenses sources
+
   linux-fuzz-repro:
     # Reproducer job for the Linux-only tree-sitter-bash SIGSEGV
     # finding from the 1.3.0 proptest layer. The parser-touching
