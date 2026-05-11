@@ -30,7 +30,9 @@
 //! | 100::/64                   | IPv6 discard-only                |
 //! | 2001::/32                  | Teredo tunneling                 |
 //! | 2002::/16                  | 6to4 tunnel (unwrap embedded v4) |
-//! | 64:ff9b::/96, 64:ff9b:1::/48| NAT64 (unwrap embedded v4)      |
+//! | 64:ff9b::/96               | NAT64 well-known (RFC6052)       |
+//! | 64:ff9b:1::/48             | NAT64 local-use (RFC8215)        |
+//! | 64:ff9b::/32 (rest)         | NAT64-adjacent unassigned        |
 //! | ff00::/8, 224.0.0.0/4      | Multicast                        |
 //! | 0.0.0.0/8, ::               | Unspecified                      |
 //! | 255.255.255.255            | Broadcast                        |
@@ -278,12 +280,35 @@ fn is_blocked_v6(v6: Ipv6Addr) -> Option<&'static str> {
         }
         return Some("6to4 tunnel (2002::/16)");
     }
-    // NAT64 well-known prefix 64:ff9b::/96 (RFC6052) and local prefix
-    // 64:ff9b:1::/48 (RFC8215). Both embed an IPv4 in the low 32 bits.
-    // Block unconditionally — safer than per-address unwrap because
-    // the model has no business reaching these tunnels.
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC6052) and local-use
+    // prefix 64:ff9b:1::/48 (RFC8215). Both embed an IPv4 in the low
+    // 32 bits. Block unconditionally — safer than per-address unwrap
+    // because the model has no business reaching these tunnels.
+    //
+    // `/96` means the first six u16 segments are fixed; `/48` means
+    // the first three are fixed. Pre-1.6.0 this arm matched any
+    // address whose first two segments were `64:ff9b:*` (effectively
+    // `/32`), which over-blocks a small tail of addresses the IETF
+    // never reserved but doesn't under-block a real NAT64 mapping. We
+    // tighten to the two documented prefixes so the reason string is
+    // truthful and future reviewers see the doc table match the code.
     if seg[0] == 0x0064 && seg[1] == 0xff9b {
-        return Some("NAT64 prefix (64:ff9b::/96 or 64:ff9b:1::/48)");
+        let rest_is_nat64_wellknown = seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0;
+        let rest_is_nat64_local_use = seg[2] == 0x0001;
+        if rest_is_nat64_wellknown {
+            return Some("NAT64 well-known prefix (64:ff9b::/96)");
+        }
+        if rest_is_nat64_local_use {
+            return Some("NAT64 local-use prefix (64:ff9b:1::/48)");
+        }
+        // Addresses like `64:ff9b:2::`..`64:ff9b:ffff::` sit in the
+        // 64:ff9b:*/32 bracket but outside either documented NAT64
+        // allocation. They're unassigned today; block them to stay
+        // strictly-safer-than-necessary — a future IETF allocation
+        // that reuses this prefix is vanishingly unlikely to be
+        // routable through to a public destination, and explicitly
+        // denying here preserves the prior behavior's guarantee.
+        return Some("NAT64-adjacent unassigned (64:ff9b::/32 outside documented NAT64 ranges)");
     }
     // IETF documentation prefix.
     if seg[0] == 0x2001 && seg[1] == 0xdb8 {
@@ -531,16 +556,42 @@ mod tests {
     #[test]
     fn blocks_nat64_well_known() {
         // 64:ff9b::7f00:1 is the NAT64 well-known mapping of 127.0.0.1.
-        // Block the whole /96 unconditionally.
+        // Block the /96 unconditionally and name it specifically so a
+        // future reader can tell the well-known prefix from the local
+        // prefix.
         let reason = block("64:ff9b::7f00:1").expect("NAT64 must block");
-        assert!(reason.contains("NAT64"));
+        assert!(
+            reason.contains("well-known") && reason.contains("NAT64"),
+            "want well-known label; got {reason}"
+        );
     }
 
     #[test]
     fn blocks_nat64_local() {
-        // RFC8215 local NAT64 prefix 64:ff9b:1::/48 — also blocked by
-        // the same check.
-        assert!(block("64:ff9b:1::1").is_some());
+        // RFC8215 local-use NAT64 prefix 64:ff9b:1::/48 — distinct
+        // reason string from the well-known /96.
+        let reason = block("64:ff9b:1::1").expect("NAT64 local-use must block");
+        assert!(
+            reason.contains("local-use") && reason.contains("NAT64"),
+            "want local-use label; got {reason}"
+        );
+    }
+
+    /// Pre-1.6.0 the NAT64 arm blocked the whole `64:ff9b::/32` with
+    /// a single generic reason string. 1.6.0 tightens the match to the
+    /// two IETF-allocated prefixes (`/96` well-known, `/48` local-use)
+    /// and keeps the adjacent unassigned space blocked with a distinct
+    /// label so the doc-table / code drift #59 item 6 called out goes
+    /// away. Pin the new distinct-label behavior with red-first tests.
+    #[test]
+    fn nat64_adjacent_unassigned_still_blocked_with_distinct_reason() {
+        // 64:ff9b:2::/48 sits inside 64:ff9b::/32 but outside both
+        // documented NAT64 allocations.
+        let reason = block("64:ff9b:2::1").expect("adjacent unassigned must still block");
+        assert!(
+            reason.contains("unassigned"),
+            "want unassigned label so operators can tell it from real NAT64; got {reason}"
+        );
     }
 
     #[test]

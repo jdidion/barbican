@@ -128,6 +128,6 @@ mod tests {
         let s = format!("\x1b[31m{}\x1b[0m", "A".repeat(5000));
         let out = sanitize_string(&s);
         assert!(!out.contains('\x1b'));
-        assert!(out.contains("truncated 1000 chars"));
+        assert!(out.contains("truncated 1000 bytes"));
     }
 }

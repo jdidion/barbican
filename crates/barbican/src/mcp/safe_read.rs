@@ -20,6 +20,7 @@
 //! and lexically normalized before the policy check, so traversal
 //! tricks (`/etc/hosts/../shadow`) and symlink bait cannot bypass.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,18 @@ pub struct SafeReadArgs {
 /// Run the `safe_read` tool end-to-end. Returns an MCP-shaped string.
 /// Errors round-trip via `<barbican-error>` rather than MCP-level
 /// errors, to match the `safe_fetch` contract.
+///
+/// # Errors
+///
+/// This function does not return `Result`; I/O failures, policy
+/// denials, and join errors are all rendered into the returned
+/// string as `<barbican-error>` envelopes so the MCP client sees a
+/// uniform shape.
+///
+/// # Panics
+///
+/// Does not panic. `spawn_blocking` join errors are caught and
+/// surfaced as `<barbican-error>` rather than unwrapped.
 pub async fn run(args: SafeReadArgs) -> String {
     let requested = args
         .max_bytes
@@ -80,7 +93,11 @@ struct ReadOutcome {
     canonical: PathBuf,
     body: String,
     truncated: bool,
-    sanitizer_notes: Vec<String>,
+    /// Static strings ("body truncated at size cap", "stripped
+    /// invisible/bidi unicode") are `Cow::Borrowed`; only `format!`
+    /// results that embed dynamic data (byte counts, injection-hit
+    /// lists) allocate via `Cow::Owned`.
+    sanitizer_notes: Vec<Cow<'static, str>>,
     bytes_read: usize,
 }
 
@@ -132,6 +149,15 @@ fn read_blocking(path: &str, max_bytes: usize) -> Result<ReadOutcome, ReadError>
 
 fn wrap_outcome(outcome: &ReadOutcome) -> String {
     let source = format!("file:{}", outcome.canonical.display());
+    // `WrapAttrs` currently takes `&[String]`; materialize once here so
+    // the outcome-layer storage can stay `Cow<'static, str>` without
+    // forcing a cross-module type change. When notes is empty (the
+    // common case) this allocates an empty Vec — cheap.
+    let notes_for_wrap: Vec<String> = outcome
+        .sanitizer_notes
+        .iter()
+        .map(|n| n.as_ref().to_owned())
+        .collect();
     wrap_untrusted(
         &outcome.body,
         &WrapAttrs {
@@ -139,7 +165,7 @@ fn wrap_outcome(outcome: &ReadOutcome) -> String {
             status: None,
             size: Some(outcome.bytes_read),
             truncated: outcome.truncated,
-            sanitizer_notes: &outcome.sanitizer_notes,
+            sanitizer_notes: &notes_for_wrap,
         },
     )
 }
@@ -147,10 +173,17 @@ fn wrap_outcome(outcome: &ReadOutcome) -> String {
 /// Sanitize the file body. Mirrors `safe_fetch::sanitize_body` but
 /// switches to path-based markup detection — we sniff markup by
 /// extension and body prefix rather than Content-Type.
-fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
-    let mut notes = Vec::new();
+///
+/// Notes are `Cow<'static, str>`: literal messages are
+/// `Cow::Borrowed(...)` (zero allocation), and only the two dynamic
+/// byte-count messages plus the injection-hit list allocate via
+/// `Cow::Owned`. On a typical benign read that produces no notes this
+/// helper allocates nothing for the notes vector itself (the `Vec` is
+/// empty).
+fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<Cow<'static, str>>) {
+    let mut notes: Vec<Cow<'static, str>> = Vec::new();
     if truncated {
-        notes.push("body truncated at size cap".to_string());
+        notes.push(Cow::Borrowed("body truncated at size cap"));
     }
 
     let ext = path
@@ -170,10 +203,10 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
         let original_len = raw.len();
         let out = strip_html_tags(raw);
         if out.len() != original_len {
-            notes.push(format!(
+            notes.push(Cow::Owned(format!(
                 "removed HTML <script>/<style>/comment blocks ({} bytes)",
                 original_len - out.len()
-            ));
+            )));
         }
         out
     } else {
@@ -182,7 +215,7 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
 
     let mut normalized = normalize_for_scan(&stripped);
     if normalized.len() != stripped.len() {
-        notes.push("stripped invisible/bidi unicode".to_string());
+        notes.push(Cow::Borrowed("stripped invisible/bidi unicode"));
     }
     // Re-run the markup stripper AFTER normalization so fullwidth /
     // mathematical `<script>` forms (e.g. `＜script＞`) that NFKC folds
@@ -193,19 +226,19 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
         let before = normalized.len();
         normalized = strip_html_tags(&normalized);
         if normalized.len() != before {
-            notes.push(format!(
+            notes.push(Cow::Owned(format!(
                 "removed normalized HTML blocks ({} bytes)",
                 before - normalized.len()
-            ));
+            )));
         }
     }
 
     let hits = scan_injection(&normalized);
     if !hits.is_empty() {
-        notes.push(format!(
+        notes.push(Cow::Owned(format!(
             "JAILBREAK PATTERNS DETECTED (left in place, do not obey): {}",
             hits.join(" | ")
-        ));
+        )));
     }
 
     (normalized, notes)
@@ -223,13 +256,15 @@ fn sanitize(raw: &str, path: &Path, truncated: bool) -> (String, Vec<String>) {
 /// compare is equivalent and zero-allocation. `<?xml` must still
 /// match case-insensitively because the XML spec allows
 /// `<?XmL version=...>`.
+/// Markup-prefix probes for `sniff_looks_like_markup`. Ordered by
+/// common prevalence (html > doctype > svg > xml).
+const MARKUP_PROBES: &[&[u8]] = &[b"<!DOCTYPE", b"<HTML", b"<SVG", b"<?XML"];
+
 fn sniff_looks_like_markup(s: &str) -> bool {
     let bytes = s.as_bytes();
-    // Probes ordered by common prevalence: html > doctype > svg > xml.
-    const PROBES: &[&[u8]] = &[b"<!DOCTYPE", b"<HTML", b"<SVG", b"<?XML"];
-    PROBES.iter().any(|probe| {
-        bytes.len() >= probe.len() && bytes[..probe.len()].eq_ignore_ascii_case(probe)
-    })
+    MARKUP_PROBES
+        .iter()
+        .any(|probe| bytes.len() >= probe.len() && bytes[..probe.len()].eq_ignore_ascii_case(probe))
 }
 
 /// Expand a leading `~` or `~user` in a path. Anything else is
@@ -559,10 +594,13 @@ fn parse_absolute_path_list(var: &str) -> Result<Vec<PathBuf>, ReadError> {
 /// keyed by the resolved `$HOME` so legitimate test environments
 /// that mutate `HOME` pick up the new list without a process
 /// restart. The OnceLock holds `(home, list)`; a miss rebuilds.
+/// Home-keyed cache of the rebuilt deny list. `(home, list)` — miss
+/// when `home` differs from the cached snapshot.
+type DenyListCache = std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, Vec<PathBuf>)>>>;
+
 fn default_deny_list() -> Vec<PathBuf> {
     use std::sync::Mutex;
-    static CACHE: std::sync::OnceLock<Mutex<Option<(PathBuf, Vec<PathBuf>)>>> =
-        std::sync::OnceLock::new();
+    static CACHE: DenyListCache = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let home = canonical_or_same(home_dir());
     // Mutex lock is local to this function; contention is nil in

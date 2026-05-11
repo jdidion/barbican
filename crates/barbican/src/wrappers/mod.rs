@@ -203,13 +203,13 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     // Classify BEFORE spawning anything. If this returns Deny, the
     // child never runs.
-    let classifier_input = synthesize_classifier_input(dialect, &body);
+    let classifier_input = synthesize_classifier_input(dialect, body);
     let decision = classify_command(&classifier_input);
 
     let body_sha256 = sha256_hex(body.as_bytes());
 
     if let Decision::Deny { reason, detail } = decision {
-        let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name(),);
+        let _ = writeln!(std::io::stderr(), "{}: {reason}", dialect.wrapper_name());
         if let Some(d) = detail.as_deref() {
             let _ = writeln!(std::io::stderr(), "detail: {d}");
         }
@@ -226,7 +226,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 
     // Allow path — spawn the interpreter with pipes and redact output.
     let interpreter = resolve_interpreter(dialect);
-    let exit_code = spawn_with_redaction(dialect, &interpreter, &body, &extra_args);
+    let exit_code = spawn_with_redaction(dialect, &interpreter, body, extra_args);
 
     write_audit_entry(dialect, "allow", None, None, &body_sha256, Some(exit_code));
     std::process::exit(exit_code);
@@ -249,18 +249,24 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 ///   so we don't apply the bundled-option heuristic there.
 ///
 /// 1.4.0 crew review (gpt-5.2 WARNING).
-fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>), String> {
+fn parse_argv<'a>(argv: &'a [String], dialect: Dialect) -> Result<(&'a str, &'a [String]), String> {
     let flag = dialect.inline_flag();
     let flag_letter = flag.as_bytes()[1]; // `-c` → b'c', `-e` → b'e'
-                                          // Skip argv[0].
-    let mut iter = argv.iter().skip(1);
-    while let Some(arg) = iter.next() {
+                                          // Skip argv[0]; walk by index so we can hand out a
+                                          // `&[String]` subslice for `rest` without cloning.
+                                          // 1.6.0 perf-lens (#59): previous version allocated
+                                          // both a `String` body and a `Vec<String>` of cloned
+                                          // extra args on every wrapper call. Now body is a
+                                          // borrow and rest is a subslice of argv.
+    let mut i = 1;
+    while i < argv.len() {
+        let arg = &argv[i];
         if arg == flag {
-            let body = iter
-                .next()
+            let body = argv
+                .get(i + 1)
                 .ok_or_else(|| format!("missing argument after {flag}"))?;
-            let rest: Vec<String> = iter.cloned().collect();
-            return Ok((body.clone(), rest));
+            let rest = &argv[(i + 2).min(argv.len())..];
+            return Ok((body.as_str(), rest));
         }
         // Bundled shell short-options: `-ce`, `-ec`, `-cex`, etc.
         // Shape: starts with `-`, not just `--`, contains flag_letter,
@@ -274,20 +280,21 @@ fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(String, Vec<String>)
                 && after_dash.contains(&flag_letter);
             if is_bundle {
                 // BODY is the next arg.
-                let body = iter
-                    .next()
+                let body = argv
+                    .get(i + 1)
                     .ok_or_else(|| format!("missing argument after {arg}"))?;
-                let rest: Vec<String> = iter.cloned().collect();
-                return Ok((body.clone(), rest));
+                let rest = &argv[(i + 2).min(argv.len())..];
+                return Ok((body.as_str(), rest));
             }
         }
         // Attached form: `-cBODY` / `-eBODY`.
         if let Some(body) = arg.strip_prefix(flag) {
             if body.is_empty() {
+                i += 1;
                 continue;
             }
-            let rest: Vec<String> = iter.cloned().collect();
-            return Ok((body.to_string(), rest));
+            let rest = &argv[(i + 1).min(argv.len())..];
+            return Ok((body, rest));
         }
         // 1.4.0 second crew review (Gemini WARNING-3): an arg before
         // the inline flag is either dropped (old behavior — broke
@@ -641,10 +648,20 @@ fn install_signal_guard(cmd: &mut Command) -> SignalGuard {
         // SAFETY: sigemptyset initializes the sa_mask set-type
         // through a stable POSIX API. The pointer is derived from
         // our owned local; no aliasing issues.
+        //
+        // 1.6.0 #59 lens-4: POSIX allows `sigemptyset` to return -1
+        // on an invalid `sigset_t*`. Our argument is an owned local
+        // with the correct type so failure is essentially
+        // impossible, but a debug_assert surfaces any future
+        // regression (e.g. a refactor that passes a null pointer).
         #[allow(unsafe_code)]
-        unsafe {
-            libc::sigemptyset(&raw mut new_action.sa_mask);
-        }
+        let emptyset_rc = unsafe { libc::sigemptyset(&raw mut new_action.sa_mask) };
+        debug_assert_eq!(
+            emptyset_rc,
+            0,
+            "sigemptyset failed unexpectedly: {}",
+            std::io::Error::last_os_error()
+        );
         new_action.sa_flags = 0;
 
         // SAFETY: same POD-zeroed argument for `old_action`. The
@@ -968,7 +985,7 @@ mod tests {
         ];
         let (body, rest) = parse_argv(&argv, Dialect::Shell).unwrap();
         assert_eq!(body, "echo \"$1\"");
-        assert_eq!(rest, vec!["hello".to_string()]);
+        assert_eq!(rest, &["hello".to_string()][..]);
     }
 
     #[test]
