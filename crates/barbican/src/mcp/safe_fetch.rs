@@ -97,6 +97,26 @@ pub async fn run(args: SafeFetchArgs) -> String {
 /// The fetch state machine: resolve, SSRF-filter, send, follow
 /// redirects manually, truncate, decode. Uses the default
 /// [`ProductionResolver`]; see [`fetch_with`] to inject a custom one.
+///
+/// # Errors
+///
+/// Returns a [`FetchError`] whose variants map to every rejection /
+/// failure mode in the fetch pipeline:
+///
+/// - [`FetchError::Reject`] — URL validation failed: bad scheme, no
+///   host, raw IP literal with literals disabled, or a resolved IP
+///   fell in a blocked range (loopback, RFC1918, link-local, CGNAT,
+///   IMDS). Wraps a [`RejectReason`] with the specific class.
+/// - [`FetchError::Dns`] — DNS lookup failed, resolver returned zero
+///   addresses, or the `ProductionResolver` could not initialize.
+/// - [`FetchError::Client`] — `reqwest::Client::builder().build()`
+///   failed (TLS config, runtime setup).
+/// - [`FetchError::Send`] — HTTP send/receive error: timeout, TCP
+///   reset, TLS handshake failure, or body-streaming I/O error.
+/// - [`FetchError::BadRedirect`] — 3xx response with a missing or
+///   unparseable `Location` header.
+/// - [`FetchError::TooManyRedirects`] — redirect chain exceeded
+///   [`MAX_REDIRECTS`] hops.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchError> {
     let resolver = ProductionResolver::new()?;
     fetch_with(url, max_bytes, &resolver).await
@@ -113,14 +133,36 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<FetchOutcome, FetchErr
 /// The resolver contract: return `Vec<SocketAddr>` that the caller
 /// will feed to `reqwest::Client::resolve_to_addrs`. The default
 /// impl filters every returned address through [`is_blocked_ip`];
-/// a test impl may choose not to. Never expose a non-default
-/// resolver to untrusted input — the `Resolver` trait is a policy
-/// boundary, not a lookup abstraction.
+/// a test impl may choose not to.
+///
+/// > **Warning:** the [`Resolver`] trait is a **policy boundary**, not
+/// > a lookup abstraction. The fetch loop trusts the addresses a
+/// > resolver returns and hands them directly to
+/// > `reqwest::Client::resolve_to_addrs`. A resolver that returns
+/// > unfiltered addresses disables the SSRF filter for every fetch
+/// > that uses it. **Never expose a non-default resolver to untrusted
+/// > input.**
 ///
 /// Visibility: `pub(crate)` always so the binary's own `fetch` can
 /// call it; elevated to `pub` only under `feature = "test-support"`
 /// so downstream library consumers can't construct a bypass resolver
 /// in a release build.
+///
+/// # Errors
+///
+/// Same [`FetchError`] set as [`fetch`]:
+///
+/// - [`FetchError::Reject`] — URL validation or IP filter rejected
+///   the target (bad scheme, no host, raw IP literal, blocked range).
+/// - [`FetchError::Dns`] — resolver returned zero addresses or
+///   failed outright (the `Resolver` impl owns the lookup error).
+/// - [`FetchError::Client`] — `reqwest::Client` construction failed.
+/// - [`FetchError::Send`] — HTTP I/O error during send, receive, or
+///   body streaming (timeout, reset, TLS).
+/// - [`FetchError::BadRedirect`] — 3xx response with a missing or
+///   unparseable `Location` header.
+/// - [`FetchError::TooManyRedirects`] — redirect chain exceeded
+///   [`MAX_REDIRECTS`] hops.
 #[cfg(feature = "test-support")]
 pub async fn fetch_with<R: Resolver + ?Sized>(
     url: &str,

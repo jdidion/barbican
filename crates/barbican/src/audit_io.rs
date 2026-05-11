@@ -84,6 +84,34 @@ pub fn audit_log_path() -> Option<std::path::PathBuf> {
 ///
 /// All failures propagate as `Err`; the caller decides whether to
 /// swallow (hooks must never break the session) or surface.
+///
+/// # Errors
+///
+/// Returns [`std::io::Error`] (some variants via [`std::io::Error::other`])
+/// on any of the following:
+///
+/// - **Symlinked ancestor** — a directory on `path.parent()`'s chain
+///   under `$HOME` is itself a symlink. Surfaced as an
+///   `io::Error::other` with a "symlinked ancestor" message.
+/// - **Symlinked parent** — the immediate parent exists and is a
+///   symlink (not a real directory). Surfaced as an `io::Error::other`
+///   with a "symlinked parent" message.
+/// - **`create_dir_all` failure** — intermediate directory creation
+///   failed (permissions, full disk, a non-directory component on
+///   the path).
+/// - **`open` failure** — the leaf open with
+///   `O_CREAT | O_APPEND | O_NOFOLLOW` failed. The common cases are
+///   `ELOOP` (leaf is itself a symlink) and `EACCES` / `EPERM`
+///   (caller does not own or cannot write the file).
+/// - **Metadata / chmod failure** — `file.metadata()` or
+///   `file.set_permissions(0o600)` failed; the hardening guarantee
+///   cannot be re-established so the write is aborted.
+/// - **Write failure** — `write_all` returned an I/O error (disk
+///   full, broken pipe on an NFS mount, etc.).
+///
+/// Note that best-effort parent-dir tightening to `0o700` does NOT
+/// return `Err`; it logs via `tracing::warn!` and proceeds so the
+/// audit record still lands.
 pub fn append_jsonl_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if ancestor_chain_has_symlink(parent) {

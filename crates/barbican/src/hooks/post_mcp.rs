@@ -18,6 +18,15 @@ use serde_json::Value;
 use crate::hooks::post_advisory::{emit_advisory, Finding};
 use crate::scan::{flatten_value_strings, scan_cap_from_env, scan_injection, truncate_for_scan};
 
+/// Run the `post-mcp` advisory hook: scan an MCP tool's response for
+/// prompt-injection shapes and emit an advisory when findings fire.
+///
+/// # Errors
+///
+/// Never propagates `Err`; all failures land in stderr or the audit
+/// log (hooks must never break the session). The `Result<()>` return
+/// matches the shape of the other hook entry points but every
+/// read / parse / scan error collapses to a silent `Ok(())`.
 pub fn run() -> Result<()> {
     let mut buf = String::new();
     if std::io::stdin()

@@ -20,6 +20,15 @@ use crate::scan::{
     scan_cap_from_env, scan_sensitive_path, scan_suspicious_content, truncate_for_scan,
 };
 
+/// Run the `post-edit` advisory hook: scan the edit target path and
+/// new content, emit an advisory on findings, append to the audit log.
+///
+/// # Errors
+///
+/// Never propagates `Err`; all failures land in stderr or the audit
+/// log (hooks must never break the session). The `Result<()>` return
+/// matches the shape of the other hook entry points but every
+/// read / parse / scan error collapses to a silent `Ok(())`.
 pub fn run() -> Result<()> {
     let mut buf = String::new();
     if std::io::stdin()

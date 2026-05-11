@@ -77,6 +77,30 @@ pub struct Pipeline {
 }
 
 /// One simple command in the IR.
+///
+/// # Invariants
+///
+/// - [`basename_lc`][Self::basename_lc] always equals
+///   `basename.to_ascii_lowercase()`. Populated once at parse time so
+///   classifiers can do case-insensitive lookups for free; callers
+///   that construct `Command` literally (e.g. synthetic markers in
+///   `hooks::pre_bash::unwrap_wrapper_command`) must maintain the
+///   invariant manually.
+/// - [`argv0_raw`][Self::argv0_raw] preserves the attacker's literal
+///   spelling (including case, NFKC-foldable forms, quoting variants).
+///   It is NEVER normalized and is surfaced verbatim in audit-log
+///   reason strings so reviewers see exactly what the attacker wrote.
+///   Classifier matching uses `basename` / `basename_lc` — never
+///   `argv0_raw`.
+/// - [`substitutions`][Self::substitutions] are recursively pre-parsed
+///   at IR-construction time. Classifiers that recurse into nested
+///   execution (`$(...)`, `` `...` ``, `<(...)`, `>(...)`) walk this
+///   vector directly; they must NOT re-run `parse` on the raw bytes,
+///   which would double-parse and desynchronize depth accounting.
+/// - [`redirects`][Self::redirects] carry heredoc bodies in
+///   [`Redirect::body`] for [`RedirectKind::Heredoc`]. For here-strings
+///   (`<<<`) the body is stored in [`Redirect::target`]; for file
+///   redirects the target is the filename and `body` is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Command {
     /// `argv[0]` after [`cmd_basename`] + surrounding-quote /
@@ -212,6 +236,31 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parse `input` as a bash script.
+///
+/// Deny-by-default (CLAUDE.md rule #1): any parse failure collapses to a
+/// single [`ParseError`] variant rather than a best-effort partial IR.
+///
+/// # Errors
+///
+/// - [`ParseError::ParserInit`] — the `tree-sitter-bash` grammar failed
+///   to load, or the parser refused the input outright (build- or
+///   install-time issue with the Barbican binary, not the command).
+/// - [`ParseError::Malformed`] — the grammar emitted an `ERROR` /
+///   `MISSING` node, the walker encountered an unrepresentable shape
+///   (subshell or compound-statement pipeline stage, redirect on a
+///   compound body, control flow behind a redirect), recursion
+///   exceeded [`MAX_DEPTH`], a node spanned an invalid UTF-8 boundary,
+///   or the input hit the `preflight_known_crashers` block-list for
+///   inputs that SIGSEGV the upstream grammar.
+///
+/// # Examples
+///
+/// ```
+/// # use barbican::parser::parse;
+/// let s = parse("ls | cat").unwrap();
+/// assert_eq!(s.pipelines.len(), 1);
+/// assert_eq!(s.pipelines[0].stages.len(), 2);
+/// ```
 pub fn parse(input: &str) -> Result<Script, ParseError> {
     // 1.3.1 defense: reject inputs that trip the tree-sitter-bash
     // SIGSEGV in the `{` + U+31860 shape before they reach the FFI.

@@ -104,6 +104,40 @@ mod tables {
 /// 5. Register the MCP server in `~/.claude.json`.
 ///
 /// All steps are idempotent: re-running only adds what's missing.
+///
+/// # Errors
+///
+/// Returns `Err` if any step refuses to proceed or fails to write. The
+/// install is best-effort atomic per-file (create-and-rename with
+/// `O_EXCL | O_NOFOLLOW`) but not cross-file; a mid-run failure can
+/// leave the binary copied but `settings.json` untouched, or the MCP
+/// registry unwritten. Common failure modes:
+///
+/// - **Claude home missing** — `opts.claude_home` does not exist or is
+///   not a directory (the user has not installed Claude Code yet).
+/// - **Binary source unreadable** — `opts.binary_source` cannot be
+///   opened with `O_NOFOLLOW`, or it is a symlink (refused since
+///   1.4.0, CRITICAL-3: a symlinked source would redirect `fs::read`
+///   to an attacker-controlled target).
+/// - **Wrapper binary validation failure** — any wrapper next to the
+///   main binary source that is a symlink or a non-regular-file
+///   (dir, socket) aborts the install. A missing wrapper is a logged
+///   skip, not a failure.
+/// - **Stale temp file** — a `<path>.barbican-tmp.<pid>` already
+///   exists at the write target, signaling an interrupted prior run
+///   or a concurrent install. The installer refuses rather than
+///   clobber it.
+/// - **settings.json / ~/.claude.json shape mismatch** — an existing
+///   `permissions`, `hooks`, `mcpServers`, etc. key is not a JSON
+///   object/array of the expected shape. The installer refuses to
+///   overwrite rather than destroy user data.
+/// - **Backup repair failure** — a prior torn `.pre-barbican` backup
+///   could not be removed before being re-created.
+/// - **Non-UTF-8 binary path** — `opts.binary_source` contains bytes
+///   that cannot encode into the JSON hook-command string.
+/// - **I/O errors** — `create_dir_all`, `read`, `write_all`,
+///   `sync_all`, or `rename` failed (permissions, full disk,
+///   read-only filesystem).
 pub fn install(opts: &InstallOptions) -> Result<()> {
     ensure_claude_home(&opts.claude_home)?;
     let barbican_dir = opts.claude_home.join("barbican");
@@ -155,6 +189,26 @@ pub fn install(opts: &InstallOptions) -> Result<()> {
 /// Uninstall Barbican. Mirrors [`install`]: strips the same entries
 /// back out, removes the `~/.claude/barbican/` directory, and leaves
 /// the `*.pre-barbican` backups in place for manual recovery.
+///
+/// # Errors
+///
+/// Returns `Err` on the following:
+///
+/// - **Claude home missing** — `opts.claude_home` does not exist or is
+///   not a directory.
+/// - **Unparseable config** — `settings.json` or `~/.claude.json` is
+///   present but not valid JSON; uninstall refuses rather than
+///   rewrite malformed user data.
+/// - **Stale temp file** — atomic rewrite of either config file
+///   trips the `create_new + O_NOFOLLOW` guard because a prior
+///   interrupted run (or a concurrent installer) left a
+///   `<path>.barbican-tmp.<pid>` sibling in place.
+/// - **Directory removal failure** — `~/.claude/barbican/` could not
+///   be deleted (permissions, still-running wrapper process holding
+///   a file open on Windows-like platforms, read-only filesystem).
+///   Suppressed when `opts.keep_files` is set.
+/// - **I/O errors** — any `read`, `write_all`, `sync_all`, or
+///   `rename` failure during the JSON rewrites.
 pub fn uninstall(opts: &UninstallOptions) -> Result<()> {
     ensure_claude_home(&opts.claude_home)?;
 
