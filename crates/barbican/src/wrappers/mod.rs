@@ -249,7 +249,7 @@ pub fn run(dialect: Dialect, argv: &[String]) -> ! {
 ///   so we don't apply the bundled-option heuristic there.
 ///
 /// 1.4.0 crew review (gpt-5.2 WARNING).
-fn parse_argv<'a>(argv: &'a [String], dialect: Dialect) -> Result<(&'a str, &'a [String]), String> {
+fn parse_argv(argv: &[String], dialect: Dialect) -> Result<(&str, &[String]), String> {
     let flag = dialect.inline_flag();
     let flag_letter = flag.as_bytes()[1]; // `-c` → b'c', `-e` → b'e'
                                           // Skip argv[0]; walk by index so we can hand out a
