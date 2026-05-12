@@ -1,0 +1,55 @@
+name: codeql
+
+# GitHub CodeQL for Rust — static-analysis layer on top of clippy.
+# Catches a distinct class of bug (data-flow, taint, query-based)
+# that clippy's local-AST analysis misses. Free for public repos.
+#
+# Runs on every push / PR to main PLUS a weekly Monday 13:00 UTC
+# scheduled sweep (keyed to the same cadence as cargo audit's
+# scheduled advisory check) so a new CodeQL rule that drops in
+# GitHub's ruleset flags pre-existing Barbican code even if no PR
+# has landed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+# CodeQL needs `security-events: write` to post findings to the
+# repo's Security tab.
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: CodeQL analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Pinned to the v4 release's commit SHA to match the hardened
+      # release.yml / ci.yml discipline — CodeQL's action holds write
+      # access to the repo's security-events surface, so an action
+      # repo compromise would be a real blast-radius.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4.35.4
+        with:
+          languages: rust
+          # Rust CodeQL supports the default query suite. `security-
+          # and-quality` is one step above `security-extended` and
+          # includes maintainability / style queries the clippy
+          # pedantic set doesn't cover.
+          queries: security-and-quality
+
+      # CodeQL's Rust analyzer auto-detects `cargo` and builds with
+      # `--all-targets`; no manual build step required.
+      - name: Analyze
+        uses: github/codeql-action/analyze@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4.35.4
+        with:
+          category: "/language:rust"
