@@ -5,6 +5,18 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly Monday 13:00 UTC advisory-DB refresh run. Catches RustSec
+  # advisories that drop against a pinned dep between PRs (the
+  # per-PR `audit` + `deny` jobs can't surface advisories until the
+  # next push). The schedule fires the full matrix, which is more
+  # than strictly needed — but limiting it to just audit + deny
+  # requires a separate workflow file with its own permissions, and
+  # a single full run per week is cheap on GitHub's hosted runners.
+  schedule:
+    - cron: '0 13 * * 1'
+  # Manual re-dispatch for investigating a specific advisory drop
+  # without waiting for the next cron tick.
+  workflow_dispatch:
 
 # Pin across the matrix — scaffold tracks a single pinned toolchain
 # (rust-toolchain.toml). CI reads that file automatically.
