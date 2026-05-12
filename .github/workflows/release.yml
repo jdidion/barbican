@@ -107,12 +107,41 @@ jobs:
           mkdir -p .cargo
           printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
 
-      - name: Release build
-        # `--bins` packs every `[[bin]]` target: the main `barbican`
-        # binary PLUS the 1.4.0 wrapper binaries (barbican-shell,
-        # -python, -node, -ruby, -perl) that cargo auto-discovers
-        # from src/bin/*.rs.
-        run: cargo build --release --target ${{ matrix.target }} --locked --bins
+      # `cargo-auditable` wraps `cargo build` and embeds a compressed
+      # snapshot of the resolved dep graph into every compiled binary
+      # under the `.dep-v0` linker section. Downstream users can then
+      # run `cargo audit bin <binary>` to audit the *installed* binary
+      # against the RustSec advisory DB without needing source. Zero
+      # runtime cost; adds ~15-30 KB to the binary.
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --locked
+
+      - name: Release build (auditable)
+        # `cargo auditable build` is a drop-in wrapper. `--bins` packs
+        # every `[[bin]]` target: the main `barbican` binary PLUS the
+        # 1.4.0 wrapper binaries (barbican-shell, -python, -node,
+        # -ruby, -perl) that cargo auto-discovers from src/bin/*.rs.
+        run: cargo auditable build --release --target ${{ matrix.target }} --locked --bins
+
+      # CycloneDX SBOM generation per target so downstream consumers
+      # (Trivy, Grype, GitHub's dependency graph) have a machine-
+      # readable manifest of every dep, version, and license that
+      # ships in the corresponding tarball.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx \
+            --format json \
+            --target ${{ matrix.target }} \
+            --all-features \
+            --override-filename "barbican-${{ matrix.target }}-sbom"
+          # cargo-cyclonedx 0.5 writes to the crate root with just `.json`
+          # (no `.cdx.json` suffix despite the file containing CycloneDX-
+          # schema JSON). Stage it at the repo root so the later
+          # staging step finds it.
+          mv crates/barbican/barbican-${{ matrix.target }}-sbom.json .
 
       - name: Stage artifact
         id: stage
@@ -144,9 +173,26 @@ jobs:
           # Linux-only.
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
 
+          # Rename the CycloneDX SBOM to match the tarball convention
+          # so release consumers can map `barbican-${VERSION}-${TARGET}.tar.gz`
+          # to its SBOM by filename. The JSON is already in the
+          # workspace root from the previous step. We use
+          # `.sbom.cdx.json` on disk (the "cdx" segment tells humans
+          # + scanners the schema) even though cargo-cyclonedx writes
+          # it as plain `.json`.
+          SBOM_SRC="barbican-${{ matrix.target }}-sbom.json"
+          SBOM_DST="${ARTIFACT}.sbom.cdx.json"
+          if [ -f "$SBOM_SRC" ]; then
+            mv "$SBOM_SRC" "$SBOM_DST"
+          else
+            echo "::error::expected SBOM at $SBOM_SRC was not produced"
+            exit 1
+          fi
+
           echo "artifact_name=${ARTIFACT}" >> "$GITHUB_OUTPUT"
           echo "tarball=${ARTIFACT}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=${ARTIFACT}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "sbom=${SBOM_DST}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -155,6 +201,7 @@ jobs:
           path: |
             ${{ steps.stage.outputs.tarball }}
             ${{ steps.stage.outputs.checksum }}
+            ${{ steps.stage.outputs.sbom }}
           if-no-files-found: error
           retention-days: 14
 
@@ -193,10 +240,11 @@ jobs:
         id: flatten
         run: |
           # Flatten: each matrix job uploads a directory with .tar.gz +
-          # .sha256; we want flat files for the attestation step and
-          # the release upload.
+          # .sha256 + .sbom.cdx.json; we want flat files for the
+          # attestation step and the release upload.
           mkdir -p flat
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) \
+          find artifacts -type f \
+            \( -name "*.tar.gz" -o -name "*.sha256" -o -name "*.sbom.cdx.json" \) \
             -exec cp {} flat/ \;
           ls -la flat/
 
