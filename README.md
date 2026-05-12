@@ -210,6 +210,12 @@ cargo +nightly fuzz run classify -- -max_total_time=60
 cargo +nightly fuzz run validate_url -- -max_total_time=60
 ```
 
+## Related work
+
+Barbican sits at the **execution layer** of an agentic-security stack: it inspects concrete tool invocations (bash pipelines, MCP calls, file paths) and gates them before they run. A complementary defense at the **planning layer** is Erik Meijer's [*Guardians of the Agents: Formal Verification of AI Workflows*](https://cacm.acm.org/practice/guardians-of-the-agents/) (CACM, January 2026), with a reference implementation at [metareflection/guardians](https://github.com/metareflection/guardians). Guardians proposes that the LLM emit a structured plan upfront using symbolic references, a static verifier (taint analysis + security automata + Z3) checks the plan against a declarative policy, and only verified plans execute.
+
+The two layers catch different attack classes. Barbican catches individual-command attack shapes (`curl | bash`, sensitive-path reads, SSRF). Guardians catches multi-step *compositions* that no single command reveals — e.g. "read 10 emails, then POST each one to a different attacker domain," where every tool call in isolation is allowed but the cumulative data-flow is the attack. Together they form a defense-in-depth posture analogous to parameterized queries + a WAF on the web-application side. See issue #80 for a planned Mode B pilot wrapping Claude Code's MCP endpoints with a Guardians-automaton proxy, without requiring harness-level changes.
+
 ## License & attribution
 
 Barbican is MIT-licensed (see [`LICENSE`](LICENSE)).
